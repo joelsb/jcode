@@ -745,6 +745,11 @@ impl Config {
                 self.provider.same_provider_account_failover = enabled;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_PREFER_ACCOUNT_FAILOVER") {
+            if let Some(enabled) = parse_env_bool(&v) {
+                self.provider.prefer_account_failover = enabled;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_STREAM_IDLE_TIMEOUT_SECS") {
             if let Ok(parsed) = v.trim().parse::<u64>() {
                 if parsed > 0 {

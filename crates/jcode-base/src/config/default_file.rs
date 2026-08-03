@@ -360,6 +360,8 @@ preserve_reasoning_context = true
 # cross_provider_failover = "manual"
 # Try another account on the same provider before switching providers (default: true)
 # same_provider_account_failover = false
+# On rate limit, try same model on a different account before downgrading model (default: true)
+# prefer_account_failover = false
 cross_provider_failover = "countdown"
 # Copilot premium mode: "normal" (default), "one" (first msg only), "zero" (all free)
 # Set to "zero" if you have premium Copilot and want free requests

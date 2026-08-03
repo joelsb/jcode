@@ -1148,6 +1148,11 @@ pub struct ProviderConfig {
     /// Whether jcode should automatically try another account on the same provider
     /// before falling back to a different provider.
     pub same_provider_account_failover: bool,
+    /// When true (default) and the error is a rate limit, skip same-provider
+    /// model downgrades in the fallback picker so the account-failover
+    /// mechanism can try the same model on a different account first.
+    /// Only effective when same_provider_account_failover is also true.
+    pub prefer_account_failover: bool,
     /// Copilot premium request mode: "normal", "one", or "zero"
     /// "zero" means all requests are free (no premium requests consumed)
     pub copilot_premium: Option<String>,
@@ -1178,6 +1183,7 @@ impl Default for ProviderConfig {
             preserve_reasoning_context: true,
             cross_provider_failover: CrossProviderFailoverMode::Countdown,
             same_provider_account_failover: true,
+            prefer_account_failover: true,
             copilot_premium: None,
             model_picker_providers: None,
             stream_idle_timeout_secs: 180,
