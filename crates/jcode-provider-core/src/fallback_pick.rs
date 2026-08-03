@@ -42,6 +42,13 @@ pub struct FallbackPickOptions {
     /// - when the failed api_method is unknown, all same-provider routes are
     ///   excluded because any of them could share the broken credential.
     pub credential_failure: bool,
+    /// The failure was a rate-limit error (429 Too Many Requests). Routes on
+    /// the same provider share the same account rate-limit bucket, so
+    /// offering a sibling model on the same provider would hit the same
+    /// limit. Skip same-provider model downgrades and prefer cross-provider
+    /// alternatives, letting the backend account-failover mechanism try the
+    /// same model on a different account first.
+    pub rate_limit: bool,
 }
 
 /// Whether `error` looks like a credential/auth failure for the active route's
@@ -143,6 +150,8 @@ pub fn pick_next_fallback_route_with_options(
 
             let tier = if same_model && !same_method {
                 0
+            } else if same_provider && options.rate_limit {
+                3
             } else if same_provider {
                 1
             } else {
@@ -278,6 +287,7 @@ mod tests {
         ];
         let options = FallbackPickOptions {
             credential_failure: true,
+            rate_limit: false,
         };
         let pick = pick_next_fallback_route_with_options(
             &routes,
@@ -300,6 +310,7 @@ mod tests {
         ];
         let options = FallbackPickOptions {
             credential_failure: true,
+            rate_limit: false,
         };
         let pick = pick_next_fallback_route_with_options(
             &routes,
@@ -324,10 +335,79 @@ mod tests {
         ];
         let options = FallbackPickOptions {
             credential_failure: true,
+            rate_limit: false,
         };
         let pick = pick_next_fallback_route_with_options(&routes, "gpt-5.5", "OpenAI", "", options)
             .expect("a fallback should exist");
         assert_eq!(routes[pick].provider, "Anthropic");
+    }
+
+    #[test]
+    fn rate_limit_skips_same_provider_model_downgrade() {
+        let routes = vec![
+            route("claude-sonnet-5", "Anthropic", "claude-oauth", true),
+            route("claude-fable-5", "Anthropic", "claude-oauth", true),
+            route("gpt-5", "OpenAI", "openai-oauth", true),
+        ];
+        let options = FallbackPickOptions {
+            credential_failure: false,
+            rate_limit: true,
+        };
+        let pick = pick_next_fallback_route_with_options(
+            &routes,
+            "claude-sonnet-5",
+            "Anthropic",
+            "claude-oauth",
+            options,
+        )
+        .expect("a fallback should exist");
+        assert_eq!(routes[pick].provider, "OpenAI");
+    }
+
+    #[test]
+    fn rate_limit_still_offers_same_model_different_auth() {
+        let routes = vec![
+            route("claude-sonnet-5", "Anthropic", "claude-oauth", true),
+            route("claude-sonnet-5", "Anthropic", "claude-api", true),
+            route("gpt-5", "OpenAI", "openai-oauth", true),
+        ];
+        let options = FallbackPickOptions {
+            credential_failure: false,
+            rate_limit: true,
+        };
+        let pick = pick_next_fallback_route_with_options(
+            &routes,
+            "claude-sonnet-5",
+            "Anthropic",
+            "claude-oauth",
+            options,
+        )
+        .expect("a fallback should exist");
+        assert_eq!(routes[pick].api_method, "claude-api");
+        assert_eq!(routes[pick].model, "claude-sonnet-5");
+    }
+
+    #[test]
+    fn non_rate_limit_still_offers_model_downgrade() {
+        let routes = vec![
+            route("claude-sonnet-5", "Anthropic", "claude-oauth", true),
+            route("claude-fable-5", "Anthropic", "claude-oauth", true),
+            route("gpt-5", "OpenAI", "openai-oauth", true),
+        ];
+        let options = FallbackPickOptions {
+            credential_failure: false,
+            rate_limit: false,
+        };
+        let pick = pick_next_fallback_route_with_options(
+            &routes,
+            "claude-sonnet-5",
+            "Anthropic",
+            "claude-oauth",
+            options,
+        )
+        .expect("a fallback should exist");
+        assert_eq!(routes[pick].provider, "Anthropic");
+        assert_eq!(routes[pick].model, "claude-fable-5");
     }
 
     #[test]
