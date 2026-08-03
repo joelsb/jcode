@@ -33,7 +33,8 @@ mod stream_timeout;
 use crate::auth;
 use crate::message::{Message, ToolDefinition};
 use account_failover::{
-    account_usage_probe, active_account_label_for_provider, maybe_annotate_limit_summary,
+    account_usage_probe, active_account_label_for_provider, error_looks_like_usage_limit,
+    maybe_annotate_limit_summary, prefer_account_failover_enabled,
     same_provider_account_candidates, same_provider_account_failover_enabled,
     set_account_override_for_provider,
 };
@@ -69,6 +70,8 @@ pub use jcode_provider_core::{
     normalize_model_route_provider_label, pick_next_fallback_route,
     pick_next_fallback_route_with_options,
 };
+pub use account_failover::error_looks_like_usage_limit;
+pub use account_failover::prefer_account_failover_enabled;
 pub use jcode_provider_core::{ProviderFailoverPrompt, parse_failover_prompt_message};
 pub use route_builders::{
     build_anthropic_oauth_route, build_chatgpt_web_route, build_copilot_route,

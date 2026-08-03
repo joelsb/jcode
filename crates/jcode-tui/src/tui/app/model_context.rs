@@ -307,7 +307,8 @@ impl App {
         // credential would fail identically.
         let options = crate::provider::FallbackPickOptions {
             credential_failure: crate::provider::error_looks_like_credential_failure(error),
-            ..Default::default()
+            rate_limit: crate::provider::prefer_account_failover_enabled()
+                && crate::provider::error_looks_like_usage_limit(error),
         };
         let Some(index) = crate::provider::pick_next_fallback_route_with_options(
             &routes,

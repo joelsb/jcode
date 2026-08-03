@@ -23,6 +23,11 @@ pub(super) fn same_provider_account_failover_enabled() -> bool {
         .same_provider_account_failover
 }
 
+pub fn prefer_account_failover_enabled() -> bool {
+    let config = crate::config::Config::load();
+    config.provider.prefer_account_failover && config.provider.same_provider_account_failover
+}
+
 pub(super) fn active_account_label_for_provider(provider: ActiveProvider) -> Option<String> {
     match provider {
         ActiveProvider::Claude => crate::auth::claude::active_account_label(),
@@ -117,7 +122,7 @@ pub(super) fn usage_exhausted_reason(provider: ActiveProvider) -> String {
     reason
 }
 
-fn error_looks_like_usage_limit(summary: &str) -> bool {
+pub fn error_looks_like_usage_limit(summary: &str) -> bool {
     let lower = summary.to_ascii_lowercase();
     [
         "quota",
