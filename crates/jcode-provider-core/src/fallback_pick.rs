@@ -42,6 +42,13 @@ pub struct FallbackPickOptions {
     /// - when the failed api_method is unknown, all same-provider routes are
     ///   excluded because any of them could share the broken credential.
     pub credential_failure: bool,
+    /// The failure was a rate-limit error (429 Too Many Requests). Routes on
+    /// the same provider share the same account rate-limit bucket, so
+    /// offering a sibling model on the same provider would hit the same
+    /// limit. Skip same-provider model downgrades and prefer cross-provider
+    /// alternatives, letting the backend account-failover mechanism try the
+    /// same model on a different account first.
+    pub rate_limit: bool,
 }
 
 /// Whether `error` looks like a credential/auth failure for the active route's
@@ -151,6 +158,8 @@ pub fn pick_next_fallback_route_with_options(
                 // billing. Excluded here so it ranks below a real cross-provider
                 // hop; it stays reachable at tier 3 when nothing else exists.
                 0
+            } else if same_provider && options.rate_limit {
+                3
             } else if same_provider {
                 1
             } else {
@@ -286,6 +295,7 @@ mod tests {
         ];
         let options = FallbackPickOptions {
             credential_failure: true,
+            rate_limit: false,
         };
         let pick = pick_next_fallback_route_with_options(
             &routes,
@@ -308,6 +318,7 @@ mod tests {
         ];
         let options = FallbackPickOptions {
             credential_failure: true,
+            rate_limit: false,
         };
         let pick = pick_next_fallback_route_with_options(
             &routes,
@@ -332,6 +343,7 @@ mod tests {
         ];
         let options = FallbackPickOptions {
             credential_failure: true,
+            rate_limit: false,
         };
         let pick = pick_next_fallback_route_with_options(&routes, "gpt-5.5", "OpenAI", "", options)
             .expect("a fallback should exist");
