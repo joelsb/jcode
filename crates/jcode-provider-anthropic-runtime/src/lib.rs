@@ -448,10 +448,10 @@ const DEFAULT_MODEL: &str = jcode_provider_core::DEFAULT_CLAUDE_MODEL;
 const API_VERSION: &str = "2023-06-01";
 
 /// Maximum number of retries for transient errors
-const MAX_RETRIES: u32 = 3;
+const MAX_RETRIES: u32 = 2;
 
 /// Base delay for exponential backoff (in milliseconds)
-const RETRY_BASE_DELAY_MS: u64 = 1000;
+const RETRY_BASE_DELAY_MS: u64 = 200;
 
 /// Cached OAuth credentials
 #[derive(Clone)]

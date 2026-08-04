@@ -120,10 +120,19 @@ pub struct CuratedModel {
 
 pub const CURATED_MODELS: &[CuratedModel] = &[
     CuratedModel {
+        id: "claude-opus-4-6[1m]",
+        display_name: "Claude Opus 4.6 (1M)",
+        aliases: &["claude-opus-4-6[1m]", "claude-opus-4-6", "opus-4-6", "opus 4.6", "claude opus 4.6"],
+        default_enabled: true,
+        routing_policy: UpstreamRoutingPolicy::ServerManaged,
+        min_tier: JcodeTier::Plus,
+        note: "DAIN default; Anthropic with 1M context window.",
+    },
+    CuratedModel {
         id: "claude-opus-4-8",
         display_name: "Claude Opus 4.8",
         aliases: &["claude-opus-4-8", "opus-4-8", "opus 4.8", "claude opus 4.8"],
-        default_enabled: true,
+        default_enabled: false,
         routing_policy: UpstreamRoutingPolicy::ServerManaged,
         min_tier: JcodeTier::Plus,
         note: "Frontier model; routed server-side to Anthropic by the jcode router.",
@@ -602,7 +611,7 @@ mod tests {
 
     #[test]
     fn default_model_is_opus() {
-        assert_eq!(default_model().id, "claude-opus-4-8");
+        assert_eq!(default_model().id, "claude-opus-4-6[1m]");
     }
 
     #[test]

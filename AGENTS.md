@@ -8,6 +8,17 @@
   and its base (e.g. `main`) otherwise. Never integrate branches owned by non-maintainers
   or other agents yourself; tell the user and let them decide how to proceed.
 
+- **New feature/fix workflow** - Always branch off `mine`, never off `master` directly:
+  1. Update first: `git checkout master && git pull origin master`
+  2. Rebase mine on top: `git checkout mine && git rebase master`
+  3. Create feature branch from mine: `git checkout -b feat/my-feature mine`
+  4. Do the work, commit
+  5. Merge back into mine: `git checkout mine && git merge feat/my-feature`
+  6. Delete feature branch: `git branch -d feat/my-feature`
+
+  This ensures every new feature starts from latest upstream + all DAIN patches.
+  The `/update` skill handles steps 1-2 automatically.
+
 ## Install Notes
 - `~/.local/bin/jcode` is the launcher symlink used from `PATH`.
 - `~/.jcode/builds/current/jcode` is the active local/source-build channel; self-dev builds and `scripts/install_release.sh` point the launcher here.
@@ -45,9 +56,10 @@ Two things that waste time otherwise:
 
 ## DAIN Custom Patches
 
-We maintain local patches on feature branches. Documentation for each:
+All DAIN patches live on the `mine` branch, rebased on `master` when upstream updates.
+Workflow: `git checkout master && git pull`, then `git checkout mine && git rebase master`, then build+install.
 
-- **Account-first failover** (`feat/account-first-failover`): When rate-limited, try same model on next OAuth account before downgrading to a smaller model. See `docs/DAIN_ACCOUNT_FIRST_FAILOVER.md`.
+- **Account-first failover**: When rate-limited, try same model on next OAuth account before downgrading to a smaller model. See `docs/DAIN_ACCOUNT_FIRST_FAILOVER.md`.
 - **Configuration reference**: Our config, aliases, accounts. See `docs/DAIN_CONFIGURATION_REFERENCE.md`.
 
 ## Build Shortcut
