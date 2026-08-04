@@ -265,6 +265,16 @@ impl UiActivity {
     }
 }
 
+/// The daemon moved this process onto a different Anthropic OAuth account
+/// because the previous one was rate limited.
+#[derive(Clone, Debug)]
+pub struct AnthropicAccountRotated {
+    /// Account label now serving requests.
+    pub label: String,
+    /// Account the request was on before, when known.
+    pub previous_label: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct GitStatusCompleted {
     pub session_id: String,
@@ -423,6 +433,8 @@ pub enum BusEvent {
     ModelRefreshCompleted(ModelRefreshCompleted),
     /// UI-visible runtime activity from auth/catalog/background operations.
     UiActivity(UiActivity),
+    /// Anthropic OAuth account rotated mid-request after a rate limit
+    AnthropicAccountRotated(AnthropicAccountRotated),
     /// Local git status command completed off the UI thread
     GitStatusCompleted(GitStatusCompleted),
     /// Update check status from background thread
@@ -539,6 +551,17 @@ impl Bus {
             .clone()
     }
 
+    pub fn publish_anthropic_account_rotated(
+        &self,
+        label: impl Into<String>,
+        previous_label: Option<String>,
+    ) {
+        self.publish(BusEvent::AnthropicAccountRotated(AnthropicAccountRotated {
+            label: label.into(),
+            previous_label,
+        }));
+    }
+
     pub fn publish_models_updated(&self) {
         // A models-updated publish means some provider catalog changed
         // out-of-band. Invalidate memoized route catalogs so the next render
@@ -638,5 +661,26 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod account_rotation_bus_tests {
+    use super::{Bus, BusEvent};
+
+    #[test]
+    fn publishing_a_rotation_reaches_subscribers_with_both_labels() {
+        let bus = Bus::new();
+        let mut rx = bus.subscribe();
+
+        bus.publish_anthropic_account_rotated("claude-2", Some("claude-1".to_string()));
+
+        match rx.try_recv() {
+            Ok(BusEvent::AnthropicAccountRotated(rotated)) => {
+                assert_eq!(rotated.label, "claude-2");
+                assert_eq!(rotated.previous_label.as_deref(), Some("claude-1"));
+            }
+            other => panic!("expected an AnthropicAccountRotated event, got {other:?}"),
+        }
     }
 }
