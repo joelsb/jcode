@@ -28,6 +28,19 @@ pub fn prefer_account_failover_enabled() -> bool {
     config.provider.prefer_account_failover && config.provider.same_provider_account_failover
 }
 
+/// Alternate account labels for `provider`, best-first: accounts the usage
+/// probe reports as neither exhausted nor erroring come before the rest, and
+/// the currently active account is always excluded.
+///
+/// Public so a provider runtime can rotate accounts itself. A streaming rate
+/// limit is delivered as an item *inside* the event stream, long after
+/// `complete()` handed that stream back, so
+/// [`MultiProvider::try_same_provider_account_failover`] never observes it and
+/// cannot rotate on the runtime's behalf.
+pub fn account_failover_candidates(provider: ActiveProvider) -> Vec<String> {
+    same_provider_account_candidates(provider)
+}
+
 pub(super) fn active_account_label_for_provider(provider: ActiveProvider) -> Option<String> {
     match provider {
         ActiveProvider::Claude => crate::auth::claude::active_account_label(),
