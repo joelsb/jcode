@@ -82,6 +82,21 @@ pub async fn get() -> UsageData {
     current_data.display_snapshot()
 }
 
+/// Invalidate the cached Anthropic usage snapshot after an account change.
+///
+/// Safe to call from sync contexts: when a Tokio runtime is available the
+/// write happens inline, otherwise the cache is left untouched rather than
+/// panicking (the next TTL expiry then repairs it).
+pub fn invalidate_anthropic_usage() {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async {
+        let usage = get_usage().await;
+        usage.write().await.mark_stale();
+    });
+}
+
 static OPENAI_USAGE: tokio::sync::OnceCell<Arc<RwLock<OpenAIUsageData>>> =
     tokio::sync::OnceCell::const_new();
 static OPENAI_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
