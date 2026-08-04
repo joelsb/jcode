@@ -534,6 +534,7 @@ mod tests {
     use super::*;
 
     const EXPECTED_PLUS_MODELS: &[&str] = &[
+        "claude-opus-4-6[1m]",
         "claude-opus-4-8",
         "claude-opus-5",
         "claude-sonnet-4-6",
@@ -638,7 +639,7 @@ mod tests {
                 .iter()
                 .all(|model| model.min_tier != JcodeTier::Flagship)
         );
-        assert_eq!(CURATED_MODELS.len(), 20);
+        assert_eq!(CURATED_MODELS.len(), 21);
         assert!(find_curated_model("magistral-small-1.2").is_none());
         assert!(find_curated_model("gemma-3-27b").is_none());
         assert!(find_curated_model("llama-4-maverick").is_none());
