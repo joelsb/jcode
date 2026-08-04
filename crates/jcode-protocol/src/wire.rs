@@ -1277,6 +1277,16 @@ pub enum ServerEvent {
         available_model_routes: Vec<jcode_provider_core::ModelRoute>,
     },
 
+    /// The daemon rotated to a different Anthropic OAuth account mid-request
+    /// after a rate limit. Clients render usage from their own process, so this
+    /// is the only signal that their cached account view is now wrong.
+    #[serde(rename = "anthropic_account_rotated")]
+    AnthropicAccountRotated {
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_label: Option<String>,
+    },
+
     /// Notification from another agent (file conflict, message, shared context)
     #[serde(rename = "notification")]
     Notification {
@@ -1461,4 +1471,34 @@ pub enum ServerEvent {
         /// Tool call ID this is associated with
         tool_call_id: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerEvent;
+
+    #[test]
+    fn anthropic_account_rotated_round_trips_over_the_wire() {
+        let event = ServerEvent::AnthropicAccountRotated {
+            label: "claude-2".to_string(),
+            previous_label: Some("claude-1".to_string()),
+        };
+
+        let encoded = serde_json::to_string(&event).expect("event serializes");
+        assert!(
+            encoded.contains("\"anthropic_account_rotated\""),
+            "the wire name is part of the protocol contract: {encoded}"
+        );
+
+        match serde_json::from_str::<ServerEvent>(&encoded).expect("event deserializes") {
+            ServerEvent::AnthropicAccountRotated {
+                label,
+                previous_label,
+            } => {
+                assert_eq!(label, "claude-2");
+                assert_eq!(previous_label.as_deref(), Some("claude-1"));
+            }
+            other => panic!("round-trip produced the wrong variant: {other:?}"),
+        }
+    }
 }
