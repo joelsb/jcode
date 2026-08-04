@@ -2242,55 +2242,92 @@ fn e2e_test_request() -> ApiRequest {
     }
 }
 
+/// Fixture for the account-rotation streaming tests: seeds two fake Claude
+/// accounts (`claude-1` active, `claude-2` the only rotation candidate) in a
+/// sandboxed `JCODE_HOME`, and runs a mock server that 429s on the first call
+/// then answers 200 on every subsequent one.
+///
+/// Holds the test-env lock and temp dir for its own lifetime so callers don't
+/// need to manage either. `drive_stream_to_completion` runs
+/// `run_stream_with_retries` against the mock server and returns every event.
+///
+/// Field order matters: struct fields drop in declaration order (unlike local
+/// variables, which drop in reverse), so `_guard` is declared last to release
+/// the test-env lock only after the temp dir, env var, and mock server have
+/// already torn down.
+struct RotationFixture {
+    server: MockAnthropicServer,
+    _home: EnvVarGuard,
+    _temp: tempfile::TempDir,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl RotationFixture {
+    async fn new() -> Self {
+        let _guard = jcode_base::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().unwrap();
+        let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+        seed_two_claude_accounts();
+
+        assert_eq!(
+            jcode_base::provider::account_failover_candidates(
+                jcode_provider_core::ActiveProvider::Claude
+            ),
+            vec!["claude-2".to_string()],
+            "fixture must leave exactly one rotation candidate"
+        );
+
+        let server = MockAnthropicServer::start(|call_no| {
+            if call_no == 1 {
+                (429, mock_429_body())
+            } else {
+                (200, mock_success_sse_body("pong"))
+            }
+        })
+        .await;
+        set_test_api_url_override(Some(server.url()));
+
+        Self {
+            server,
+            _home,
+            _temp: temp,
+            _guard,
+        }
+    }
+
+    async fn drive_stream_to_completion(&self) -> Vec<Result<StreamEvent>> {
+        let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+        let model_state = Arc::new(std::sync::RwLock::new(
+            "claude-3-5-haiku-20241022".to_string(),
+        ));
+
+        run_stream_with_retries(
+            Client::new(),
+            "fixture-access-claude-1".to_string(),
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+        )
+        .await;
+
+        set_test_api_url_override(None);
+
+        let mut events = Vec::new();
+        while let Some(item) = rx.recv().await {
+            events.push(item);
+        }
+        events
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_stream_with_retries_rotates_account_on_streaming_429_and_replays_successfully() {
-    let _guard = jcode_base::storage::lock_test_env();
-    let temp = tempfile::TempDir::new().unwrap();
-    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
-    seed_two_claude_accounts();
-
-    assert_eq!(
-        jcode_base::provider::account_failover_candidates(
-            jcode_provider_core::ActiveProvider::Claude
-        ),
-        vec!["claude-2".to_string()],
-        "fixture must leave exactly one rotation candidate"
-    );
-
-    let server = MockAnthropicServer::start(|call_no| {
-        if call_no == 1 {
-            (429, mock_429_body())
-        } else {
-            (200, mock_success_sse_body("pong"))
-        }
-    })
-    .await;
-    set_test_api_url_override(Some(server.url()));
-
-    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
-    let model_state = Arc::new(std::sync::RwLock::new(
-        "claude-3-5-haiku-20241022".to_string(),
-    ));
-
-    run_stream_with_retries(
-        Client::new(),
-        "fixture-access-claude-1".to_string(),
-        true,
-        e2e_test_request(),
-        tx,
-        Arc::new(RwLock::new(None)),
-        "claude-3-5-haiku-20241022".to_string(),
-        "test-session".to_string(),
-        model_state,
-    )
-    .await;
-
-    set_test_api_url_override(None);
-
-    let mut events = Vec::new();
-    while let Some(item) = rx.recv().await {
-        events.push(item);
-    }
+    let fixture = RotationFixture::new().await;
+    let events = fixture.drive_stream_to_completion().await;
 
     for event in &events {
         assert!(
@@ -2325,24 +2362,51 @@ async fn run_stream_with_retries_rotates_account_on_streaming_429_and_replays_su
     );
 
     assert_eq!(
-        server.call_count(),
+        fixture.server.call_count(),
         2,
         "one 429 on the original account, one successful replay on the rotated account"
     );
     assert!(
-        server.authorization_changed_from_first(1),
+        fixture.server.authorization_changed_from_first(1),
         "the replay must carry a different bearer token than the first attempt"
     );
-    assert!(server.authorization_contains(0, "fixture-access-claude-1"));
-    assert!(server.authorization_contains(1, "fixture-access-claude-2"));
+    assert!(
+        fixture
+            .server
+            .authorization_contains(0, "fixture-access-claude-1")
+    );
+    assert!(
+        fixture
+            .server
+            .authorization_contains(1, "fixture-access-claude-2")
+    );
 
     assert_eq!(
         jcode_base::auth::claude::active_account_label().as_deref(),
         Some("claude-2"),
         "a rotation that lands on a working account must stick, not get restored"
     );
+}
 
-    server.stop();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_publishes_an_account_rotated_bus_event() {
+    let fixture = RotationFixture::new().await;
+    let mut bus_rx = jcode_base::bus::Bus::global().subscribe();
+
+    fixture.drive_stream_to_completion().await;
+
+    let mut rotated_labels = Vec::new();
+    while let Ok(event) = bus_rx.try_recv() {
+        if let jcode_base::bus::BusEvent::AnthropicAccountRotated(rotated) = event {
+            rotated_labels.push((rotated.previous_label.clone(), rotated.label.clone()));
+        }
+    }
+
+    assert_eq!(
+        rotated_labels,
+        vec![(Some("claude-1".to_string()), "claude-2".to_string())],
+        "a rotation the client cannot otherwise observe must be announced exactly once"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
