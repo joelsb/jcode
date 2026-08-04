@@ -176,6 +176,11 @@ latex_rendering = "image"
 # Show idle animation before first prompt (default: false)
 idle_animation = false
 
+# Keep the idle animation running for the whole session (after the first prompt
+# and past the 30s dormancy cutoff) instead of only on the fresh-session screen.
+# Requires idle_animation = true. (default: false)
+idle_animation_persistent = false
+
 # Briefly animate a user prompt line when it enters the viewport (default: true)
 prompt_entry_animation = true
 

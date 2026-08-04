@@ -49,6 +49,21 @@ fn deep_idle_dormant(state: &dyn TuiState) -> bool {
     stream_dormant && user_dormant
 }
 
+/// Whether the user asked for the decorative animation to keep running for the
+/// whole session, not just on the pre-first-prompt screen.
+///
+/// `display.idle_animation` alone only covers the fresh-session screen: the
+/// donut disappears the moment a conversation starts and again after 30s of
+/// dormancy. `display.idle_animation_persistent` opts out of both of those
+/// gates, so the animation keeps playing whenever the session is otherwise
+/// resting (not processing, not streaming, nothing queued). The focus gate and
+/// the performance-tier gates still apply: an unfocused or Reduced/Minimal
+/// client must never burn cores on decoration.
+pub(crate) fn idle_animation_persistent() -> bool {
+    let display = &crate::config::config().display;
+    display.idle_animation && display.idle_animation_persistent
+}
+
 fn idle_donut_active_with_policy(
     state: &dyn TuiState,
     policy: &crate::perf::TuiPerfPolicy,
@@ -73,14 +88,14 @@ fn idle_donut_active_with_policy(
     // The idle donut is decorative.  Leaving many dormant tabs/sessions open
     // should not keep every TUI repainting forever, especially when those tabs
     // are hidden behind a terminal multiplexer or kitty single-instance window.
-    if deep_idle_dormant(state) {
+    if deep_idle_dormant(state) && !idle_animation_persistent() {
         return false;
     }
 
     policy.enable_decorative_animations
         && crate::config::config().display.idle_animation
         && policy.tier.idle_animation_enabled()
-        && !has_started_conversation(state)
+        && (idle_animation_persistent() || !has_started_conversation(state))
         && !state.is_processing()
         && state.streaming_text().is_empty()
         && state.queued_messages().is_empty()
@@ -442,6 +457,7 @@ pub(crate) fn redraw_interval_with_policy_and_animation(
     let deep_idle = deep_idle_dormant(state);
 
     if deep_idle
+        && !idle_donut_active_with_policy(state, policy)
         && !state.is_processing()
         && state.streaming_text().is_empty()
         && !state.has_pending_mouse_scroll_animation()
@@ -582,8 +598,11 @@ fn periodic_redraw_required_inner(state: &dyn TuiState, include_idle_animation: 
     let policy = crate::perf::tui_policy();
 
     let deep_idle = deep_idle_dormant(state);
+    let animation_paces_redraws =
+        idle_donut_paces_redraws(state, &policy, animation_on_screen_now());
 
     if deep_idle
+        && !idle_donut_active_with_policy(state, &policy)
         && !state.is_processing()
         && state.streaming_text().is_empty()
         && !state.has_pending_mouse_scroll_animation()
@@ -600,8 +619,6 @@ fn periodic_redraw_required_inner(state: &dyn TuiState, include_idle_animation: 
         return false;
     }
 
-    let animation_paces_redraws =
-        idle_donut_paces_redraws(state, &policy, animation_on_screen_now());
     if include_idle_animation && animation_paces_redraws {
         return true;
     }
