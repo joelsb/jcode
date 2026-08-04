@@ -33,8 +33,8 @@ mod stream_timeout;
 use crate::auth;
 use crate::message::{Message, ToolDefinition};
 use account_failover::{
-    account_usage_probe, active_account_label_for_provider, error_looks_like_usage_limit,
-    maybe_annotate_limit_summary, prefer_account_failover_enabled,
+    account_usage_probe, active_account_label_for_provider,
+    maybe_annotate_limit_summary,
     same_provider_account_candidates, same_provider_account_failover_enabled,
     set_account_override_for_provider,
 };
