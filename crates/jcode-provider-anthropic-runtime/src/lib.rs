@@ -59,6 +59,39 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 /// OAuth endpoint (with beta=true query param)
 const API_URL_OAUTH: &str = "https://api.anthropic.com/v1/messages?beta=true";
 
+/// Test-only seam so `stream_response` can be pointed at a local mock HTTP
+/// server instead of the real Anthropic endpoint. `API_URL`/`API_URL_OAUTH`
+/// are `const`, so this is the smallest indirection that lets a test drive
+/// the real retry/rotation loop end-to-end. Compiled out entirely in
+/// non-test builds (no `std::env::var` involved, nothing readable in a
+/// release binary): `api_url` reduces to the plain `if is_oauth {..} else
+/// {..}` it replaces.
+#[cfg(test)]
+static TEST_API_URL_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_test_api_url_override(url: Option<String>) {
+    *TEST_API_URL_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = url;
+}
+
+fn api_url(is_oauth: bool) -> String {
+    #[cfg(test)]
+    {
+        if let Some(url) = TEST_API_URL_OVERRIDE.get().and_then(|cell| {
+            cell.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }) {
+            return url;
+        }
+    }
+    (if is_oauth { API_URL_OAUTH } else { API_URL }).to_string()
+}
+
 #[cfg(test)]
 pub(crate) const OAUTH_BETA_HEADERS_1M: &str = jcode_provider_core::ANTHROPIC_OAUTH_BETA_HEADERS_1M;
 
@@ -2025,10 +2058,10 @@ async fn stream_response(
     let connect_start = std::time::Instant::now();
     let stream_idle_timeout = jcode_base::provider::stream_idle_timeout();
     // Build request with appropriate auth headers
-    let url = if is_oauth { API_URL_OAUTH } else { API_URL };
+    let url = api_url(is_oauth);
 
     let mut req = client
-        .post(url)
+        .post(url.as_str())
         .header("anthropic-version", API_VERSION)
         .header("content-type", "application/json")
         .header(

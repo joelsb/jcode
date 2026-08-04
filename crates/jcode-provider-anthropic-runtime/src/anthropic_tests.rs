@@ -2033,3 +2033,471 @@ fn account_override_is_restored_only_when_rotation_ran_dry() {
         "no override was set, so none may be written"
     );
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end account rotation over real HTTP, against a hand-rolled mock
+// server. `API_URL`/`API_URL_OAUTH` are `const`, so `set_test_api_url_override`
+// (test-only, compiled out of release builds; see `api_url` in `lib.rs`) is the
+// seam that lets `run_stream_with_retries` be driven exactly as production
+// calls it, with a local listener standing in for api.anthropic.com. No mock
+// server crate is added: the workspace has none (wiremock/httpmock/mockito are
+// all absent from every `Cargo.toml` and `Cargo.lock`), and a few dozen lines
+// of raw HTTP/1.1 framing is small enough not to be worth a new dependency for
+// one test file.
+//
+// Fixture tokens below (`fixture-access-claude-*`) are not real credentials;
+// nothing derived from a real account is ever read, logged, or asserted here.
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+/// Minimal single-purpose HTTP/1.1 responder standing in for the Anthropic
+/// Messages endpoint. Each accepted connection is one request/response pair:
+/// headers and the declared `Content-Length` body are read (so the client's
+/// `write_all` never blocks on a peer that stopped reading), the
+/// `Authorization` header is captured for the test to inspect, and a
+/// `respond` callback decides the status/body by 1-based call number.
+struct MockAnthropicServer {
+    addr: std::net::SocketAddr,
+    authorizations: Arc<std::sync::Mutex<Vec<String>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl MockAnthropicServer {
+    async fn start(mut respond: impl FnMut(u32) -> (u16, String) + Send + 'static) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let authorizations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let authorizations_task = Arc::clone(&authorizations);
+
+        let handle = tokio::spawn(async move {
+            let mut call_no: u32 = 0;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                call_no += 1;
+                let authorization = read_request_authorization(&mut socket).await;
+                authorizations_task.lock().unwrap().push(authorization);
+
+                let (status, body) = respond(call_no);
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: text/event-stream\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n{body}",
+                    status = status,
+                    reason = canonical_reason(status),
+                    len = body.len(),
+                    body = body,
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        Self {
+            addr,
+            authorizations,
+            handle,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/v1/messages", self.addr)
+    }
+
+    fn call_count(&self) -> usize {
+        self.authorizations.lock().unwrap().len()
+    }
+
+    /// Whether the bearer token on request `index` (0-based) differs from the
+    /// one on request 0. Never returns or prints the token itself.
+    fn authorization_changed_from_first(&self, index: usize) -> bool {
+        let seen = self.authorizations.lock().unwrap();
+        match (seen.first(), seen.get(index)) {
+            (Some(first), Some(other)) => first != other,
+            _ => false,
+        }
+    }
+
+    fn authorization_contains(&self, index: usize, needle: &str) -> bool {
+        self.authorizations
+            .lock()
+            .unwrap()
+            .get(index)
+            .is_some_and(|auth| auth.contains(needle))
+    }
+
+    fn stop(self) {
+        self.handle.abort();
+    }
+}
+
+fn canonical_reason(status: u16) -> &'static str {
+    match status {
+        429 => "Too Many Requests",
+        200 => "OK",
+        _ => "Error",
+    }
+}
+
+async fn read_request_authorization(socket: &mut tokio::net::TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let headers_end = loop {
+        let n = socket.read(&mut tmp).await.unwrap_or(0);
+        if n == 0 {
+            return String::new();
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+    };
+    let header_text = String::from_utf8_lossy(&buf[..headers_end]).to_string();
+    let content_length: usize = header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let body_start = headers_end + 4;
+    while buf.len() < body_start + content_length {
+        let n = socket.read(&mut tmp).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn mock_429_body() -> String {
+    "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"this request would exceed your account's rate limit.\"}}".to_string()
+}
+
+fn mock_success_sse_body(text: &str) -> String {
+    format!(
+        concat!(
+            "event: message_start\n",
+            "data: {{\"type\":\"message_start\",\"message\":{{\"model\":\"claude-3-5-haiku-20241022\",\"usage\":{{\"input_tokens\":5}}}}}}\n\n",
+            "event: content_block_start\n",
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n",
+            "event: content_block_stop\n",
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+            "event: message_delta\n",
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n",
+            "event: message_stop\n",
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        ),
+        text = text,
+    )
+}
+
+/// Seeds two fake Claude accounts (`claude-1` active, `claude-2` the only
+/// rotation candidate) in the sandboxed `JCODE_HOME`. Caller must hold
+/// `jcode_base::storage::lock_test_env()` and have already pointed
+/// `JCODE_HOME` at a temp dir, exactly like the credential-mode tests above.
+fn seed_two_claude_accounts() {
+    let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    for label in ["claude-1", "claude-2"] {
+        jcode_base::auth::claude::upsert_account(jcode_base::auth::claude::AnthropicAccount {
+            label: label.to_string(),
+            access: format!("fixture-access-{label}"),
+            refresh: String::new(),
+            expires: far_future,
+            email: None,
+            subscription_type: Some("max".to_string()),
+            scopes: vec![],
+        })
+        .unwrap();
+    }
+    jcode_base::auth::claude::set_active_account("claude-1").unwrap();
+}
+
+fn e2e_test_request() -> ApiRequest {
+    ApiRequest {
+        model: "claude-3-5-haiku-20241022".to_string(),
+        max_tokens: 16,
+        system: None,
+        messages: vec![],
+        tools: None,
+        metadata: None,
+        thinking: None,
+        output_config: None,
+        temperature: None,
+        service_tier: None,
+        stream: true,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_stream_with_retries_rotates_account_on_streaming_429_and_replays_successfully() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+
+    assert_eq!(
+        jcode_base::provider::account_failover_candidates(
+            jcode_provider_core::ActiveProvider::Claude
+        ),
+        vec!["claude-2".to_string()],
+        "fixture must leave exactly one rotation candidate"
+    );
+
+    let server = MockAnthropicServer::start(|call_no| {
+        if call_no == 1 {
+            (429, mock_429_body())
+        } else {
+            (200, mock_success_sse_body("pong"))
+        }
+    })
+    .await;
+    set_test_api_url_override(Some(server.url()));
+
+    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+    let model_state = Arc::new(std::sync::RwLock::new(
+        "claude-3-5-haiku-20241022".to_string(),
+    ));
+
+    run_stream_with_retries(
+        Client::new(),
+        "fixture-access-claude-1".to_string(),
+        true,
+        e2e_test_request(),
+        tx,
+        Arc::new(RwLock::new(None)),
+        "claude-3-5-haiku-20241022".to_string(),
+        "test-session".to_string(),
+        model_state,
+    )
+    .await;
+
+    set_test_api_url_override(None);
+
+    let mut events = Vec::new();
+    while let Some(item) = rx.recv().await {
+        events.push(item);
+    }
+
+    for event in &events {
+        assert!(
+            event.is_ok(),
+            "stream must succeed once the retry replays on a working account"
+        );
+    }
+
+    let switched = events.iter().any(|event| {
+        matches!(
+            event,
+            Ok(StreamEvent::StatusDetail { detail })
+                if detail.contains("claude-1") && detail.contains("claude-2")
+        )
+    });
+    assert!(
+        switched,
+        "the account switch must be surfaced to the consumer via StatusDetail"
+    );
+
+    let text_deltas: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            Ok(StreamEvent::TextDelta(text)) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text_deltas,
+        vec!["pong"],
+        "the replay must stream the successful response exactly once, not duplicated"
+    );
+
+    assert_eq!(
+        server.call_count(),
+        2,
+        "one 429 on the original account, one successful replay on the rotated account"
+    );
+    assert!(
+        server.authorization_changed_from_first(1),
+        "the replay must carry a different bearer token than the first attempt"
+    );
+    assert!(server.authorization_contains(0, "fixture-access-claude-1"));
+    assert!(server.authorization_contains(1, "fixture-access-claude-2"));
+
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label().as_deref(),
+        Some("claude-2"),
+        "a rotation that lands on a working account must stick, not get restored"
+    );
+
+    server.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_stream_with_retries_bounds_rotation_attempts_and_restores_original_account() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+
+    let candidates = jcode_base::provider::account_failover_candidates(
+        jcode_provider_core::ActiveProvider::Claude,
+    );
+    assert_eq!(
+        candidates.len(),
+        1,
+        "fixture must leave exactly one rotation candidate"
+    );
+
+    let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+    set_test_api_url_override(Some(server.url()));
+
+    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+    let model_state = Arc::new(std::sync::RwLock::new(
+        "claude-3-5-haiku-20241022".to_string(),
+    ));
+
+    run_stream_with_retries(
+        Client::new(),
+        "fixture-access-claude-1".to_string(),
+        true,
+        e2e_test_request(),
+        tx,
+        Arc::new(RwLock::new(None)),
+        "claude-3-5-haiku-20241022".to_string(),
+        "test-session".to_string(),
+        model_state,
+    )
+    .await;
+
+    set_test_api_url_override(None);
+
+    let mut events = Vec::new();
+    while let Some(item) = rx.recv().await {
+        events.push(item);
+    }
+
+    let error_count = events.iter().filter(|event| event.is_err()).count();
+    assert_eq!(
+        error_count, 1,
+        "exactly one terminal error once every account and retry is exhausted"
+    );
+
+    // attempt_budget starts at MAX_RETRIES and gains exactly one extra attempt
+    // per successful rotation; with a single rotation candidate that always
+    // 429s, the budget grows from MAX_RETRIES to MAX_RETRIES + 1 and then the
+    // loop must stop -- this is the assertion that an always-429 world cannot
+    // spin the retry loop forever.
+    assert_eq!(
+        server.call_count(),
+        (MAX_RETRIES + 1) as usize,
+        "the rotation+retry loop must terminate at the sized attempt budget instead of looping forever"
+    );
+
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label().as_deref(),
+        Some("claude-1"),
+        "every account limited: the original account override must be restored"
+    );
+
+    server.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switch_to_next_claude_account_terminates_once_candidates_are_exhausted() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+
+    let credentials: Arc<RwLock<Option<CachedCredentials>>> = Arc::new(RwLock::new(None));
+    let mut tried = vec!["claude-1".to_string()];
+
+    let first = switch_to_next_claude_account(&credentials, &mut tried).await;
+    assert_eq!(
+        first.as_ref().map(|(label, _)| label.as_str()),
+        Some("claude-2"),
+        "the only untried candidate must be picked"
+    );
+
+    let second = switch_to_next_claude_account(&credentials, &mut tried).await;
+    assert!(
+        second.is_none(),
+        "no candidates left: must return None instead of looping"
+    );
+
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label().as_deref(),
+        Some("claude-2"),
+        "a None return must leave the override exactly as the prior successful switch set it"
+    );
+}
+
+#[test]
+fn restore_claude_account_skips_write_when_another_session_changed_the_override() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    jcode_base::auth::claude::upsert_account(jcode_base::auth::claude::AnthropicAccount {
+        label: "claude-3".to_string(),
+        access: "fixture-access-claude-3".to_string(),
+        refresh: String::new(),
+        expires: far_future,
+        email: None,
+        subscription_type: Some("max".to_string()),
+        scopes: vec![],
+    })
+    .unwrap();
+    // Simulate: this request rotated claude-1 -> claude-2, then before the
+    // dead-end restore ran, something else (another concurrent request, or a
+    // user-issued account switch) pointed the process-wide override at a
+    // third account.
+    jcode_base::auth::claude::set_active_account_override(Some("claude-3".to_string()));
+
+    restore_claude_account(
+        &Some("claude-1".to_string()),
+        &Some("claude-2".to_string()),
+        true,
+    );
+
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label().as_deref(),
+        Some("claude-3"),
+        "a live override that no longer matches ours must not be clobbered"
+    );
+}
+
+#[test]
+fn restore_claude_account_writes_back_when_override_still_matches() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::auth::claude::set_active_account_override(Some("claude-2".to_string()));
+
+    restore_claude_account(
+        &Some("claude-1".to_string()),
+        &Some("claude-2".to_string()),
+        true,
+    );
+
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label().as_deref(),
+        Some("claude-1"),
+        "override still holds our label: restoring the original is safe"
+    );
+}
