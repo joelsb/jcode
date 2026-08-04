@@ -467,8 +467,7 @@ pub(crate) async fn execute_account_command_remote(
                     return Ok(());
                 }
                 crate::auth::AuthStatus::invalidate_cache();
-                app.context_limit = app.provider.context_window() as u64;
-                app.context_warning_shown = false;
+                app.refresh_context_limit_after_account_change();
                 remote.switch_anthropic_account(&label).await?;
                 app.push_display_message(DisplayMessage::system(format!(
                     "Switched to Anthropic account {}.",
@@ -485,8 +484,7 @@ pub(crate) async fn execute_account_command_remote(
                     return Ok(());
                 }
                 crate::auth::AuthStatus::invalidate_cache();
-                app.context_limit = app.provider.context_window() as u64;
-                app.context_warning_shown = false;
+                app.refresh_context_limit_after_account_change();
                 remote.switch_openai_account(&label).await?;
                 app.push_display_message(DisplayMessage::system(format!(
                     "Switched to OpenAI account {}.",
@@ -515,8 +513,7 @@ pub(crate) async fn execute_account_command_remote(
                         return Ok(());
                     }
                     crate::auth::AuthStatus::invalidate_cache();
-                    app.context_limit = app.provider.context_window() as u64;
-                    app.context_warning_shown = false;
+                    app.refresh_context_limit_after_account_change();
                     remote.switch_anthropic_account(&label).await?;
                     app.push_display_message(DisplayMessage::system(format!(
                         "Switched to Anthropic account {}.",
@@ -533,8 +530,7 @@ pub(crate) async fn execute_account_command_remote(
                         return Ok(());
                     }
                     crate::auth::AuthStatus::invalidate_cache();
-                    app.context_limit = app.provider.context_window() as u64;
-                    app.context_warning_shown = false;
+                    app.refresh_context_limit_after_account_change();
                     remote.switch_openai_account(&label).await?;
                     app.push_display_message(DisplayMessage::system(format!(
                         "Switched to OpenAI account {}.",
