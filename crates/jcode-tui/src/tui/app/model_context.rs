@@ -649,6 +649,18 @@ impl App {
         }
     }
 
+    /// Recompute the context limit after an account change.
+    ///
+    /// Account switches change credentials, not the model, so the limit must
+    /// come from the active model (which may be a 1M variant) rather than from
+    /// the local provider's default window.
+    pub(in crate::tui::app) fn refresh_context_limit_after_account_change(&mut self) {
+        let active_model = self
+            .effective_remote_provider_model()
+            .unwrap_or_else(|| self.provider.model());
+        self.update_context_limit_for_model(&active_model);
+    }
+
     pub(super) fn effective_context_tokens_from_usage(
         &self,
         input_tokens: u64,

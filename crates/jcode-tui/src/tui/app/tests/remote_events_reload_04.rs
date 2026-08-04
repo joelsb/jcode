@@ -2471,3 +2471,23 @@ fn rotation_event_keeps_the_model_context_limit_and_adopts_the_new_account() {
         "the client must mirror the account the daemon actually uses"
     );
 }
+
+#[test]
+fn manual_account_switch_keeps_the_model_context_limit() {
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_provider_model = Some("claude-opus-5[1m]".to_string());
+    app.update_context_limit_for_model("claude-opus-5[1m]");
+    let expected_limit = app.context_limit;
+    assert!(
+        expected_limit > 200_000,
+        "fixture must use a 1M model or this test cannot detect the clobber"
+    );
+
+    app.refresh_context_limit_after_account_change();
+
+    assert_eq!(
+        app.context_limit, expected_limit,
+        "switching accounts changes credentials, not the model's context window"
+    );
+}
