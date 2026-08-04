@@ -1973,6 +1973,13 @@ async fn run_stream_with_retries(
                                 .clone()
                                 .unwrap_or_else(auth::claude::primary_account_label);
                             current_account = Some(switched_label.clone());
+                            // The client renders usage from its own process and
+                            // cannot see this process's account override, so a
+                            // rotation is invisible to it unless announced.
+                            jcode_base::bus::Bus::global().publish_anthropic_account_rotated(
+                                switched_label.clone(),
+                                Some(previous_label.clone()),
+                            );
                             jcode_base::logging::info(&format!(
                                 "Same-provider account failover: Anthropic rate-limited ({}); retrying '{}' on account '{}'",
                                 e, model_name, switched_label
@@ -2210,6 +2217,12 @@ fn restore_claude_account(
     }
     auth::claude::set_active_account_override(original.clone());
     jcode_base::auth::AuthStatus::invalidate_cached_status();
+    jcode_base::bus::Bus::global().publish_anthropic_account_rotated(
+        original
+            .clone()
+            .unwrap_or_else(auth::claude::primary_account_label),
+        ours.clone(),
+    );
 }
 
 async fn force_refresh_oauth_token(

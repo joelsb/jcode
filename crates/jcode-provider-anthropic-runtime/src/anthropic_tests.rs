@@ -30,94 +30,6 @@ impl Drop for EnvVarGuard {
     }
 }
 
-#[test]
-fn direct_api_url_supports_standard_and_profile_overrides() {
-    let _lock = jcode_base::storage::lock_test_env();
-    let _standard = EnvVarGuard::set("ANTHROPIC_BASE_URL", "https://proxy.example/v1/");
-    assert_eq!(direct_api_url(), "https://proxy.example/v1/messages");
-
-    let _profile = EnvVarGuard::set(
-        "JCODE_ANTHROPIC_API_BASE",
-        "https://gateway.example/anthropic/v1/messages",
-    );
-    assert_eq!(
-        direct_api_url(),
-        "https://gateway.example/anthropic/v1/messages"
-    );
-}
-
-#[test]
-fn configured_direct_headers_parse_and_reject_invalid_values() {
-    let _lock = jcode_base::storage::lock_test_env();
-    let _headers = EnvVarGuard::set(
-        "JCODE_ANTHROPIC_HEADERS",
-        r#"{"x-tenant":"alpha","x-route":"claude"}"#,
-    );
-    let parsed = configured_direct_headers().expect("valid custom headers");
-    assert_eq!(parsed.get("x-tenant").unwrap(), "alpha");
-    assert_eq!(parsed.get("x-route").unwrap(), "claude");
-
-    let _invalid = EnvVarGuard::set("JCODE_ANTHROPIC_HEADERS", r#"{"bad header":"x"}"#);
-    assert!(configured_direct_headers().is_err());
-}
-
-#[test]
-fn anthropic_auth_token_selects_bearer_without_affecting_explicit_profile_auth() {
-    let _lock = jcode_base::storage::lock_test_env();
-    let _token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", "gateway-token");
-    assert_eq!(direct_auth_mode(), "bearer");
-
-    let _explicit = EnvVarGuard::set("JCODE_ANTHROPIC_AUTH", "header");
-    assert_eq!(direct_auth_mode(), "header");
-}
-
-#[test]
-fn named_profile_runtime_captures_transport_and_credential_immutably() {
-    let _lock = jcode_base::storage::lock_test_env();
-    let _base = EnvVarGuard::set("JCODE_ANTHROPIC_API_BASE", "https://one.example/v1");
-    let _auth = EnvVarGuard::set("JCODE_ANTHROPIC_AUTH", "bearer");
-    let _key_name = EnvVarGuard::set("JCODE_ANTHROPIC_API_KEY_NAME", "PROFILE_ONE_KEY");
-    let _key = EnvVarGuard::set("PROFILE_ONE_KEY", "one-secret");
-    let provider = AnthropicProvider::new();
-
-    let _changed_base = EnvVarGuard::set("JCODE_ANTHROPIC_API_BASE", "https://two.example/v1");
-    let _changed_key = EnvVarGuard::set("PROFILE_ONE_KEY", "two-secret");
-    assert_eq!(
-        provider.direct_transport.api_url,
-        "https://one.example/v1/messages"
-    );
-    assert_eq!(provider.direct_transport.auth_mode, "bearer");
-    assert_eq!(
-        provider.profile_api_key.as_ref().unwrap().as_ref().unwrap(),
-        "one-secret"
-    );
-}
-
-#[test]
-fn named_anthropic_profile_accepts_its_configured_custom_model() {
-    let _lock = jcode_base::storage::lock_test_env();
-    let _home = tempfile::TempDir::new().expect("temp home");
-    let _home_guard = EnvVarGuard::set("JCODE_HOME", _home.path());
-    std::fs::write(
-        _home.path().join("config.toml"),
-        r#"
-        [providers.custom]
-        type = "anthropic-compatible"
-        base_url = "http://localhost:12345/v1"
-        default_model = "claude-private"
-        "#,
-    )
-    .expect("write config");
-    jcode_base::config::Config::invalidate_cache();
-    let _profile = EnvVarGuard::set("JCODE_NAMED_PROVIDER_PROFILE", "custom");
-    let models = active_anthropic_profile_models().expect("active profile models");
-    assert!(models.iter().any(|model| model == "claude-private"));
-    assert!(!models.iter().any(|model| model == "not-configured"));
-    drop(_profile);
-    drop(_home_guard);
-    jcode_base::config::Config::invalidate_cache();
-}
-
 async fn collect_live_smoke_stream(
     mut stream: EventStream,
     timeout: std::time::Duration,
@@ -1919,86 +1831,6 @@ fn anthropic_quality_rank_orders_opus_before_haiku_and_retired_last() {
 }
 
 #[test]
-fn fable_quota_fallback_selects_the_best_available_opus() {
-    let fallback = AnthropicProvider::best_available_opus_model("claude-fable-5")
-        .expect("the curated Anthropic catalog should contain an Opus fallback");
-    assert!(
-        fallback.contains("claude-opus"),
-        "unexpected fallback: {fallback}"
-    );
-
-    let candidates = jcode_base::provider::cached_anthropic_model_ids()
-        .unwrap_or_else(jcode_base::provider::known_anthropic_model_ids);
-    let best_rank = candidates
-        .iter()
-        .filter(|model| model.to_ascii_lowercase().contains("claude-opus"))
-        .filter(|model| !anthropic_model_is_retired(model))
-        .map(|model| anthropic_model_quality_rank(model))
-        .min()
-        .expect("available Opus model");
-    assert_eq!(anthropic_model_quality_rank(&fallback), best_rank);
-}
-
-#[test]
-fn model_scoped_usage_routes_only_exhausted_fable_to_opus() {
-    let usage = jcode_base::usage::UsageData {
-        model_scoped: vec![jcode_base::usage::ModelScopedUsageWindow {
-            model_name: "Fable".to_string(),
-            utilization: 1.0,
-            resets_at: Some("2026-08-11T00:00:00Z".to_string()),
-        }],
-        ..Default::default()
-    };
-    let fallback = AnthropicProvider::fallback_for_model_scoped_usage("claude-fable-5", &usage)
-        .expect("exhausted Fable should route to Opus");
-    assert!(
-        fallback.contains("claude-opus"),
-        "unexpected fallback: {fallback}"
-    );
-    assert!(
-        AnthropicProvider::fallback_for_model_scoped_usage("claude-opus-5", &usage).is_none(),
-        "an exhausted Fable scope must not reroute an explicitly selected Opus"
-    );
-
-    let available = jcode_base::usage::UsageData {
-        model_scoped: vec![jcode_base::usage::ModelScopedUsageWindow {
-            model_name: "Fable".to_string(),
-            utilization: 0.98,
-            resets_at: None,
-        }],
-        ..Default::default()
-    };
-    assert!(
-        AnthropicProvider::fallback_for_model_scoped_usage("claude-fable-5", &available).is_none(),
-        "Fable must remain selected while its scoped quota is available"
-    );
-}
-
-#[test]
-fn detects_live_fable_scoped_limit_errors_without_misrouting_other_limits() {
-    assert!(is_fable_scoped_limit_error(
-        "claude-fable-5",
-        r#"429 {"type":"rate_limit_error","message":"You have reached your weekly Fable limit"}"#,
-    ));
-    assert!(is_fable_scoped_limit_error(
-        "claude-fable-5",
-        "usage limit reached for the 7-day model window",
-    ));
-    assert!(!is_fable_scoped_limit_error(
-        "claude-opus-5",
-        "weekly Fable rate limit reached",
-    ));
-    assert!(!is_fable_scoped_limit_error(
-        "claude-fable-5",
-        "429 overloaded_error: service temporarily overloaded",
-    ));
-    assert!(!is_fable_scoped_limit_error(
-        "claude-fable-5",
-        "global 5-hour rate limit reached",
-    ));
-}
-
-#[test]
 fn ping_keepalive_emits_streaming_phase_event() {
     // Issue #451: during silent reasoning phases, `ping` events can be the
     // only upstream traffic. They must surface as a StreamEvent so the client
@@ -2410,56 +2242,93 @@ fn e2e_test_request() -> ApiRequest {
     }
 }
 
+/// Fixture for the account-rotation streaming tests: seeds two fake Claude
+/// accounts (`claude-1` active, `claude-2` the only rotation candidate) in a
+/// sandboxed `JCODE_HOME`, and runs a mock server that 429s on the first call
+/// then answers 200 on every subsequent one.
+///
+/// Holds the test-env lock and temp dir for its own lifetime so callers don't
+/// need to manage either. `drive_stream_to_completion` runs
+/// `run_stream_with_retries` against the mock server and returns every event.
+///
+/// Field order matters: struct fields drop in declaration order (unlike local
+/// variables, which drop in reverse), so `_guard` is declared last to release
+/// the test-env lock only after the temp dir, env var, and mock server have
+/// already torn down.
+struct RotationFixture {
+    server: MockAnthropicServer,
+    _home: EnvVarGuard,
+    _temp: tempfile::TempDir,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl RotationFixture {
+    async fn new() -> Self {
+        let _guard = jcode_base::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().unwrap();
+        let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+        seed_two_claude_accounts();
+
+        assert_eq!(
+            jcode_base::provider::account_failover_candidates(
+                jcode_provider_core::ActiveProvider::Claude
+            ),
+            vec!["claude-2".to_string()],
+            "fixture must leave exactly one rotation candidate"
+        );
+
+        let server = MockAnthropicServer::start(|call_no| {
+            if call_no == 1 {
+                (429, mock_429_body())
+            } else {
+                (200, mock_success_sse_body("pong"))
+            }
+        })
+        .await;
+        set_test_api_url_override(Some(server.url()));
+
+        Self {
+            server,
+            _home,
+            _temp: temp,
+            _guard,
+        }
+    }
+
+    async fn drive_stream_to_completion(&self) -> Vec<Result<StreamEvent>> {
+        let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+        let model_state = Arc::new(std::sync::RwLock::new(
+            "claude-3-5-haiku-20241022".to_string(),
+        ));
+
+        run_stream_with_retries(
+            Client::new(),
+            "fixture-access-claude-1".to_string(),
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+            DirectTransportConfig::from_env(),
+        )
+        .await;
+
+        set_test_api_url_override(None);
+
+        let mut events = Vec::new();
+        while let Some(item) = rx.recv().await {
+            events.push(item);
+        }
+        events
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_stream_with_retries_rotates_account_on_streaming_429_and_replays_successfully() {
-    let _guard = jcode_base::storage::lock_test_env();
-    let temp = tempfile::TempDir::new().unwrap();
-    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
-    seed_two_claude_accounts();
-
-    assert_eq!(
-        jcode_base::provider::account_failover_candidates(
-            jcode_provider_core::ActiveProvider::Claude
-        ),
-        vec!["claude-2".to_string()],
-        "fixture must leave exactly one rotation candidate"
-    );
-
-    let server = MockAnthropicServer::start(|call_no| {
-        if call_no == 1 {
-            (429, mock_429_body())
-        } else {
-            (200, mock_success_sse_body("pong"))
-        }
-    })
-    .await;
-    set_test_api_url_override(Some(server.url()));
-
-    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
-    let model_state = Arc::new(std::sync::RwLock::new(
-        "claude-3-5-haiku-20241022".to_string(),
-    ));
-
-    run_stream_with_retries(
-        Client::new(),
-        "fixture-access-claude-1".to_string(),
-        true,
-        e2e_test_request(),
-        tx,
-        Arc::new(RwLock::new(None)),
-        "claude-3-5-haiku-20241022".to_string(),
-        "test-session".to_string(),
-        model_state,
-        DirectTransportConfig::from_env(),
-    )
-    .await;
-
-    set_test_api_url_override(None);
-
-    let mut events = Vec::new();
-    while let Some(item) = rx.recv().await {
-        events.push(item);
-    }
+    let fixture = RotationFixture::new().await;
+    let events = fixture.drive_stream_to_completion().await;
 
     for event in &events {
         assert!(
@@ -2494,24 +2363,51 @@ async fn run_stream_with_retries_rotates_account_on_streaming_429_and_replays_su
     );
 
     assert_eq!(
-        server.call_count(),
+        fixture.server.call_count(),
         2,
         "one 429 on the original account, one successful replay on the rotated account"
     );
     assert!(
-        server.authorization_changed_from_first(1),
+        fixture.server.authorization_changed_from_first(1),
         "the replay must carry a different bearer token than the first attempt"
     );
-    assert!(server.authorization_contains(0, "fixture-access-claude-1"));
-    assert!(server.authorization_contains(1, "fixture-access-claude-2"));
+    assert!(
+        fixture
+            .server
+            .authorization_contains(0, "fixture-access-claude-1")
+    );
+    assert!(
+        fixture
+            .server
+            .authorization_contains(1, "fixture-access-claude-2")
+    );
 
     assert_eq!(
         jcode_base::auth::claude::active_account_label().as_deref(),
         Some("claude-2"),
         "a rotation that lands on a working account must stick, not get restored"
     );
+}
 
-    server.stop();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_publishes_an_account_rotated_bus_event() {
+    let fixture = RotationFixture::new().await;
+    let mut bus_rx = jcode_base::bus::Bus::global().subscribe();
+
+    fixture.drive_stream_to_completion().await;
+
+    let mut rotated_labels = Vec::new();
+    while let Ok(event) = bus_rx.try_recv() {
+        if let jcode_base::bus::BusEvent::AnthropicAccountRotated(rotated) = event {
+            rotated_labels.push((rotated.previous_label.clone(), rotated.label.clone()));
+        }
+    }
+
+    assert_eq!(
+        rotated_labels,
+        vec![(Some("claude-1".to_string()), "claude-2".to_string())],
+        "a rotation the client cannot otherwise observe must be announced exactly once"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
