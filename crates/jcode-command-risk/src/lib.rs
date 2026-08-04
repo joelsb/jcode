@@ -307,11 +307,21 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
         return;
     }
 
-    let mut targets: Vec<&Token> = tokens
-        .iter()
-        .skip(1)
-        .filter(|t| !t.is_flag() && !t.is_operator)
-        .collect();
+    // Operands only count as destruction targets when a destructive verb is
+    // actually present. Without this guard, `grep -rn "x" .` was classified as
+    // a recursive delete of `.`: the redirect made the segment interesting, and
+    // then every operand of a read-only program was judged as if `rm` had been
+    // typed. When only a redirect fired, the sole thing being written is the
+    // redirect target.
+    let mut targets: Vec<&Token> = if triggered {
+        tokens
+            .iter()
+            .skip(1)
+            .filter(|t| !t.is_flag() && !t.is_operator)
+            .collect()
+    } else {
+        Vec::new()
+    };
     targets.extend(redirect_targets.iter().copied());
 
     // A destructive command fed by a pipe takes its operands from the previous
@@ -343,7 +353,9 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
         return;
     }
 
-    let recursive = tokens.iter().any(|t| t.is_recursive_flag());
+    // `-r` only widens blast radius for a destructive verb. On `grep -r` it
+    // describes how the program reads, not what it removes.
+    let recursive = triggered && tokens.iter().any(|t| t.is_recursive_flag());
 
     for target in targets {
         // `dd`-style `key=value` operands hide the path from a naive scan.

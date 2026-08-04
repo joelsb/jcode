@@ -406,3 +406,70 @@ fn ordinary_wrapped_commands_still_run_immediately() {
         "gate became noisy on normal work: {noisy:#?}"
     );
 }
+
+/// Read-only commands that merely silence stderr must stay Safe.
+///
+/// Regression: `2>/dev/null` resolved inside the recursively-protected `/dev`
+/// tree and was reported as catastrophic, so `wc -c a b 2>/dev/null` was
+/// hard-blocked with no possible override.
+#[test]
+fn stream_redirects_are_not_destructive() {
+    let ctx = ctx();
+    let mut blocked = Vec::new();
+    for command in [
+        "echo hi 2>/dev/null",
+        "wc -c AGENTS.md CLAUDE.md 2>/dev/null",
+        "cat missing.txt 2>/dev/null",
+        "make build >/dev/null 2>&1",
+        "echo hi >/dev/stdout",
+        "echo hi >/dev/stderr",
+    ] {
+        let assessment = assess(command, &ctx);
+        if assessment.level != RiskLevel::Safe {
+            blocked.push(format!("{command} -> {:?}", assessment.level));
+        }
+    }
+    assert!(
+        blocked.is_empty(),
+        "stderr silencing must not be flagged: {blocked:#?}"
+    );
+}
+
+/// A recursive read is not a recursive delete.
+///
+/// Regression: because a redirect made the segment interesting, every operand
+/// of a read-only program was then classified as a deletion target, and the
+/// `-r` in `grep -rn` was read as the `-r` of `rm`.
+#[test]
+fn recursive_read_only_commands_are_safe() {
+    let ctx = ctx();
+    let mut blocked = Vec::new();
+    for command in [
+        "grep -rn needle . 2>/dev/null",
+        "grep -rn pattern /home/u/proj/src",
+        "ls -R . 2>/dev/null",
+    ] {
+        let assessment = assess(command, &ctx);
+        if !assessment.level.runs_immediately() {
+            blocked.push(format!("{command} -> {:?}", assessment.level));
+        }
+    }
+    assert!(
+        blocked.is_empty(),
+        "recursive reads must not be gated: {blocked:#?}"
+    );
+}
+
+/// The exemption must not open a hole: real device writes and real deletions
+/// are still caught, including when a harmless redirect is present.
+#[test]
+fn stream_device_exemption_does_not_leak() {
+    assert_eq!(
+        level("dd if=/dev/zero of=/dev/disk0"),
+        RiskLevel::Catastrophic
+    );
+    assert_eq!(level("rm -rf ~ 2>/dev/null"), RiskLevel::Catastrophic);
+    assert_eq!(level("rm -rf / >/dev/null 2>&1"), RiskLevel::Catastrophic);
+    assert_eq!(level("rm -rf ~/.ssh 2>/dev/null"), RiskLevel::Catastrophic);
+    assert_eq!(level("echo x > /home/u/notes.txt"), RiskLevel::Confirm);
+}

@@ -58,6 +58,10 @@ const SYSTEM_PATHS_PROTECTED_RECURSIVELY: &[&str] = &[
     "/var/lib", "/System", "/Library",
 ];
 
+/// Pseudo-devices that discard or forward writes rather than backing a disk.
+/// Writing to them destroys nothing, so they are exempt from every path rule.
+const STREAM_DEVICES: &[&str] = &["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"];
+
 /// The set of paths this policy protects, exposed for testing and docs.
 pub struct ProtectedPaths;
 
@@ -135,6 +139,15 @@ fn normalize(path: &Path) -> PathBuf {
 pub fn is_catastrophic_target(path: &Path, ctx: &RiskContext) -> bool {
     let path = normalize(path);
 
+    // The standard stream pseudo-devices are write-only sinks with no
+    // filesystem behind them: `2>/dev/null` is the single most common idiom in
+    // shell, and flagging it made every routine read-only command look
+    // catastrophic. They must be cleared before the recursive `/dev` rule
+    // below, which would otherwise swallow them.
+    if STREAM_DEVICES.iter().any(|d| path == Path::new(d)) {
+        return false;
+    }
+
     // Exact system roots, plus anything inside the ones whose contents are as
     // unrecoverable as the directory itself (`/etc/passwd`). `/home` and
     // `/Users` are deliberately not recursive: a user's own project lives
@@ -178,6 +191,12 @@ pub fn classify_target(
     recursive: bool,
     ctx: &RiskContext,
 ) -> Option<RiskFinding> {
+    // Redirecting to a stream pseudo-device is not a write to any file, so it
+    // never carries risk regardless of the surrounding command.
+    if STREAM_DEVICES.iter().any(|d| expanded == Path::new(d)) {
+        return None;
+    }
+
     // Glob and variable expansion we did not perform: we cannot know the
     // footprint, so escalate rather than guess.
     if raw.contains('*') || raw.contains('?') {
@@ -226,11 +245,7 @@ pub fn classify_target(
     }
 
     // Raw device nodes are never a safe write target.
-    if expanded.starts_with("/dev")
-        && !expanded.starts_with("/dev/null")
-        && !expanded.starts_with("/dev/stdout")
-        && !expanded.starts_with("/dev/stderr")
-    {
+    if expanded.starts_with("/dev") {
         return Some(RiskFinding {
             level: RiskLevel::Catastrophic,
             reason: "writes directly to a device node, which can destroy a \
