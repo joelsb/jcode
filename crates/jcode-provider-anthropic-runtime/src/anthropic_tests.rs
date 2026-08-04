@@ -1994,31 +1994,42 @@ fn should_rotate_account_only_on_usage_limits() {
     let rate_limit = "anthropic api error (429 too many requests)";
 
     assert!(
-        should_rotate_account(true, false, rate_limit),
-        "a 429 before any output is exactly the case account rotation exists for"
+        should_rotate_account(true, rate_limit),
+        "a 429 is exactly the case account rotation exists for"
     );
     assert!(
-        !should_rotate_account(false, false, rate_limit),
+        !should_rotate_account(false, rate_limit),
         "rotation must stay off when prefer_account_failover is disabled or auth is an API key"
     );
     assert!(
-        !should_rotate_account(true, true, rate_limit),
-        "output already reached the consumer; replaying on another account would duplicate it"
-    );
-    assert!(
-        !should_rotate_account(
-            true,
-            false,
-            "error sending request: connection reset by peer"
-        ),
+        !should_rotate_account(true, "error sending request: connection reset by peer"),
         "transport faults belong to the retry loop, not to another account"
     );
     assert!(
-        !should_rotate_account(
-            true,
-            false,
-            "anthropic api error (500 internal server error)"
-        ),
+        !should_rotate_account(true, "anthropic api error (500 internal server error)"),
         "a server fault is not an account problem"
+    );
+}
+
+#[test]
+fn account_override_is_restored_only_when_rotation_ran_dry() {
+    let original = Some("claude-1".to_string());
+    let rotated = Some("claude-2".to_string());
+
+    assert!(
+        should_restore_account(&original, &rotated, true),
+        "every account limited: hand the override back rather than pinning a searched-through account"
+    );
+    assert!(
+        !should_restore_account(&original, &rotated, false),
+        "a rotation that found a working account must survive an unrelated later failure"
+    );
+    assert!(
+        !should_restore_account(&original, &original, true),
+        "nothing to undo when the request never left its starting account"
+    );
+    assert!(
+        !should_restore_account(&None, &None, true),
+        "no override was set, so none may be written"
     );
 }

@@ -45,6 +45,21 @@ Account rotation inside `run_stream_with_retries` (`crates/jcode-provider-anthro
 Scope: Anthropic HTTPS/SSE runtime (both unified and split system paths, which share `run_stream_with_retries`).
 The Claude CLI runtime has its own retry loop and is not covered.
 
+### Review fixes applied on top
+
+- **Restore only on a dead end.** `restore_claude_account` used to fire on every hard-failure exit once a rotation had happened, so an unrelated failure *after* a successful rotation re-pinned the session onto the account already known to be limited. It now runs only when `switch_to_next_claude_account` returned `None` (`should_restore_account`).
+- **No blind write to shared state.** The account override is process-wide and one daemon serves many sessions, so the restore now writes only if the override still holds the label this request put there. Anything else means another session switched accounts meanwhile (possibly a deliberate `/account switch`) and is left alone.
+- **Failed candidates roll back.** If a candidate account's credentials cannot be loaded or refreshed, the override is put back before trying the next one, so it never lingers on an account that cannot serve a request.
+- **Rotation cannot be starved.** The attempt budget starts at `MAX_RETRIES` and each successful rotation grants itself one extra attempt, instead of pre-sizing the budget by account count where the other one-shot retry causes (forced refresh, model fallback, reasoning strip) could consume it first.
+- **Mid-stream limits rotate too.** A usage limit arriving after partial output used to skip rotation and fall into the generic transient retry, honoring the exhausted account's 60s `retry-after` - the original bug in a narrower form. Rotation now also covers that case, emitting `StreamEvent::RetryRollback` first so the consumer discards the partial attempt, the same contract the transient path already uses.
+
+### Known limitation (not fixed here)
+
+Account identity is process-global: `auth::account_store` keys the active override by `"claude"` alone, and one `AnthropicProvider` (with a single-slot credential cache) is shared by every session on the daemon.
+A rotation therefore affects concurrent sessions, and the single credential slot can hand another session the rotated account's token.
+`MultiProvider::try_same_provider_account_failover` has the same property, so this is pre-existing rather than new, but the rotation window here spans a whole streaming turn.
+A real fix is per-session account attribution, which is an architectural change well beyond this patch.
+
 ## Files Changed
 
 ### Core logic
