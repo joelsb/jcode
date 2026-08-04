@@ -60,6 +60,18 @@ A rotation therefore affects concurrent sessions, and the single credential slot
 `MultiProvider::try_same_provider_account_failover` has the same property, so this is pre-existing rather than new, but the rotation window here spans a whole streaming turn.
 A real fix is per-session account attribution, which is an architectural change well beyond this patch.
 
+### Client sync (August 2026)
+
+Rotation happens in the daemon, but the TUI is a separate process that renders usage from its own `crate::usage::get_sync()` cache, so a rotation used to be invisible: the widget kept showing the exhausted account's 5-hour reset.
+
+The runtime now publishes `BusEvent::AnthropicAccountRotated` on every account change (including the restore when every account is limited).
+`client_lifecycle.rs` forwards it to each subscribed client as `ServerEvent::AnthropicAccountRotated` and drops the daemon's own usage cache.
+The client mirrors the account with an override (not a persisted switch), invalidates its auth and usage caches, prints the switch, and recomputes the context limit from the active model.
+
+`UsageData` carries no account identity and its staleness is time-based, so an account change now calls `usage::invalidate_anthropic_usage()`; without it a fresh-but-wrong snapshot is served until the TTL expires.
+
+All account-switch paths use `refresh_context_limit_after_account_change()` instead of assigning `provider.context_window()`, which dropped 1M windows down to the local default of 200k.
+
 ## Files Changed
 
 ### Core logic

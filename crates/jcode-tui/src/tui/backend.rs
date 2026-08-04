@@ -216,6 +216,7 @@ pub enum RemoteRead {
 /// Classification of a single decoded protocol line read from the server
 /// stream. Used by [`RemoteConnection::next_event`] to keep the cancellation-
 /// safe read loop readable. The event is boxed because [`ServerEvent`] is large.
+#[derive(Debug)]
 enum LineOutcome {
     Event(Box<ServerEvent>),
     Skip,
@@ -1817,5 +1818,26 @@ mod tests {
             1,
         ));
         assert!(remote_protocol_frame_exceeds_limit(usize::MAX, 1));
+    }
+
+    #[tokio::test]
+    async fn skipping_unparseable_still_parses_the_anthropic_account_rotated_event() {
+        let remote = RemoteConnection::dummy();
+        let mut stray_lines = 0usize;
+
+        let line = br#"{"type":"anthropic_account_rotated","label":"claude-2"}"#.to_vec();
+        match remote.classify_protocol_line(line, &mut stray_lines) {
+            LineOutcome::Event(event) => match *event {
+                ServerEvent::AnthropicAccountRotated { label, .. } => {
+                    assert_eq!(label, "claude-2");
+                }
+                other => panic!("expected the rotation event, got {other:?}"),
+            },
+            other => panic!("expected LineOutcome::Event, got {other:?}"),
+        }
+        assert_eq!(
+            stray_lines, 0,
+            "a known event type must not count against the stray-line budget"
+        );
     }
 }
