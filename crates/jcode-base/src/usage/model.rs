@@ -113,6 +113,15 @@ impl UsageData {
         }
     }
 
+    /// Drop the freshness stamp so the next `get`/`get_sync` refetches.
+    ///
+    /// `UsageData` carries no account identity and the cache is global, so a
+    /// snapshot taken before an account switch is not stale by time but is
+    /// wrong by account. Callers that change the active account must call this.
+    pub fn mark_stale(&mut self) {
+        self.fetched_at = None;
+    }
+
     /// Check if the last error was a rate limit (429)
     fn is_rate_limited(&self) -> bool {
         self.last_error
@@ -423,5 +432,30 @@ impl AccountUsageProbe {
             alternative.summary(),
             self.provider.switch_command(&alternative.label)
         ))
+    }
+}
+
+#[cfg(test)]
+mod mark_stale_tests {
+    use super::UsageData;
+
+    #[test]
+    fn mark_stale_forces_the_next_read_to_refetch() {
+        let mut usage = UsageData {
+            five_hour: 0.42,
+            fetched_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        };
+        assert!(
+            !usage.is_stale(),
+            "a just-fetched snapshot is fresh, which is why an account switch must invalidate it explicitly"
+        );
+
+        usage.mark_stale();
+
+        assert!(
+            usage.is_stale(),
+            "after an account switch the cached numbers belong to the previous account and must not be served"
+        );
     }
 }
