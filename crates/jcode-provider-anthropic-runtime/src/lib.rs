@@ -1599,7 +1599,7 @@ async fn run_stream_with_retries(
         // poisoned other idle pooled connections opened through the same path,
         // so reusing the shared pool can fail identically. A fresh client
         // guarantees a brand-new TCP+TLS connection.
-        let attempt_client = if attempt == 0 {
+        let attempt_client = if attempt_index == 0 {
             client.clone()
         } else {
             jcode_provider_core::fresh_transport_client()
