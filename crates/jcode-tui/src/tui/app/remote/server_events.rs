@@ -2318,6 +2318,33 @@ pub(in crate::tui::app) fn handle_server_event(
             // redraw happens.
             true
         }
+        ServerEvent::AnthropicAccountRotated {
+            label,
+            previous_label,
+        } => {
+            // Mirror the daemon's choice with an override rather than a
+            // persisted switch: the rotation lasts as long as the daemon says
+            // it does, and must not rewrite the user's configured account.
+            crate::auth::claude::set_active_account_override(Some(label.clone()));
+            crate::auth::AuthStatus::invalidate_cache();
+            crate::usage::invalidate_anthropic_usage();
+
+            let active_model = app
+                .effective_remote_provider_model()
+                .unwrap_or_else(|| app.provider.model());
+            app.update_context_limit_for_model(&active_model);
+
+            let message = match previous_label {
+                Some(previous) => format!(
+                    "⚡ Rate limited; switched Anthropic account: {} → {}",
+                    previous, label
+                ),
+                None => format!("⚡ Rate limited; switched Anthropic account to {}", label),
+            };
+            app.push_display_message(DisplayMessage::system(message));
+            app.set_status_notice(format!("Account: switched to {}", label));
+            false
+        }
         ServerEvent::ReasoningEffortChanged { effort, error, .. } => {
             if let Some(err) = error {
                 app.push_display_message(DisplayMessage::error(format!(

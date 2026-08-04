@@ -2413,3 +2413,38 @@ fn test_credential_failure_breaker_resets_on_turn_success() {
         "a successful turn must reset the credential-failure streak"
     );
 }
+
+#[test]
+fn rotation_event_keeps_the_model_context_limit_and_adopts_the_new_account() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.is_remote = true;
+    app.remote_provider_model = Some("claude-opus-5[1m]".to_string());
+    app.update_context_limit_for_model("claude-opus-5[1m]");
+    let expected_limit = app.context_limit;
+    assert!(
+        expected_limit > 200_000,
+        "fixture must use a 1M model or this test cannot detect the clobber"
+    );
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::AnthropicAccountRotated {
+            label: "claude-2".to_string(),
+            previous_label: Some("claude-1".to_string()),
+        },
+        &mut remote,
+    );
+
+    assert_eq!(
+        app.context_limit, expected_limit,
+        "a rate-limit rotation must not shrink the window to the local provider default"
+    );
+    assert_eq!(
+        crate::auth::claude::active_account_label().as_deref(),
+        Some("claude-2"),
+        "the client must mirror the account the daemon actually uses"
+    );
+}
