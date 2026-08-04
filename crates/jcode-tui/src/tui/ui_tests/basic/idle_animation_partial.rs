@@ -592,3 +592,115 @@ fn copy_cells_in_copies_exactly_the_rectangle_and_nothing_else() {
         "a rectangle outside the buffer must copy nothing and must not panic"
     );
 }
+
+/// RAII guard enabling `display.idle_animation_persistent` (and the base
+/// `idle_animation` it requires) for one test.
+struct PersistentIdleAnimationEnvGuard {
+    _env: std::sync::MutexGuard<'static, ()>,
+}
+
+impl PersistentIdleAnimationEnvGuard {
+    fn enable() -> Self {
+        let env = crate::storage::lock_test_env();
+        crate::env::set_var("JCODE_IDLE_ANIMATION", "1");
+        crate::env::set_var("JCODE_IDLE_ANIMATION_PERSISTENT", "1");
+        crate::config::invalidate_config_cache();
+        Self { _env: env }
+    }
+}
+
+impl Drop for PersistentIdleAnimationEnvGuard {
+    fn drop(&mut self) {
+        crate::env::remove_var("JCODE_IDLE_ANIMATION");
+        crate::env::remove_var("JCODE_IDLE_ANIMATION_PERSISTENT");
+        crate::config::invalidate_config_cache();
+    }
+}
+
+/// The whole point of `idle_animation_persistent`: a started conversation and a
+/// long-dormant session both keep the decoration alive, where the plain
+/// `idle_animation` opt-in stops at the first prompt and at the 30s cutoff.
+#[test]
+fn persistent_idle_animation_survives_the_first_prompt_and_deep_idle() {
+    let _persistent = PersistentIdleAnimationEnvGuard::enable();
+    pin_full_tier();
+
+    let after_prompt = TestState {
+        display_messages: vec![DisplayMessage::user("build it")],
+        time_since_activity: Some(Duration::from_millis(200)),
+        ..Default::default()
+    };
+    assert!(
+        crate::tui::idle_donut_active(&after_prompt),
+        "persistent mode must keep animating once a conversation exists"
+    );
+
+    let dormant = TestState {
+        display_messages: vec![DisplayMessage::user("build it")],
+        time_since_activity: Some(Duration::from_secs(600)),
+        time_since_user_interaction: Some(Duration::from_secs(600)),
+        ..Default::default()
+    };
+    assert!(
+        crate::tui::idle_donut_active(&dormant),
+        "persistent mode must outlive the deep-idle cutoff"
+    );
+}
+
+/// Deep idle normally short-circuits the redraw loop to a 5s crawl, which would
+/// freeze a persistent animation into a slideshow. When the animation is on
+/// screen it must keep pacing the loop.
+#[test]
+fn persistent_idle_animation_keeps_pacing_redraws_when_dormant() {
+    let _persistent = PersistentIdleAnimationEnvGuard::enable();
+    pin_full_tier();
+    let policy = full_tier_policy();
+
+    let dormant = TestState {
+        display_messages: vec![DisplayMessage::user("build it")],
+        time_since_activity: Some(Duration::from_secs(600)),
+        time_since_user_interaction: Some(Duration::from_secs(600)),
+        ..Default::default()
+    };
+
+    let interval = crate::tui::redraw_interval_with_policy(&dormant, &policy);
+    assert!(
+        interval < crate::tui::REDRAW_IDLE,
+        "a dormant session with a persistent animation must still animate (got {interval:?})"
+    );
+    // `periodic_redraw_required` reads the renderer's published animation rows,
+    // so draw one frame first to establish that the donut is actually on screen.
+    let _ = render_full(&dormant, 100, 40);
+    assert!(
+        crate::tui::periodic_redraw_required(&dormant),
+        "the dormant short-circuit must not suppress the persistent animation frame"
+    );
+}
+
+/// Persistence only relaxes the "fresh screen" and dormancy gates. Real work and
+/// an unfocused terminal must still stop the decoration.
+#[test]
+fn persistent_idle_animation_still_yields_to_pending_work() {
+    let _persistent = PersistentIdleAnimationEnvGuard::enable();
+    pin_full_tier();
+
+    let processing = TestState {
+        display_messages: vec![DisplayMessage::user("build it")],
+        status: ProcessingStatus::Thinking(Instant::now()),
+        ..Default::default()
+    };
+    assert!(
+        !crate::tui::idle_donut_active(&processing),
+        "a working session must not render the decorative animation"
+    );
+
+    let queued = TestState {
+        display_messages: vec![DisplayMessage::user("build it")],
+        queued_messages: vec!["next up".to_string()],
+        ..Default::default()
+    };
+    assert!(
+        !crate::tui::idle_donut_active(&queued),
+        "a session with queued work is not resting"
+    );
+}

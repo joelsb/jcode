@@ -51,6 +51,7 @@ impl Config {
 - Debug socket: {}
 - Emoji: {}
 - Idle animation: {}
+- Idle animation persistent: {}
 - Prompt entry animation: {}
 - Compact notifications: {}
 - Chat native scrollbar: {}
@@ -172,6 +173,7 @@ impl Config {
             self.display.debug_socket,
             self.display.emoji,
             self.display.idle_animation,
+            self.display.idle_animation_persistent,
             self.display.prompt_entry_animation,
             self.display.compact_notifications,
             self.display.native_scrollbars.chat,

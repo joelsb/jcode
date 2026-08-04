@@ -56,6 +56,11 @@ pub struct DisplayConfig {
     pub pin_todos: bool,
     /// Show idle animation before first prompt (default: false)
     pub idle_animation: bool,
+    /// Keep the idle animation running for the whole session instead of only
+    /// before the first prompt. Requires `idle_animation = true`
+    /// (default: false)
+    #[serde(default)]
+    pub idle_animation_persistent: bool,
     /// Briefly animate user prompt line when it enters viewport (default: true)
     pub prompt_entry_animation: bool,
     /// Disable specific animation variants by name (e.g. ["donut", "orbit_rings"])
@@ -140,6 +145,7 @@ impl Default for DisplayConfig {
             markdown_spacing: MarkdownSpacingMode::default(),
             latex_rendering: LatexRenderingMode::default(),
             idle_animation: false,
+            idle_animation_persistent: false,
             prompt_entry_animation: true,
             disabled_animations: Vec::new(),
             diff_line_wrap: true,

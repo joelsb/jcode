@@ -235,6 +235,11 @@ impl Config {
                 self.display.idle_animation = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_IDLE_ANIMATION_PERSISTENT") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.display.idle_animation_persistent = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_PROMPT_ENTRY_ANIMATION") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.display.prompt_entry_animation = parsed;
