@@ -1676,7 +1676,45 @@ async fn run_stream_with_retries(
     // model only falls back to genuinely new candidates.
     let mut tried_models: Vec<String> = vec![original_model.clone()];
 
-    for attempt in 0..MAX_RETRIES {
+    // Account rotation state. `original_account` is restored if every
+    // alternate account also fails, so a dead end never leaves the session
+    // pinned to an account the user did not choose.
+    let account_rotation_enabled =
+        is_oauth && jcode_base::provider::prefer_account_failover_enabled();
+    let original_account = if account_rotation_enabled {
+        auth::claude::active_account_label()
+    } else {
+        None
+    };
+    let mut tried_accounts: Vec<String> = if account_rotation_enabled {
+        vec![
+            original_account
+                .clone()
+                .unwrap_or_else(auth::claude::primary_account_label),
+        ]
+    } else {
+        Vec::new()
+    };
+    // Account the in-flight attempt is running on, so a second rotation reports
+    // the account it actually left rather than the one the request started on.
+    let mut current_account = original_account.clone();
+    let mut rotated_account = false;
+
+    // Each alternate account gets an attempt of its own on top of the
+    // transport retry budget: rotating accounts must not consume the retries
+    // reserved for transient network faults, and a transient fault after a
+    // rotation must still be retryable.
+    let account_attempt_budget = if account_rotation_enabled {
+        claude_account_candidate_count()
+    } else {
+        0
+    };
+    let max_attempts = MAX_RETRIES + account_attempt_budget;
+    // Transport-level retries, counted separately from account rotations so
+    // `MAX_RETRIES` keeps meaning "attempts at the same request", as before.
+    let mut transport_retries: u32 = 0;
+
+    for attempt in 0..max_attempts {
         if attempt > 0 {
             // Exponential backoff with jitter: ~1s, ~2s, ~4s
             let delay = jcode_provider_core::retry_after::retry_delay(
@@ -1688,7 +1726,7 @@ async fn run_stream_with_retries(
                 .send(Ok(StreamEvent::ConnectionPhase {
                     phase: jcode_message_types::ConnectionPhase::Retrying {
                         attempt: attempt + 1,
-                        max: MAX_RETRIES,
+                        max: max_attempts,
                     },
                 }))
                 .await;
@@ -1696,7 +1734,7 @@ async fn run_stream_with_retries(
             jcode_base::logging::info(&format!(
                 "Retrying Anthropic API request (attempt {}/{})",
                 attempt + 1,
-                MAX_RETRIES
+                max_attempts
             ));
         }
 
@@ -1762,6 +1800,7 @@ async fn run_stream_with_retries(
                             continue;
                         }
                         Err(refresh_err) => {
+                            restore_claude_account(&original_account, rotated_account);
                             let _ = tx
                                 .send(Err(anyhow::anyhow!(
                                     "{}\n\nAutomatic Claude OAuth refresh failed: {}\nRun `jcode login --provider claude` (preferred) or `claude`, then retry.",
@@ -1869,8 +1908,49 @@ async fn run_stream_with_retries(
                     continue;
                 }
 
+                // Rate limit / usage exhaustion on an OAuth account. This error
+                // arrives as an item inside the event stream, long after
+                // `complete()` returned the stream, so
+                // `MultiProvider::try_same_provider_account_failover` never
+                // sees it and cannot rotate accounts for us. Without the
+                // rotation below the only remaining reaction is the TUI
+                // fallback picker offering a *smaller model* on the same
+                // exhausted account. Replay the same model on the next account
+                // instead; only when every account is limited does the caller
+                // fall through to a model downgrade.
+                if should_rotate_account(account_rotation_enabled, saw_output, &error_str)
+                    && let Some((switched_label, switched_token)) =
+                        switch_to_next_claude_account(&credentials, &mut tried_accounts).await
+                {
+                    let previous_label = current_account
+                        .clone()
+                        .unwrap_or_else(auth::claude::primary_account_label);
+                    current_account = Some(switched_label.clone());
+                    jcode_base::logging::info(&format!(
+                        "Same-provider account failover: Anthropic rate-limited ({}); retrying '{}' on account '{}'",
+                        e, model_name, switched_label
+                    ));
+                    let _ = tx
+                        .send(Ok(StreamEvent::StatusDetail {
+                            detail: format!(
+                                "⚡ Rate limited; switching Claude account: {} → {}",
+                                previous_label, switched_label
+                            ),
+                        }))
+                        .await;
+                    token = switched_token;
+                    rotated_account = true;
+                    // The new account has its own quota bucket, so the
+                    // `retry-after` the exhausted account asked for (often 60s)
+                    // does not apply to it.
+                    next_retry_delay = None;
+                    last_error = Some(e);
+                    continue;
+                }
+
                 // Check if this is a transient/retryable error
-                if is_retryable_error(&error_str) && attempt + 1 < MAX_RETRIES {
+                if is_retryable_error(&error_str) && transport_retries + 1 < MAX_RETRIES {
+                    transport_retries += 1;
                     if saw_output {
                         // The fault hit mid-stream after partial output reached
                         // the consumer. Tell it to discard the partial attempt
@@ -1883,7 +1963,7 @@ async fn run_stream_with_retries(
                         let _ = tx
                             .send(Ok(StreamEvent::RetryRollback {
                                 attempt: attempt + 2,
-                                max: MAX_RETRIES,
+                                max: max_attempts,
                             }))
                             .await;
                     } else {
@@ -1895,6 +1975,7 @@ async fn run_stream_with_retries(
                 }
 
                 // Non-retryable or final attempt
+                restore_claude_account(&original_account, rotated_account);
                 if is_oauth && is_oauth_auth_error(&error_str) {
                     let _ = tx
                         .send(Err(anyhow::anyhow!(
@@ -1911,15 +1992,130 @@ async fn run_stream_with_retries(
     }
 
     // All retries exhausted
+    restore_claude_account(&original_account, rotated_account);
     if let Some(e) = last_error {
         let _ = tx
             .send(Err(anyhow::anyhow!(
                 "Failed after {} retries: {}",
-                MAX_RETRIES,
+                max_attempts,
                 e
             )))
             .await;
     }
+}
+
+/// Whether a failed attempt should be replayed on another OAuth account.
+///
+/// Requires a usage/rate limit (a transport fault is the retry loop's job, not
+/// another account's), and no output yet on this attempt: once tokens have
+/// reached the consumer, replaying the request would duplicate them.
+fn should_rotate_account(rotation_enabled: bool, saw_output: bool, error_str: &str) -> bool {
+    rotation_enabled && !saw_output && jcode_base::provider::error_looks_like_usage_limit(error_str)
+}
+
+/// How many alternate Anthropic OAuth accounts a rate-limited request could
+/// still rotate to. Used to size the attempt budget, so the rotation path never
+/// eats the retries reserved for transient transport faults.
+fn claude_account_candidate_count() -> u32 {
+    u32::try_from(
+        jcode_base::provider::account_failover_candidates(
+            jcode_provider_core::ActiveProvider::Claude,
+        )
+        .len(),
+    )
+    .unwrap_or(u32::MAX)
+}
+
+/// First candidate not yet attempted during this request.
+///
+/// Candidates arrive best-first (least-used accounts before exhausted ones) and
+/// may repeat across calls, because the usage probe is re-read each time; the
+/// `tried` list is what guarantees forward progress.
+fn next_untried_account<'a>(candidates: &'a [String], tried: &[String]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .map(String::as_str)
+        .find(|candidate| !tried.iter().any(|seen| seen == candidate))
+}
+
+/// Point the process-wide Anthropic account override at the next untried
+/// account and return its label plus a usable access token.
+///
+/// Accounts whose credentials cannot be loaded or refreshed are recorded as
+/// tried and skipped, so one broken login does not block the rest. Returns
+/// `None` once no account is left, leaving the override on the last account it
+/// touched for the caller to restore.
+async fn switch_to_next_claude_account(
+    credentials: &Arc<RwLock<Option<CachedCredentials>>>,
+    tried: &mut Vec<String>,
+) -> Option<(String, String)> {
+    loop {
+        let candidates = jcode_base::provider::account_failover_candidates(
+            jcode_provider_core::ActiveProvider::Claude,
+        );
+        let label = next_untried_account(&candidates, tried)?.to_string();
+        tried.push(label.clone());
+
+        auth::claude::set_active_account_override(Some(label.clone()));
+        jcode_base::auth::AuthStatus::invalidate_cached_status();
+
+        match credentials_for_claude_account(&label).await {
+            Ok(fresh) => {
+                let access_token = fresh.access_token.clone();
+                let mut cached = credentials.write().await;
+                *cached = Some(fresh);
+                return Some((label, access_token));
+            }
+            Err(err) => {
+                jcode_base::logging::warn(&format!(
+                    "Cannot use Anthropic account '{}' for account failover: {:#}",
+                    label, err
+                ));
+            }
+        }
+    }
+}
+
+/// Load credentials for `label`, refreshing the access token when it is expired
+/// or within the same 5-minute buffer the normal token path uses.
+async fn credentials_for_claude_account(label: &str) -> Result<CachedCredentials> {
+    let creds = auth::claude::load_credentials_for_account(label)
+        .with_context(|| format!("Failed to load Claude credentials for account '{label}'"))?;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    if creds.expires_at > now + 300_000 {
+        return Ok(CachedCredentials {
+            access_token: creds.access_token,
+            refresh_token: creds.refresh_token,
+            expires_at: creds.expires_at,
+        });
+    }
+
+    if creds.refresh_token.is_empty() {
+        anyhow::bail!(
+            "Claude OAuth token for account '{label}' is expired and has no refresh token"
+        );
+    }
+    let refreshed = oauth::refresh_claude_tokens_for_account(&creds.refresh_token, label)
+        .await
+        .with_context(|| format!("OAuth refresh failed for Claude account '{label}'"))?;
+    Ok(CachedCredentials {
+        access_token: refreshed.access_token,
+        refresh_token: refreshed.refresh_token,
+        expires_at: refreshed.expires_at,
+    })
+}
+
+/// Put the account override back where the request found it. Called only when
+/// every rotation attempt failed: a rotation that produced a working account is
+/// meant to stick for the rest of the session, exactly like the account
+/// failover in `MultiProvider`.
+fn restore_claude_account(original: &Option<String>, rotated: bool) {
+    if !rotated {
+        return;
+    }
+    auth::claude::set_active_account_override(original.clone());
+    jcode_base::auth::AuthStatus::invalidate_cached_status();
 }
 
 async fn force_refresh_oauth_token(
