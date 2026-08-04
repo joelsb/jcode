@@ -1390,3 +1390,26 @@ async fn lightweight_comm_request_skips_full_session_initialization() {
 fn decode_request_or_event(line: &str) -> ServerEvent {
     serde_json::from_str(line.trim()).expect("decode server event")
 }
+
+mod account_rotation_forwarding_tests {
+    use super::*;
+
+    #[test]
+    fn bus_rotation_maps_to_the_wire_event() {
+        let rotated = jcode_base::bus::AnthropicAccountRotated {
+            label: "claude-2".to_string(),
+            previous_label: Some("claude-1".to_string()),
+        };
+
+        match account_rotated_server_event(&rotated) {
+            ServerEvent::AnthropicAccountRotated {
+                label,
+                previous_label,
+            } => {
+                assert_eq!(label, "claude-2");
+                assert_eq!(previous_label.as_deref(), Some("claude-1"));
+            }
+            other => panic!("expected the rotation wire event, got {other:?}"),
+        }
+    }
+}
