@@ -290,6 +290,13 @@ fn compaction_server_event(event: crate::compaction::CompactionEvent) -> ServerE
     }
 }
 
+fn account_rotated_server_event(rotated: &jcode_base::bus::AnthropicAccountRotated) -> ServerEvent {
+    ServerEvent::AnthropicAccountRotated {
+        label: rotated.label.clone(),
+        previous_label: rotated.previous_label.clone(),
+    }
+}
+
 async fn poll_agent_compaction_completion(agent: Arc<Mutex<Agent>>) -> Option<ServerEvent> {
     let mut agent_guard = agent.lock().await;
     agent_guard
@@ -890,6 +897,12 @@ pub(super) async fn handle_client(
                                 let _ = tx.send(event);
                             }
                         });
+                    }
+                    Ok(BusEvent::AnthropicAccountRotated(rotated)) => {
+                        // The daemon's own usage cache is account-blind too, so
+                        // drop it before the client asks for fresh numbers.
+                        jcode_base::usage::invalidate_anthropic_usage();
+                        let _ = client_event_tx.send(account_rotated_server_event(&rotated));
                     }
                     _ => {}
                 }
