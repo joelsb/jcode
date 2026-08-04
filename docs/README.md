@@ -5,6 +5,7 @@ Reference documentation for the jcode codebase.
 ## Layout
 
 - `docs/*.md` — architecture, feature, and behavior docs (current state of the system).
+- `docs/adr/` — architecture decision records: why the system is shaped this way, including decisions deliberately left unfixed. Feature docs explain how something works; ADRs explain why it is that shape.
 - `docs/plans/` — forward-looking plans, roadmaps, and TODO trackers. May be partially implemented or stale.
 - `docs/audits/` — point-in-time audits and reviews. Historical snapshots, not kept up to date.
 - `docs/proposals/` — design proposals not yet committed to.
