@@ -155,6 +155,41 @@ fn active_anthropic_profile_models() -> Option<Vec<String>> {
     Some(models)
 }
 
+/// Test-only seam so `stream_response` can be pointed at a local mock HTTP
+/// server instead of the real Anthropic endpoint. `API_URL`/`API_URL_OAUTH`
+/// are `const`, so this is the smallest indirection that lets a test drive
+/// the real retry/rotation loop end-to-end. Compiled out entirely in
+/// non-test builds (no `std::env::var` involved, nothing readable in a
+/// release binary): `test_override_url` reduces to a constant `None`, leaving
+/// the caller's real URL untouched.
+#[cfg(test)]
+static TEST_API_URL_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_test_api_url_override(url: Option<String>) {
+    *TEST_API_URL_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = url;
+}
+
+/// Returns the test-only endpoint override when one is installed, else `None`
+/// so the caller keeps whatever real URL it resolved. Compiled out entirely in
+/// non-test builds, where it is a constant `None` and the caller's URL stands.
+fn test_override_url() -> Option<String> {
+    #[cfg(test)]
+    {
+        return TEST_API_URL_OVERRIDE.get().and_then(|cell| {
+            cell.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        });
+    }
+    #[cfg(not(test))]
+    None
+}
+
 #[cfg(test)]
 pub(crate) const OAUTH_BETA_HEADERS_1M: &str = jcode_provider_core::ANTHROPIC_OAUTH_BETA_HEADERS_1M;
 
@@ -2253,13 +2288,17 @@ async fn stream_response(
     let connect_start = std::time::Instant::now();
     let stream_idle_timeout = jcode_base::provider::stream_idle_timeout();
     // Build request with appropriate auth headers
+    // Upstream picks the endpoint (OAuth vs the configurable direct base);
+    // `api_url` then applies the test-only override when one is installed, so
+    // the E2E rotation test can drive this exact code path against a mock.
     let url = if is_oauth {
-        API_URL_OAUTH
+        API_URL_OAUTH.to_string()
     } else {
-        direct_transport.api_url.as_str()
+        direct_transport.api_url.clone()
     };
+    let url = test_override_url().unwrap_or(url);
 
-    let mut req = client.post(url);
+    let mut req = client.post(url.as_str());
     if !is_oauth {
         req = req.headers(
             direct_transport
