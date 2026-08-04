@@ -33,8 +33,7 @@ mod stream_timeout;
 use crate::auth;
 use crate::message::{Message, ToolDefinition};
 use account_failover::{
-    account_usage_probe, active_account_label_for_provider,
-    maybe_annotate_limit_summary,
+    account_usage_probe, active_account_label_for_provider, maybe_annotate_limit_summary,
     same_provider_account_candidates, same_provider_account_failover_enabled,
     set_account_override_for_provider,
 };
@@ -46,6 +45,9 @@ use registry::ProviderRegistry;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
+pub use account_failover::account_failover_candidates;
+pub use account_failover::error_looks_like_usage_limit;
+pub use account_failover::prefer_account_failover_enabled;
 pub use catalog_routes::{
     append_simplified_anthropic_model_routes, remote_current_openai_compatible_route_for_model,
     remote_model_is_server_copilot_only, remote_model_routes_fallback,
@@ -70,8 +72,6 @@ pub use jcode_provider_core::{
     normalize_model_route_provider_label, pick_next_fallback_route,
     pick_next_fallback_route_with_options,
 };
-pub use account_failover::error_looks_like_usage_limit;
-pub use account_failover::prefer_account_failover_enabled;
 pub use jcode_provider_core::{ProviderFailoverPrompt, parse_failover_prompt_message};
 pub use route_builders::{
     build_anthropic_oauth_route, build_chatgpt_web_route, build_copilot_route,

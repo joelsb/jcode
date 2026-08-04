@@ -18,10 +18,39 @@ This lets the backend account-failover mechanism try the same model on a differe
 
 Gated by `prefer_account_failover` config option (default `true`).
 
+## Part 2 - In-Stream Rate Limits (August 2026)
+
+The route-picker tiering above was necessary but not sufficient: streaming 429s never reached account failover at all.
+
+### Why the first patch could not fire
+
+`AnthropicProvider::complete*` returns `Ok(Box::pin(ReceiverStream::new(rx)))` before the HTTP request is sent, then runs `run_stream_with_retries` in a spawned task.
+A 429 therefore arrives as an `Err` *item inside the event stream*, not as an `Err` return from `complete_on_provider`.
+`MultiProvider::try_same_provider_account_failover` is only called from the `Err(err)` arm of `complete_with_failover` (`crates/jcode-base/src/provider/mod.rs`), so for streaming requests it was unreachable.
+
+Evidence from a real session: 522 log lines mentioning `429`, zero lines mentioning `Same-provider failover`.
+The retry loop also burned its whole budget on the same exhausted account, honoring the 60s `retry-after`, before surfacing the error and letting the TUI offer a model downgrade.
+
+### What was added
+
+Account rotation inside `run_stream_with_retries` (`crates/jcode-provider-anthropic-runtime/src/lib.rs`):
+
+- On a usage-limit error with no output yet on the attempt (`should_rotate_account`), pick the next untried account from `account_failover_candidates(ActiveProvider::Claude)`, set the account override, load or refresh that account's token, and replay the same model.
+- `retry-after` is cleared on rotation: the new account has its own quota bucket.
+- Rotation gets its own attempt budget (`MAX_RETRIES + alternate account count`) and transport retries are counted separately (`transport_retries`), so rotating never consumes the retries reserved for network faults.
+- Accounts whose credentials fail to load or refresh are marked tried and skipped.
+- If every account is limited, the original account override is restored (`restore_claude_account`) and the error surfaces as before, so the TUI model downgrade is the last resort rather than the first.
+- The switch is visible: `StreamEvent::StatusDetail` in the transcript plus a `Same-provider account failover` log line.
+
+Scope: Anthropic HTTPS/SSE runtime (both unified and split system paths, which share `run_stream_with_retries`).
+The Claude CLI runtime has its own retry loop and is not covered.
+
 ## Files Changed
 
 ### Core logic
 - `crates/jcode-provider-core/src/fallback_pick.rs` - Added `rate_limit` field to `FallbackPickOptions`, updated tier assignment, 3 new tests (14 total pass)
+- `crates/jcode-provider-anthropic-runtime/src/lib.rs` - Account rotation in the streaming retry loop: `should_rotate_account`, `switch_to_next_claude_account`, `credentials_for_claude_account`, `next_untried_account`, `claude_account_candidate_count`, `restore_claude_account`; separate transport-retry counter and extended attempt budget
+- `crates/jcode-base/src/provider/account_failover.rs` - Added public `account_failover_candidates(provider)` so a provider runtime can rotate accounts itself
 
 ### Wiring
 - `crates/jcode-base/src/provider/account_failover.rs` - Made `error_looks_like_usage_limit` public, added `prefer_account_failover_enabled()` accessor

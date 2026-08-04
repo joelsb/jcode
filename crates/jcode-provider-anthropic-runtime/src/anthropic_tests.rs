@@ -2103,3 +2103,90 @@ fn test_anthropic_unknown_content_block_start_does_not_drop_event() {
         );
     }
 }
+
+#[test]
+fn next_untried_account_skips_already_attempted_labels() {
+    let candidates = vec![
+        "claude-1".to_string(),
+        "claude-2".to_string(),
+        "claude-3".to_string(),
+    ];
+    let tried = vec!["claude-1".to_string(), "claude-2".to_string()];
+
+    assert_eq!(
+        next_untried_account(&candidates, &tried),
+        Some("claude-3"),
+        "rotation must move past every account the request already used"
+    );
+}
+
+#[test]
+fn next_untried_account_returns_first_candidate_when_nothing_tried() {
+    let candidates = vec!["claude-2".to_string(), "claude-1".to_string()];
+
+    assert_eq!(
+        next_untried_account(&candidates, &[]),
+        Some("claude-2"),
+        "candidates arrive best-first, so the head is the preferred account"
+    );
+}
+
+#[test]
+fn next_untried_account_is_none_when_every_account_is_exhausted() {
+    let candidates = vec!["claude-1".to_string(), "claude-2".to_string()];
+    let tried = vec!["claude-2".to_string(), "claude-1".to_string()];
+
+    assert_eq!(
+        next_untried_account(&candidates, &tried),
+        None,
+        "with no account left the caller must fall through to model fallback"
+    );
+}
+
+#[test]
+fn rate_limit_errors_are_recognized_as_usage_limits() {
+    let error_str = "anthropic api error (429 too many requests): {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"this request would exceed your account's rate limit.\"}}";
+
+    assert!(
+        jcode_base::provider::error_looks_like_usage_limit(error_str),
+        "the 429 body jcode logs must trigger account rotation"
+    );
+    assert!(
+        is_retryable_error(error_str),
+        "429 stays retryable so the rotated account gets an attempt"
+    );
+}
+
+#[test]
+fn should_rotate_account_only_on_usage_limits() {
+    let rate_limit = "anthropic api error (429 too many requests)";
+
+    assert!(
+        should_rotate_account(true, false, rate_limit),
+        "a 429 before any output is exactly the case account rotation exists for"
+    );
+    assert!(
+        !should_rotate_account(false, false, rate_limit),
+        "rotation must stay off when prefer_account_failover is disabled or auth is an API key"
+    );
+    assert!(
+        !should_rotate_account(true, true, rate_limit),
+        "output already reached the consumer; replaying on another account would duplicate it"
+    );
+    assert!(
+        !should_rotate_account(
+            true,
+            false,
+            "error sending request: connection reset by peer"
+        ),
+        "transport faults belong to the retry loop, not to another account"
+    );
+    assert!(
+        !should_rotate_account(
+            true,
+            false,
+            "anthropic api error (500 internal server error)"
+        ),
+        "a server fault is not an account problem"
+    );
+}
