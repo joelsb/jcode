@@ -42,3 +42,20 @@ Two things that waste time otherwise:
 - Confirm which binary you are actually inspecting. `strings` on
   `builds/shared-server/jcode` reads a 70-byte symlink, not a program; resolve it
   with `readlink -f` first.
+
+## DAIN Custom Patches
+
+We maintain local patches on feature branches. Documentation for each:
+
+- **Account-first failover** (`feat/account-first-failover`): When rate-limited, try same model on next OAuth account before downgrading to a smaller model. See `docs/DAIN_ACCOUNT_FIRST_FAILOVER.md`.
+- **Configuration reference**: Our config, aliases, accounts. See `docs/DAIN_CONFIGURATION_REFERENCE.md`.
+
+## Build Shortcut
+
+```bash
+source "$HOME/.cargo/env"
+cargo build --release
+bash scripts/install_release.sh --fast
+```
+
+Official docs: https://jcode.sh/docs#configuration
