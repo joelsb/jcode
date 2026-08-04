@@ -488,3 +488,30 @@ fn wrapper_value_flags_and_unbounded_globs_remain_guarded() {
         );
     }
 }
+
+/// A recursive read is not a recursive delete.
+///
+/// Regression (DAIN, superseded upstream but not covered by an upstream test):
+/// a redirect made the segment "interesting", after which every operand of a
+/// read-only program was classified as a deletion target and the `-r` of
+/// `grep -rn` was read as the `-r` of `rm`. Keep the case pinned so the
+/// upstream implementation cannot regress it.
+#[test]
+fn recursive_read_only_commands_are_safe() {
+    let ctx = ctx();
+    let mut blocked = Vec::new();
+    for command in [
+        "grep -rn needle . 2>/dev/null",
+        "grep -rn pattern /home/u/proj/src",
+        "ls -R . 2>/dev/null",
+    ] {
+        let assessment = assess(command, &ctx);
+        if !assessment.level.runs_immediately() {
+            blocked.push(format!("{command} -> {:?}", assessment.level));
+        }
+    }
+    assert!(
+        blocked.is_empty(),
+        "recursive reads must not be gated: {blocked:#?}"
+    );
+}
