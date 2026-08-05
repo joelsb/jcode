@@ -1693,6 +1693,30 @@ impl Provider for InertRuntimeProvider {
 impl App {
     const AUTO_RETRY_BASE_DELAY_SECS: u64 = 2;
     const AUTO_RETRY_MAX_ATTEMPTS: u8 = 3;
+    /// Attempts allowed for a provider capacity rejection (`overloaded_error`,
+    /// HTTP 529).
+    ///
+    /// Far more generous than `AUTO_RETRY_MAX_ATTEMPTS`, because the two failures
+    /// are not comparable. Three attempts is right for a lost connection: if the
+    /// socket is still broken after ~12s, something needs attention. An overload
+    /// is the provider being momentarily full, which is both common and entirely
+    /// self-healing, so the correct reaction is to keep waiting rather than to
+    /// hand the user a failed turn and an offer to downgrade their model.
+    /// Observed live: a session burned all three attempts inside ~20s during an
+    /// Anthropic overload window and failed, while retrying a little longer
+    /// succeeded.
+    ///
+    /// 50 attempts against the 30s cap is roughly 22 minutes of patience. That is
+    /// deliberately long: an overload window that outlasts it is a real provider
+    /// outage worth reporting, whereas anything shorter risks failing a turn that
+    /// waiting would have completed.
+    const OVERLOAD_RETRY_MAX_ATTEMPTS: u8 = 50;
+    /// Base delay for capacity retries, growing linearly and then capped by
+    /// `RETRY_MAX_BACKOFF_SECS`: ~5s, 10s, 15s, ... 30s, 30s, ...
+    const OVERLOAD_RETRY_BASE_DELAY_SECS: u64 = 5;
+    /// Ceiling on any single retry wait. Past this the wait stops being
+    /// distinguishable from a hang, so the cadence holds steady instead.
+    const RETRY_MAX_BACKOFF_SECS: u64 = 30;
     /// Budget for completion-confidence gate nudges per auto-poke cycle.
     /// Observed live: a session that stopped updating its todos was re-nudged
     /// with the same hidden continuation every ~5 seconds indefinitely, one

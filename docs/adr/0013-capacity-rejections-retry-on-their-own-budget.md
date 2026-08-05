@@ -38,6 +38,20 @@ Classify capacity separately from transport, and give it its own budget and back
 Ordering in the loop matters: the capacity branch sits after account rotation and before the generic transient branch.
 An overload is a server-side capacity problem, not an account quota problem, so `should_rotate_account` must not fire on it - rotating to another account reaches the same saturated fleet while burning a rotation.
 
+### The client-side budget, too
+
+Fixing only the provider was not enough, and the reason is worth recording.
+With the provider fix live, one session recovered (`⏳ Anthropic is overloaded; retrying (2/4)`) while another still failed.
+The second session had exhausted a *different* budget: once the provider gives up, the TUI decides whether to resend the turn at all, and that path gave an overload the generic transport treatment - `AUTO_RETRY_MAX_ATTEMPTS` of 3 at 2/4/6s, reported as "Connection lost", then "Auto-retry limit reached after 3 attempts" and the model-downgrade offer.
+
+So the client became the binding constraint, and the same reasoning applies at both layers:
+
+- `App::error_is_provider_overload` classifies the rendered wire text, mirroring the provider-side `is_overloaded_error`.
+- Capacity retries use `OVERLOAD_RETRY_MAX_ATTEMPTS` (50) at `OVERLOAD_RETRY_BASE_DELAY_SECS` (5s), growing linearly and capped by `RETRY_MAX_BACKOFF_SECS` (30s): roughly 22 minutes of patience. An overload window that outlasts that is a real outage worth reporting.
+- The cap exists because unbounded linear growth reaches multi-minute waits that are indistinguishable from a hang. A steady 30s cadence stays legible.
+- The notice reads `⏳ Provider overloaded - retrying (n/50, in Ns)`. Calling a capacity rejection "Connection lost" told the user to check their network for a server-side problem.
+
+
 ## Consequences
 
 - A transient overload now costs seconds of waiting instead of a failed turn. Worst case an unrecoverable overload takes ~14s longer to report, which is the right trade: the failure message is only useful once retrying is genuinely hopeless.
@@ -58,5 +72,6 @@ Also revisit if telemetry shows overloads routinely surviving four retries, whic
 ## Evidence
 
 - Reported failure: `overloaded_error` with `request_id` `req_011CDjHKfn5sRZakAvDW2xJ6`, surfaced with the Ctrl+Y model-downgrade offer.
-- `crates/jcode-provider-anthropic-runtime/src/lib.rs`: `is_overloaded_error`, `MAX_OVERLOADED_RETRIES`, `OVERLOADED_RETRY_BASE_DELAY_MS`, and the capacity branch in `run_stream_with_retries`.
-- Tests: `overloaded_errors_are_classified_as_capacity_not_just_transient`, `a_request_id_containing_529_is_not_mistaken_for_a_capacity_error`.
+- `crates/jcode-provider-anthropic-runtime/src/lib.rs`: `is_overloaded_error`, `MAX_OVERLOADED_RETRIES`, `OVERLOADED_RETRY_BASE_DELAY_MS`, and the capacity branch in `run_stream_with_retries`. Client side: `App::error_is_provider_overload`, `schedule_pending_remote_overload_retry`, `OVERLOAD_RETRY_MAX_ATTEMPTS`, `RETRY_MAX_BACKOFF_SECS`.
+- Tests: `overloaded_errors_are_classified_as_capacity_not_just_transient`, `a_request_id_containing_529_is_not_mistaken_for_a_capacity_error`, `test_overload_retries_on_its_own_generous_budget`, `test_overload_backoff_is_capped_so_waits_stay_legible`.
+- The two-layer nature of the bug was only visible live: with the provider fix deployed, one session recovered while another failed on the client budget. A single-layer fix looked correct in tests and in one session, which is the general lesson - a retry policy is only as patient as its least patient layer.
