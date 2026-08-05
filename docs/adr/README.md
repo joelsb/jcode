@@ -25,3 +25,7 @@ Format: Michael Nygard's ADR template, trimmed to the sections this codebase act
 | [0007](0007-announce-rotation-to-clients-over-the-bus.md) | Announce rotation to clients over the bus and mirror it with an override | Accepted |
 | [0008](0008-context-limit-derives-from-the-active-model.md) | Derive the context limit from the active model, never from the provider default | Accepted |
 | [0009](0009-defer-per-session-account-identity.md) | Leave account identity process-global for now | Deferred |
+| [0010](0010-invalidate-the-usage-cache-with-an-epoch-guard.md) | Invalidate the usage cache explicitly, guarded by an epoch | Accepted |
+| [0011](0011-filter-the-rotation-broadcast-client-side.md) | Broadcast rotation to every client, filter it client-side by provider | Accepted |
+| [0012](0012-announce-a-dead-end-restore-as-its-own-outcome.md) | Announce a dead-end restore as its own outcome, not as a switch | Accepted |
+| [0013](0013-capacity-rejections-retry-on-their-own-budget.md) | Anthropic capacity rejections retry on their own budget and clock | Accepted |
