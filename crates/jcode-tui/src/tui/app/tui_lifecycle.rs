@@ -284,25 +284,29 @@ impl App {
             Ok((retry_attempts, backoff_secs, retry_at)) => {
                 self.rate_limit_reset = Some(retry_at);
                 let is_overload = Self::error_is_provider_overload(reason);
-                let headline = if is_overload {
-                    "⏳ Provider overloaded"
+                let content = if is_overload {
+                    // The provider error is already rendered directly above this
+                    // notice, so repeating the raw JSON here only pushes the
+                    // actionable part (which attempt, how long) off the line.
+                    format!(
+                        "⏳ Provider overloaded - retrying (attempt {}/{}, in {}s)",
+                        retry_attempts, max_attempts, backoff_secs
+                    )
                 } else {
-                    "⚡ Connection lost"
+                    format!(
+                        "⚡ Connection lost - retrying (attempt {}/{}, in {}s) - {}",
+                        retry_attempts,
+                        max_attempts,
+                        backoff_secs,
+                        reason
+                            .trim()
+                            .trim_start_matches("⚡ ")
+                            .trim_start_matches("Connection lost")
+                            .trim_start_matches('(')
+                            .trim_end_matches('.')
+                            .trim()
+                    )
                 };
-                let content = format!(
-                    "{} - retrying (attempt {}/{}, in {}s) - {}",
-                    headline,
-                    retry_attempts,
-                    max_attempts,
-                    backoff_secs,
-                    reason
-                        .trim()
-                        .trim_start_matches("⚡ ")
-                        .trim_start_matches("Connection lost")
-                        .trim_start_matches('(')
-                        .trim_end_matches('.')
-                        .trim()
-                );
                 if let Some(idx) = self.display_messages.iter().rposition(|message| {
                     message.role == "system"
                         && (message.title.as_deref() == Some("Connection")
