@@ -29,4 +29,3 @@ Format: Michael Nygard's ADR template, trimmed to the sections this codebase act
 | [0011](0011-filter-the-rotation-broadcast-client-side.md) | Broadcast rotation to every client, filter it client-side by provider | Accepted |
 | [0012](0012-announce-a-dead-end-restore-as-its-own-outcome.md) | Announce a dead-end restore as its own outcome, not as a switch | Accepted |
 | [0013](0013-capacity-rejections-retry-on-their-own-budget.md) | Anthropic capacity rejections retry on their own budget and clock | Accepted |
-| [0014](0014-detect-wezterm-by-its-own-marker-variables.md) | Detect WezTerm by its own marker variables, not only terminal identity | Accepted |
