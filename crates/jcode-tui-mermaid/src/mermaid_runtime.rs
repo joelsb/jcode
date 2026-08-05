@@ -123,43 +123,11 @@ pub(super) fn picker_init_mode_from_probe_env(raw: Option<&str>) -> PickerInitMo
     }
 }
 
-/// WezTerm's own marker variables, which survive a multiplexer that rewrites
-/// `TERM`/`TERM_PROGRAM`.
-fn wezterm_env_marker() -> Option<String> {
-    for key in ["WEZTERM_PANE", "WEZTERM_EXECUTABLE", "WEZTERM_UNIX_SOCKET"] {
-        if let Ok(value) = std::env::var(key)
-            && !value.trim().is_empty()
-        {
-            return Some(value);
-        }
-    }
-    None
-}
-
 pub(super) fn infer_protocol_from_env(
     term: Option<&str>,
     term_program: Option<&str>,
     lc_terminal: Option<&str>,
     kitty_window_id: Option<&str>,
-) -> Option<ProtocolType> {
-    infer_protocol_from_env_with_wezterm(term, term_program, lc_terminal, kitty_window_id, None)
-}
-
-/// Same detection, with WezTerm's own marker variables passed in.
-///
-/// A multiplexer replaces `TERM_PROGRAM` with its own name (`tmux`) and rewrites
-/// `TERM` to `tmux-256color`, so inside tmux none of the terminal-identity
-/// variables mention WezTerm and detection fell through to `None` - which is why
-/// a WezTerm user inside tmux saw "your terminal cannot render inline images".
-/// WezTerm also exports `WEZTERM_PANE` and `WEZTERM_EXECUTABLE`, which tmux
-/// passes through untouched, so they identify the outer terminal when the
-/// standard variables no longer can.
-pub(super) fn infer_protocol_from_env_with_wezterm(
-    term: Option<&str>,
-    term_program: Option<&str>,
-    lc_terminal: Option<&str>,
-    kitty_window_id: Option<&str>,
-    wezterm_marker: Option<&str>,
 ) -> Option<ProtocolType> {
     let term = term.unwrap_or("").to_ascii_lowercase();
     let term_program = term_program.unwrap_or("").to_ascii_lowercase();
@@ -170,10 +138,7 @@ pub(super) fn infer_protocol_from_env_with_wezterm(
     // correctly. Its iTerm2 path is the upstream-tested, glitch-free choice.
     // Prefer this explicit terminal identity over TERM/KITTY_WINDOW_ID, which
     // may be inherited or deliberately overridden.
-    if term_program.contains("wezterm")
-        || lc_terminal.contains("wezterm")
-        || wezterm_marker.is_some_and(|marker| !marker.trim().is_empty())
-    {
+    if term_program.contains("wezterm") || lc_terminal.contains("wezterm") {
         return Some(ProtocolType::Iterm2);
     }
 
@@ -216,14 +181,7 @@ pub(super) fn real_iterm2_without_opt_in() -> bool {
     let lc_terminal = std::env::var("LC_TERMINAL")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    // Same multiplexer blind spot as `infer_protocol_from_env`: inside tmux the
-    // identity variables say "tmux", so WezTerm must be recognized by its own
-    // markers or the stdio probe's correct Iterm2 answer gets downgraded to
-    // halfblocks as though we were in real iTerm2.
-    if term_program.contains("wezterm")
-        || lc_terminal.contains("wezterm")
-        || wezterm_env_marker().is_some()
-    {
+    if term_program.contains("wezterm") || lc_terminal.contains("wezterm") {
         return false;
     }
     let is_iterm = term_program.contains("iterm")
@@ -277,12 +235,11 @@ fn fast_picker() -> Picker {
     #[allow(deprecated)]
     let mut picker = Picker::from_fontsize(font_size);
     picker.set_protocol_type(ProtocolType::Halfblocks);
-    if let Some(protocol) = infer_protocol_from_env_with_wezterm(
+    if let Some(protocol) = infer_protocol_from_env(
         std::env::var("TERM").ok().as_deref(),
         std::env::var("TERM_PROGRAM").ok().as_deref(),
         std::env::var("LC_TERMINAL").ok().as_deref(),
         std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
-        wezterm_env_marker().as_deref(),
     ) {
         picker.set_protocol_type(protocol);
     }
@@ -355,12 +312,11 @@ pub(crate) fn prewarm_svg_font_db_async() {
 /// in-memory cache registration.
 pub fn init_picker() {
     PICKER.get_or_init(|| {
-        let env_protocol = infer_protocol_from_env_with_wezterm(
+        let env_protocol = infer_protocol_from_env(
             std::env::var("TERM").ok().as_deref(),
             std::env::var("TERM_PROGRAM").ok().as_deref(),
             std::env::var("LC_TERMINAL").ok().as_deref(),
             std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
-            wezterm_env_marker().as_deref(),
         );
         let multiplexer = detect_multiplexer_from_env();
         let probe_override = std::env::var("JCODE_MERMAID_PICKER_PROBE")
@@ -792,40 +748,6 @@ mod tests {
         // Herdr/tmux advertise a bland TERM with no graphics hints.
         assert_eq!(
             infer_protocol_from_env(Some("xterm-256color"), None, None, None),
-            None
-        );
-    }
-
-    #[test]
-    fn infer_protocol_detects_wezterm_behind_tmux_via_its_own_markers() {
-        // The exact environment a WezTerm user inside tmux has: tmux rewrites
-        // TERM and claims TERM_PROGRAM for itself, so no identity variable
-        // mentions WezTerm and images were reported as unsupported.
-        assert_eq!(
-            infer_protocol_from_env(Some("tmux-256color"), Some("tmux"), None, None),
-            None,
-            "the identity variables alone cannot see WezTerm through tmux"
-        );
-        assert_eq!(
-            infer_protocol_from_env_with_wezterm(
-                Some("tmux-256color"),
-                Some("tmux"),
-                None,
-                None,
-                Some("0"),
-            ),
-            Some(ProtocolType::Iterm2),
-            "WEZTERM_PANE survives tmux and identifies the outer terminal"
-        );
-        // An empty marker is not evidence of anything.
-        assert_eq!(
-            infer_protocol_from_env_with_wezterm(
-                Some("tmux-256color"),
-                Some("tmux"),
-                None,
-                None,
-                Some("  "),
-            ),
             None
         );
     }
