@@ -2126,6 +2126,12 @@ impl MockAnthropicServer {
     }
 
     fn stop(self) {
+        self.abort();
+    }
+
+    /// Same teardown as [`Self::stop`] without consuming the server, so an
+    /// owning fixture can abort it from `Drop`.
+    fn abort(&self) {
         self.handle.abort();
     }
 }
@@ -2262,6 +2268,15 @@ struct RotationFixture {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
+impl Drop for RotationFixture {
+    fn drop(&mut self) {
+        // The pre-fixture version of these tests ended with an explicit
+        // `server.stop()`. Without this the listener task outlives every
+        // rotation test and keeps its port bound for the rest of the run.
+        self.server.abort();
+    }
+}
+
 impl RotationFixture {
     async fn new() -> Self {
         let _guard = jcode_base::storage::lock_test_env();
@@ -2396,17 +2411,22 @@ async fn rotation_publishes_an_account_rotated_bus_event() {
 
     fixture.drive_stream_to_completion().await;
 
-    let mut rotated_labels = Vec::new();
+    let mut rotations = Vec::new();
     while let Ok(event) = bus_rx.try_recv() {
         if let jcode_base::bus::BusEvent::AnthropicAccountRotated(rotated) = event {
-            rotated_labels.push((rotated.previous_label.clone(), rotated.label.clone()));
+            rotations.push((
+                rotated.previous_label.clone(),
+                rotated.label.clone(),
+                rotated.restored,
+            ));
         }
     }
 
     assert_eq!(
-        rotated_labels,
-        vec![(Some("claude-1".to_string()), "claude-2".to_string())],
-        "a rotation the client cannot otherwise observe must be announced exactly once"
+        rotations,
+        vec![(Some("claude-1".to_string()), "claude-2".to_string(), false)],
+        "a rotation the client cannot otherwise observe must be announced exactly once, and \
+         landing on a working account is not the give-up path"
     );
 }
 
@@ -2565,5 +2585,40 @@ fn restore_claude_account_writes_back_when_override_still_matches() {
         jcode_base::auth::claude::active_account_label().as_deref(),
         Some("claude-1"),
         "override still holds our label: restoring the original is safe"
+    );
+}
+
+#[test]
+fn overloaded_errors_are_classified_as_capacity_not_just_transient() {
+    // The exact SSE error event Anthropic sends when it has no capacity.
+    let sse = "retryable stream error: {\"type\":\"error\",\"error\":{\"details\":null,\"type\":\"overloaded_error\",\"message\":\"overloaded\"},\"request_id\":\"req_011cdjhkfn5srzakavdw2xj6\"}";
+
+    assert!(
+        is_overloaded_error(sse),
+        "an overloaded_error must take the capacity backoff, not the ~200ms transport backoff"
+    );
+    assert!(
+        is_retryable_error(sse),
+        "it must stay retryable so the request is not surfaced as a hard failure"
+    );
+    assert!(
+        is_overloaded_error("anthropic api error (529 ): overloaded"),
+        "HTTP 529 is the same capacity signal on the initial response"
+    );
+    assert!(
+        !should_rotate_account(true, sse),
+        "an overload is a server capacity problem, not an account quota problem"
+    );
+}
+
+#[test]
+fn a_request_id_containing_529_is_not_mistaken_for_a_capacity_error() {
+    // A bare "529" substring occurs inside request ids and token counts, so the
+    // capacity match must be anchored on the status text.
+    assert!(
+        !is_overloaded_error(
+            "anthropic api error (400 bad request): {\"request_id\":\"req_011cdj529hkfn\"}"
+        ),
+        "a request id that happens to contain 529 must not trigger capacity backoff"
     );
 }
