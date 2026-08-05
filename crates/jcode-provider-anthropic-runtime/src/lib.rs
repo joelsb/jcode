@@ -486,6 +486,20 @@ const MAX_RETRIES: u32 = 3;
 /// Base delay for exponential backoff (in milliseconds)
 const RETRY_BASE_DELAY_MS: u64 = 1000;
 
+/// Extra attempts reserved for Anthropic capacity rejections (`overloaded_error`,
+/// HTTP 529).
+///
+/// An overload is not a transport fault: the request was well-formed and the
+/// server simply had no capacity right now. It clears on its own, but on the
+/// order of seconds, not the ~200ms the transport backoff waits. Sharing the
+/// transport budget meant a single overload burned the one available retry
+/// almost immediately and surfaced a raw stream error plus a "switch model"
+/// prompt, when simply waiting a little longer nearly always succeeds.
+const MAX_OVERLOADED_RETRIES: u32 = 4;
+
+/// Base delay for capacity backoff, giving ~2s, 4s, 8s across the retries above.
+const OVERLOADED_RETRY_BASE_DELAY_MS: u64 = 2000;
+
 /// Cached OAuth credentials
 #[derive(Clone)]
 struct CachedCredentials {
@@ -1749,6 +1763,9 @@ async fn run_stream_with_retries(
     // Transport-level retries, counted separately so `MAX_RETRIES` keeps
     // meaning "attempts at the same request", as before.
     let mut transport_retries: u32 = 0;
+    // Capacity retries, counted separately again: an overload burst and a flaky
+    // network are independent faults and must not consume each other's budget.
+    let mut overloaded_retries: u32 = 0;
     let mut attempt: u32 = 0;
 
     while attempt < attempt_budget {
@@ -2024,6 +2041,50 @@ async fn run_stream_with_retries(
                     }
                 }
 
+                // Capacity rejection (`overloaded_error` / HTTP 529). Retryable,
+                // but on a longer clock than a transport fault and on its own
+                // budget, so a burst of overloads cannot exhaust the retries
+                // reserved for network faults (and vice versa).
+                if is_overloaded_error(&error_str) && overloaded_retries + 1 < MAX_OVERLOADED_RETRIES
+                {
+                    overloaded_retries += 1;
+                    if saw_output {
+                        let _ = tx
+                            .send(Ok(StreamEvent::RetryRollback {
+                                attempt: attempt_index + 2,
+                                max: attempt_budget + 1,
+                            }))
+                            .await;
+                    }
+                    jcode_base::logging::info(&format!(
+                        "Anthropic is overloaded (attempt {}/{}), backing off and retrying: {}",
+                        overloaded_retries, MAX_OVERLOADED_RETRIES, e
+                    ));
+                    let _ = tx
+                        .send(Ok(StreamEvent::StatusDetail {
+                            detail: format!(
+                                "⏳ Anthropic is overloaded; retrying ({}/{})",
+                                overloaded_retries, MAX_OVERLOADED_RETRIES
+                            ),
+                        }))
+                        .await;
+                    // An overload is not the user's turn failing, so it must not
+                    // consume an attempt the transport retries may still need.
+                    attempt_budget += 1;
+                    next_retry_delay = Some(
+                        jcode_provider_core::retry_after::retry_after_from_error(&e).unwrap_or_else(
+                            || {
+                                jcode_provider_core::attempt_tracker::retry_backoff_delay(
+                                    overloaded_retries,
+                                    OVERLOADED_RETRY_BASE_DELAY_MS,
+                                )
+                            },
+                        ),
+                    );
+                    last_error = Some(e);
+                    continue;
+                }
+
                 // Check if this is a transient/retryable error
                 if is_retryable_error(&error_str) && transport_retries + 1 < MAX_RETRIES {
                     transport_retries += 1;
@@ -2215,7 +2276,7 @@ fn restore_claude_account(
     }
     auth::claude::set_active_account_override(original.clone());
     jcode_base::auth::AuthStatus::invalidate_cached_status();
-    jcode_base::bus::Bus::global().publish_anthropic_account_rotated(
+    jcode_base::bus::Bus::global().publish_anthropic_account_restored(
         original
             .clone()
             .unwrap_or_else(auth::claude::primary_account_label),
@@ -2485,9 +2546,26 @@ fn is_retryable_error(error_str: &str) -> bool {
         || error_str.contains("429 too many requests")
         || error_str.contains("rate limit")
         || error_str.contains("rate_limit")
-        // API-level server errors (SSE error events)
-        || error_str.contains("api_error")
-        || error_str.contains("internal server error")
+    // API-level server errors (SSE error events)
+    || error_str.contains("api_error")
+    || error_str.contains("internal server error")
+}
+
+/// Detect an Anthropic capacity rejection.
+///
+/// Anthropic signals "no capacity right now" as `overloaded_error` in an SSE
+/// error event, or as HTTP 529 on the initial response. Both are retryable, but
+/// they need a longer wait than a transport fault, so they are classified
+/// separately from [`is_retryable_error`]. `error_str` is expected to already be
+/// lowercased.
+///
+/// The 529 match is anchored on the surrounding status text that
+/// `stream_response` emits, because a bare "529" also occurs inside request ids
+/// and token counts.
+fn is_overloaded_error(error_str: &str) -> bool {
+    error_str.contains("overloaded")
+        || error_str.contains("(529")
+        || error_str.contains("529 ")
 }
 
 fn is_fable_scoped_limit_error(model: &str, error: &str) -> bool {
