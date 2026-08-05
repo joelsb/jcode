@@ -126,6 +126,34 @@ impl App {
         self.schedule_pending_remote_retry_with_limit(reason, Self::AUTO_RETRY_MAX_ATTEMPTS)
     }
 
+    /// Schedule a retry for a provider capacity rejection.
+    ///
+    /// A capacity rejection is not a lost connection: it needs a longer wait and
+    /// more attempts than a transport fault, and labelling it "Connection lost"
+    /// misdescribes it. The provider already retries internally on its own
+    /// budget (ADR-0013); this is the client-side budget that decides whether the
+    /// turn is resent at all after the provider gives up, so it must be at least
+    /// as patient or it becomes the binding constraint.
+    pub(super) fn schedule_pending_remote_overload_retry(&mut self, reason: &str) -> bool {
+        self.schedule_pending_remote_retry_with_limit_and_backoff(
+            reason,
+            Self::OVERLOAD_RETRY_MAX_ATTEMPTS,
+            Self::OVERLOAD_RETRY_BASE_DELAY_SECS,
+        )
+    }
+
+    /// Whether an error message is a provider "no capacity right now" rejection.
+    ///
+    /// Mirrors the provider-side classifier (`is_overloaded_error`), but has to
+    /// work from the rendered error text the client receives over the wire.
+    pub(super) fn error_is_provider_overload(error: &str) -> bool {
+        let lower = error.to_ascii_lowercase();
+        lower.contains("overloaded")
+            || lower.contains("(529")
+            || lower.contains("529 too many")
+            || lower.contains("529 service")
+    }
+
     pub(super) fn schedule_pending_remote_network_wait(&mut self, reason: &str) -> bool {
         self.schedule_pending_remote_network_wait_with_force(reason, false)
     }
@@ -197,6 +225,19 @@ impl App {
         reason: &str,
         max_attempts: u8,
     ) -> bool {
+        self.schedule_pending_remote_retry_with_limit_and_backoff(
+            reason,
+            max_attempts,
+            Self::AUTO_RETRY_BASE_DELAY_SECS,
+        )
+    }
+
+    pub(super) fn schedule_pending_remote_retry_with_limit_and_backoff(
+        &mut self,
+        reason: &str,
+        max_attempts: u8,
+        base_delay_secs: u64,
+    ) -> bool {
         let Some(pending) = self.rate_limit_pending_message.as_mut() else {
             return false;
         };
@@ -210,7 +251,11 @@ impl App {
             } else {
                 pending.retry_attempts += 1;
                 let retry_attempts = pending.retry_attempts;
-                let backoff_secs = Self::AUTO_RETRY_BASE_DELAY_SECS * u64::from(retry_attempts);
+                // Linear growth, capped: a long overload should keep retrying on
+                // a steady cadence rather than drifting into multi-minute waits
+                // that look indistinguishable from a hang.
+                let backoff_secs = (base_delay_secs * u64::from(retry_attempts))
+                    .min(Self::RETRY_MAX_BACKOFF_SECS);
                 let retry_at = Instant::now() + Duration::from_secs(backoff_secs);
                 pending.retry_at = Some(retry_at);
                 Ok((retry_attempts, backoff_secs, retry_at))
@@ -231,8 +276,15 @@ impl App {
             }
             Ok((retry_attempts, backoff_secs, retry_at)) => {
                 self.rate_limit_reset = Some(retry_at);
+                let is_overload = Self::error_is_provider_overload(reason);
+                let headline = if is_overload {
+                    "⏳ Provider overloaded"
+                } else {
+                    "⚡ Connection lost"
+                };
                 let content = format!(
-                    "⚡ Connection lost - retrying (attempt {}/{}, in {}s) - {}",
+                    "{} - retrying (attempt {}/{}, in {}s) - {}",
+                    headline,
                     retry_attempts,
                     max_attempts,
                     backoff_secs,
@@ -250,7 +302,8 @@ impl App {
                             || message
                                 .content
                                 .starts_with("⚡ Server reload in progress - waiting for handoff")
-                            || message.content.starts_with("⚡ Connection lost"))
+                            || message.content.starts_with("⚡ Connection lost")
+                            || message.content.starts_with("⏳ Provider overloaded"))
                 }) {
                     self.replace_display_message_title_and_content(
                         idx,

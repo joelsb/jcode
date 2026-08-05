@@ -1395,8 +1395,16 @@ pub(in crate::tui::app) fn handle_server_event(
                 );
                 return false;
             }
-            if !is_failover_prompt && !app.schedule_pending_remote_retry("⚠ Remote request failed.")
-            {
+            // A capacity rejection retries on its own, far more patient budget:
+            // the provider is momentarily full, not broken, and the generic
+            // 3-attempt transport budget was failing turns that would have
+            // succeeded seconds later. See ADR-0013.
+            let retry_scheduled = if app_mod::App::error_is_provider_overload(&message) {
+                app.schedule_pending_remote_overload_retry(&message)
+            } else {
+                app.schedule_pending_remote_retry("⚠ Remote request failed.")
+            };
+            if !is_failover_prompt && !retry_scheduled {
                 app.clear_pending_remote_retry();
                 // No automatic retry will resend this turn, so restore the prompt the
                 // user typed back into the input box instead of dropping it.

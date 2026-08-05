@@ -613,3 +613,99 @@ fn test_busy_rejection_requeues_user_submitted_prompt() {
         "the premature echo must be removed so the queue dispatch echoes exactly once"
     );
 }
+
+// A provider capacity rejection must not be failed by the client's 3-attempt
+// transport retry budget. Observed live: the provider retried internally, gave
+// up, and the client then burned attempt 3/3 within ~20s and reported
+// "Auto-retry limit reached", offering a model downgrade for a problem that was
+// pure provider capacity.
+#[test]
+fn test_overload_retries_on_its_own_generous_budget() {
+    let mut app = create_test_app();
+    let overload = "Retryable stream error: {\"type\":\"error\",\"error\":{\"details\":null,\"type\":\"overloaded_error\",\"message\":\"Overloaded\"},\"request_id\":\"req_011CDjJDH5nWppS27ZKtBNrk\"}";
+
+    assert!(
+        App::error_is_provider_overload(overload),
+        "the wire text the client receives must classify as a capacity rejection"
+    );
+    assert!(
+        !App::error_is_provider_overload("error sending request: connection reset by peer"),
+        "a transport fault keeps the tighter transport budget"
+    );
+
+    // The generic transport budget would stop after 3; capacity keeps going well
+    // past it.
+    app.rate_limit_pending_message = Some(PendingRemoteMessage {
+        content: "turn to resend".to_string(),
+        images: vec![],
+        is_system: true,
+        system_reminder: None,
+        auto_retry: true,
+        retry_attempts: 0,
+        retry_at: None,
+    });
+
+    for attempt in 1..=10 {
+        assert!(
+            app.schedule_pending_remote_overload_retry(overload),
+            "capacity retry {attempt} must still be scheduled where the transport budget would have given up at 3"
+        );
+        assert_eq!(
+            app.rate_limit_pending_message
+                .as_ref()
+                .expect("pending message must survive a scheduled retry")
+                .retry_attempts,
+            attempt
+        );
+    }
+
+    // The notice must describe an overload, not a lost connection.
+    let notice = app
+        .display_messages()
+        .iter()
+        .rev()
+        .find(|message| message.role == "system")
+        .expect("a retry notice must be shown");
+    assert!(
+        notice.content.starts_with("⏳ Provider overloaded"),
+        "an overload must not be reported as a lost connection, got: {}",
+        notice.content
+    );
+    assert!(
+        !notice.content.contains("Connection lost"),
+        "got: {}",
+        notice.content
+    );
+}
+
+#[test]
+fn test_overload_backoff_is_capped_so_waits_stay_legible() {
+    let mut app = create_test_app();
+    let overload = "overloaded_error";
+    app.rate_limit_pending_message = Some(PendingRemoteMessage {
+        content: "turn to resend".to_string(),
+        images: vec![],
+        is_system: true,
+        system_reminder: None,
+        auto_retry: true,
+        retry_attempts: 0,
+        retry_at: None,
+    });
+
+    // Linear growth would reach 5 * 20 = 100s by attempt 20; the cap holds it at
+    // 30s so a long overload keeps a steady, legible cadence.
+    for _ in 0..20 {
+        assert!(app.schedule_pending_remote_overload_retry(overload));
+    }
+    let notice = app
+        .display_messages()
+        .iter()
+        .rev()
+        .find(|message| message.role == "system")
+        .expect("a retry notice must be shown");
+    assert!(
+        notice.content.contains("in 30s"),
+        "the backoff must be capped at 30s, got: {}",
+        notice.content
+    );
+}
