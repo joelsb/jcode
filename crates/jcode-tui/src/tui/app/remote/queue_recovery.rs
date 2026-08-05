@@ -158,6 +158,42 @@ pub(super) fn recover_undelivered_queued_continuation(app: &mut App, reason: &st
     true
 }
 
+/// Recover a *user-submitted* prompt that the server rejected because a turn
+/// was still running.
+///
+/// `recover_undelivered_queued_continuation` only handles the queued-follow-up
+/// shape (`is_system && !auto_retry`). A prompt the user typed and submitted
+/// while a background turn was still in flight has the plain user shape, so it
+/// fell through to the generic error path: the turn was marked idle, the error
+/// "Already processing a message" was printed into the transcript, and the
+/// prompt was only restored to the input box - looking to the user like their
+/// message was rejected outright. Fold it back onto the queue instead, so it
+/// dispatches when the running turn actually finishes.
+pub(super) fn recover_rejected_user_submission(app: &mut App, reason: &str) -> bool {
+    let is_recoverable = app
+        .rate_limit_pending_message
+        .as_ref()
+        .is_some_and(|pending| !pending.is_system && !pending.content.trim().is_empty());
+    if !is_recoverable {
+        return false;
+    }
+    let Some(pending) = app.rate_limit_pending_message.take() else {
+        return false;
+    };
+    app.rate_limit_reset = None;
+    crate::logging::info(&format!(
+        "Recovering user-submitted prompt into queued follow-ups after {} (content_chars={})",
+        reason,
+        pending.content.chars().count()
+    ));
+    // The submit path already echoed this prompt into the transcript. The queue
+    // dispatch echoes it again when it really sends, so drop the first echo.
+    app.pop_trailing_user_display_message(&pending.content);
+    app.last_submitted_input = None;
+    app.queued_messages.insert(0, pending.content);
+    true
+}
+
 pub(super) fn recover_local_interleave_to_queue(app: &mut App, reason: &str) -> bool {
     let Some(interleave) = app.interleave_message.take() else {
         return false;

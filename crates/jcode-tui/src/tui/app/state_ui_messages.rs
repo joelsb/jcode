@@ -123,6 +123,28 @@ impl App {
         self.note_runtime_memory_event_force("display_messages_replaced", "display_history_reset");
     }
 
+    /// Remove a just-appended user echo from the transcript.
+    ///
+    /// Used when a submitted prompt never actually started a turn (the server
+    /// rejected it as busy) and is being folded back into the queue: the queue
+    /// dispatch echoes it again when it really sends, so leaving the first echo
+    /// in place would show the prompt twice.
+    pub(super) fn pop_trailing_user_display_message(&mut self, content: &str) -> bool {
+        let matches = self
+            .display_messages
+            .last()
+            .is_some_and(|last| last.role == "user" && last.content == content);
+        if !matches {
+            return false;
+        }
+        let Some(message) = self.display_messages.pop() else {
+            return false;
+        };
+        self.adjust_display_message_stats(&message, false);
+        self.bump_display_messages_version_no_stats();
+        true
+    }
+
     pub(super) fn replace_display_message_content(&mut self, idx: usize, content: String) -> bool {
         if let Some(message) = self.display_messages.get_mut(idx) {
             if message.content != content {

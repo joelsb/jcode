@@ -701,3 +701,68 @@ fn completed_cycle_rearms_auto_poke_only_when_default_on() {
         );
     });
 }
+
+// A prompt the user types and submits while a turn is still running must be
+// queued, not rejected. The client can believe the turn is idle (a background
+// task's turn is still finishing server-side), submit the prompt, and get back
+// "Already processing a message". Before the fix, that surfaced as a raw error
+// in the transcript and the prompt was only dropped back into the input box.
+#[test]
+fn test_busy_rejection_requeues_user_submitted_prompt() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    // The client thought it was idle and dispatched a plain user prompt.
+    app.is_processing = true;
+    app.current_message_id = Some(7);
+    app.last_submitted_input = Some("new prompt".to_string());
+    app.push_display_message(DisplayMessage::user("new prompt".to_string()));
+    app.rate_limit_pending_message = Some(PendingRemoteMessage {
+        content: "new prompt".to_string(),
+        images: vec![],
+        is_system: false,
+        system_reminder: None,
+        auto_retry: false,
+        retry_attempts: 0,
+        retry_at: None,
+    });
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Error {
+            id: 7,
+            message: "Already processing a message".to_string(),
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+
+    assert_eq!(
+        app.queued_messages(),
+        &["new prompt"],
+        "a busy-rejected user prompt must go back on the queue"
+    );
+    assert!(
+        app.is_processing,
+        "the still-running server turn must be re-adopted"
+    );
+    assert!(
+        app.rate_limit_pending_message.is_none(),
+        "the recovered prompt must not linger as an unreachable pending message"
+    );
+    assert!(
+        !app.display_messages()
+            .iter()
+            .any(|message| message.role == "error"),
+        "a busy rejection is not a user-visible error"
+    );
+    assert_eq!(
+        app.display_messages()
+            .iter()
+            .filter(|message| message.role == "user" && message.content == "new prompt")
+            .count(),
+        0,
+        "the premature echo must be removed so the queue dispatch echoes exactly once"
+    );
+}
