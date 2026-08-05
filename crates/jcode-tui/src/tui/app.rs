@@ -1702,11 +1702,14 @@ impl App {
     /// Anthropic overload window and failed, while retrying a little longer
     /// succeeded.
     ///
-    /// 50 attempts against the 30s cap is roughly 22 minutes of patience. That is
-    /// deliberately long: an overload window that outlasts it is a real provider
-    /// outage worth reporting, whereas anything shorter risks failing a turn that
-    /// waiting would have completed.
-    const OVERLOAD_RETRY_MAX_ATTEMPTS: u8 = 50;
+    /// The two layers multiply, which is what sets the number. Each client
+    /// attempt drives a fresh provider request, and the provider itself retries a
+    /// capacity rejection `MAX_OVERLOADED_RETRIES` times before reporting failure
+    /// (ADR-0013). So 10 client attempts is ~40 actual requests spread over
+    /// roughly 4.5 minutes at the 30s cap - ample for a normal overload window,
+    /// while an outage that outlasts it gets reported instead of retried
+    /// indefinitely. A larger client ceiling only multiplies redundant work.
+    const OVERLOAD_RETRY_MAX_ATTEMPTS: u8 = 10;
     /// Base delay for capacity retries, growing linearly and then capped by
     /// `RETRY_MAX_BACKOFF_SECS`: ~5s, 10s, 15s, ... 30s, 30s, ...
     const OVERLOAD_RETRY_BASE_DELAY_SECS: u64 = 5;

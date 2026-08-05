@@ -645,6 +645,7 @@ fn test_overload_retries_on_its_own_generous_budget() {
         retry_at: None,
     });
 
+    // The generic transport budget stops at 3; capacity keeps going past it.
     for attempt in 1..=10 {
         assert!(
             app.schedule_pending_remote_overload_retry(overload),
@@ -676,6 +677,25 @@ fn test_overload_retries_on_its_own_generous_budget() {
         "got: {}",
         notice.content
     );
+    // The provider error is already rendered above the notice; repeating the raw
+    // JSON here would bury the part the user actually needs.
+    assert!(
+        !notice.content.contains("overloaded_error"),
+        "the notice must not echo the error body, got: {}",
+        notice.content
+    );
+    assert!(
+        !notice.content.contains("request_id"),
+        "the notice must not echo the error body, got: {}",
+        notice.content
+    );
+
+    // Ten attempts is the ceiling: each one drives a fresh provider request that
+    // itself retries internally, so the effective patience is ~40 requests.
+    assert!(
+        !app.schedule_pending_remote_overload_retry(overload),
+        "the 11th attempt must be refused so a real outage is reported"
+    );
 }
 
 #[test]
@@ -692,9 +712,9 @@ fn test_overload_backoff_is_capped_so_waits_stay_legible() {
         retry_at: None,
     });
 
-    // Linear growth would reach 5 * 20 = 100s by attempt 20; the cap holds it at
-    // 30s so a long overload keeps a steady, legible cadence.
-    for _ in 0..20 {
+    // Linear growth would reach 5 * 10 = 50s by the last attempt; the cap holds it
+    // at 30s so a long overload keeps a steady, legible cadence.
+    for _ in 0..10 {
         assert!(app.schedule_pending_remote_overload_retry(overload));
     }
     let notice = app

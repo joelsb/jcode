@@ -47,9 +47,10 @@ The second session had exhausted a *different* budget: once the provider gives u
 So the client became the binding constraint, and the same reasoning applies at both layers:
 
 - `App::error_is_provider_overload` classifies the rendered wire text, mirroring the provider-side `is_overloaded_error`.
-- Capacity retries use `OVERLOAD_RETRY_MAX_ATTEMPTS` (50) at `OVERLOAD_RETRY_BASE_DELAY_SECS` (5s), growing linearly and capped by `RETRY_MAX_BACKOFF_SECS` (30s): roughly 22 minutes of patience. An overload window that outlasts that is a real outage worth reporting.
+- Capacity retries use `OVERLOAD_RETRY_MAX_ATTEMPTS` (10) at `OVERLOAD_RETRY_BASE_DELAY_SECS` (5s), growing linearly and capped by `RETRY_MAX_BACKOFF_SECS` (30s).
+- The two layers multiply, and that is what sizes the client ceiling. Each client attempt drives a fresh provider request that itself retries `MAX_OVERLOADED_RETRIES` times, so 10 client attempts is ~40 real requests over ~4.5 minutes. An earlier draft used 50 attempts (~22 min); it was cut once the multiplication was made explicit, because the extra ceiling only multiplied redundant requests against an already-saturated fleet without buying meaningful patience.
 - The cap exists because unbounded linear growth reaches multi-minute waits that are indistinguishable from a hang. A steady 30s cadence stays legible.
-- The notice reads `⏳ Provider overloaded - retrying (n/50, in Ns)`. Calling a capacity rejection "Connection lost" told the user to check their network for a server-side problem.
+- The notice reads `⏳ Provider overloaded - retrying (n/10, in Ns)` and deliberately stops there. Calling a capacity rejection "Connection lost" told the user to check their network for a server-side problem, and appending the raw error JSON (as the transport notice does) buried the only actionable part - which attempt, and how long - behind a wrapped `request_id`. The error body is already rendered immediately above the notice.
 
 
 ## Consequences
