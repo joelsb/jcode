@@ -1221,24 +1221,32 @@ pub(in crate::tui::app) fn handle_server_event(
             // user's queued message (issue #391). Instead, put it back on the
             // queue and re-adopt the running-turn state so the queue
             // dispatches once the real turn completes.
-            if message == "Already processing a message"
-                && recover_undelivered_queued_continuation(app, "server busy rejection")
-            {
-                app.is_processing = true;
-                app.status = ProcessingStatus::Thinking(Instant::now());
-                app.current_message_id = None;
-                app.processing_started.get_or_insert_with(Instant::now);
-                app.last_stream_activity = Some(Instant::now());
-                app.remote_resume_activity = Some(RemoteResumeActivity {
-                    session_id: app.remote_session_id.clone().unwrap_or_default(),
-                    observed_at: Instant::now(),
-                    current_tool_name: None,
-                });
-                app.set_status_notice("Server still busy; follow-up stays queued");
-                crate::logging::info(
-                    "Server rejected queued continuation because a turn is still running; re-queued it and re-adopted the running turn",
-                );
-                return true;
+            if message == "Already processing a message" {
+                // Two shapes reach here. A queued follow-up that raced the
+                // turn-end dispatch (is_system, no auto-retry), and a prompt
+                // the user typed and submitted while a turn was still running
+                // - which the client considered idle. Both must go back on the
+                // queue rather than surface a raw error: the user's message is
+                // not invalid, the server is simply still busy.
+                let recovered = recover_undelivered_queued_continuation(app, "server busy rejection")
+                    || recover_rejected_user_submission(app, "server busy rejection");
+                if recovered {
+                    app.is_processing = true;
+                    app.status = ProcessingStatus::Thinking(Instant::now());
+                    app.current_message_id = None;
+                    app.processing_started.get_or_insert_with(Instant::now);
+                    app.last_stream_activity = Some(Instant::now());
+                    app.remote_resume_activity = Some(RemoteResumeActivity {
+                        session_id: app.remote_session_id.clone().unwrap_or_default(),
+                        observed_at: Instant::now(),
+                        current_tool_name: None,
+                    });
+                    app.set_status_notice("Server still busy; message stays queued");
+                    crate::logging::info(
+                        "Server rejected a message because a turn is still running; re-queued it and re-adopted the running turn",
+                    );
+                    return true;
+                }
             }
             let reset_duration = retry_after_secs
                 .map(Duration::from_secs)
@@ -2321,7 +2329,15 @@ pub(in crate::tui::app) fn handle_server_event(
         ServerEvent::AnthropicAccountRotated {
             label,
             previous_label,
+            restored,
         } => {
+            if app.ignores_anthropic_account_events() {
+                // Another session on this daemon rotated. Touching the
+                // process-wide override here would repoint this session's
+                // usage widget at an account it never talks to.
+                return false;
+            }
+
             // Mirror the daemon's choice with an override rather than a
             // persisted switch: the rotation lasts as long as the daemon says
             // it does, and must not rewrite the user's configured account.
@@ -2334,16 +2350,41 @@ pub(in crate::tui::app) fn handle_server_event(
                 .unwrap_or_else(|| app.provider.model());
             app.update_context_limit_for_model(&active_model);
 
-            let message = match previous_label {
-                Some(previous) => format!(
-                    "⚡ Rate limited; switched Anthropic account: {} → {}",
-                    previous, label
-                ),
-                None => format!("⚡ Rate limited; switched Anthropic account to {}", label),
+            let (message, notice) = if restored {
+                // The give-up path: every account was limited, so the daemon
+                // put the original back. Calling this a switch would read as
+                // "carrying on elsewhere" when the opposite is true.
+                (
+                    match &previous_label {
+                        Some(previous) => format!(
+                            "⚡ Every Anthropic account is rate limited; restored {} (was trying {})",
+                            label, previous
+                        ),
+                        None => format!(
+                            "⚡ Every Anthropic account is rate limited; restored {}",
+                            label
+                        ),
+                    },
+                    format!("Account: restored {} (all limited)", label),
+                )
+            } else {
+                (
+                    match &previous_label {
+                        Some(previous) => format!(
+                            "⚡ Rate limited; switched Anthropic account: {} → {}",
+                            previous, label
+                        ),
+                        None => format!("⚡ Rate limited; switched Anthropic account to {}", label),
+                    },
+                    format!("Account: switched to {}", label),
+                )
             };
             app.push_display_message(DisplayMessage::system(message));
-            app.set_status_notice(format!("Account: switched to {}", label));
-            false
+            app.set_status_notice(notice);
+            // A rotation lands during a 429 retry, when no stream deltas are
+            // arriving to repaint. Returning false here would leave the notice
+            // and the corrected context limit invisible until unrelated input.
+            true
         }
         ServerEvent::ReasoningEffortChanged { effort, error, .. } => {
             if let Some(err) = error {
