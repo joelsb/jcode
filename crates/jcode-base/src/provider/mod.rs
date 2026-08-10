@@ -46,8 +46,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 pub use account_failover::account_failover_candidates;
+pub use account_failover::all_accounts_quota_exhausted;
 pub use account_failover::error_looks_like_usage_limit;
 pub use account_failover::prefer_account_failover_enabled;
+pub use account_failover::with_quota_exhausted_override;
 pub use catalog_routes::{
     append_simplified_anthropic_model_routes, remote_current_openai_compatible_route_for_model,
     remote_model_is_server_copilot_only, remote_model_routes_fallback,

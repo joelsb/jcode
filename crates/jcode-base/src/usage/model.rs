@@ -365,12 +365,23 @@ impl AccountUsageProbe {
     }
 
     pub fn all_accounts_exhausted(&self) -> bool {
-        self.has_multiple_accounts()
-            && self
-                .accounts
-                .iter()
-                .filter(|account| account.error.is_none())
-                .all(|account| account.exhausted)
+        if !self.has_multiple_accounts() {
+            return false;
+        }
+        let mut probed = self
+            .accounts
+            .iter()
+            .filter(|account| account.error.is_none())
+            .peekable();
+        // No account could be probed, so nothing is known. `all()` is vacuously
+        // true on an empty set, which used to turn "the usage endpoint is
+        // unreachable" into "every account is exhausted": the most pessimistic
+        // possible reading of no evidence, and it drives both the startup
+        // warning and the retry loop's fast-fail path.
+        if probed.peek().is_none() {
+            return false;
+        }
+        probed.all(|account| account.exhausted)
     }
 
     pub fn switch_guidance(&self) -> Option<String> {

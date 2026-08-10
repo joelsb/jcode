@@ -2771,3 +2771,63 @@ async fn a_burst_limit_that_clears_lets_the_turn_finish() {
         server.call_count()
     );
 }
+
+/// A spent quota must fail immediately instead of waiting out a burst window.
+///
+/// Waiting ~75s is right when requests are merely bouncing, and wrong when the
+/// quota is gone: the reset can be hours away, so every second spent waiting is
+/// a second the user stares at a spinner before being told to switch. The usage
+/// probe is what separates the two, so this drives the same always-429 server
+/// under both verdicts and compares the request counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spent_quota_fails_fast_instead_of_waiting_out_a_burst() {
+    async fn drive_with_verdict(quota_exhausted: bool) -> usize {
+        let _guard = jcode_base::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().unwrap();
+        let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+        seed_two_claude_accounts();
+
+        let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+        set_test_api_url_override(Some(server.url()));
+
+        let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+        let model_state = Arc::new(std::sync::RwLock::new(
+            "claude-3-5-haiku-20241022".to_string(),
+        ));
+
+        // The override is thread-local and the runtime is multi-threaded, so it
+        // is set inside the same future that runs the loop.
+        jcode_base::provider::with_quota_exhausted_override(Some(quota_exhausted), || {
+            futures::executor::block_on(run_stream_with_retries(
+                Client::new(),
+                "fixture-access-claude-1".to_string(),
+                true,
+                e2e_test_request(),
+                tx,
+                Arc::new(RwLock::new(None)),
+                "claude-3-5-haiku-20241022".to_string(),
+                "test-session".to_string(),
+                model_state,
+            ));
+        });
+
+        set_test_api_url_override(None);
+        while rx.recv().await.is_some() {}
+        server.call_count()
+    }
+
+    let spent_calls = drive_with_verdict(true).await;
+    let burst_calls = drive_with_verdict(false).await;
+
+    // Rotation still gets its one try per account: proving an account is
+    // limited costs one request, never two.
+    assert_eq!(
+        spent_calls,
+        (MAX_RETRIES + 1) as usize,
+        "a spent quota must stop after rotation, with no rate-limit waits"
+    );
+    assert!(
+        burst_calls > spent_calls,
+        "a burst limit must still be waited out ({burst_calls} vs {spent_calls} calls)"
+    );
+}
