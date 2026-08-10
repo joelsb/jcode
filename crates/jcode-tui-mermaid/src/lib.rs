@@ -250,13 +250,14 @@ pub use inline_image::{
     inline_image_dims, inline_image_id, inline_image_is_materialized, materialize_inline_image,
     materialize_inline_image_by_id, rediscover_inline_image,
 };
-pub use runtime::force_test_kitty_picker;
 pub use runtime::{
-    error_lines_for, get_cached_png, get_font_size, image_protocol_available, init_picker,
-    is_video_export_mode, native_image_protocol_available, protocol_type,
+    error_lines_for, get_cached_png, get_font_size, halfblocks_allowed, image_protocol_available,
+    init_picker, is_video_export_mode, native_image_protocol_available, protocol_type,
     rediscover_external_image, register_external_image, register_inline_image,
-    set_video_export_mode, uses_text_image_fallback, with_image_protocol_override,
+    set_halfblocks_allowed, set_video_export_mode, uses_text_image_fallback,
+    with_image_protocol_override,
 };
+pub use runtime::{force_test_halfblocks_picker, force_test_kitty_picker};
 pub use viewport_render::{
     InlineFitReadiness, inline_fit_readiness, invalidate_render_state, prewarm_inline_fit_state,
     render_image_widget_fit_stable, render_image_widget_viewport,
@@ -410,6 +411,11 @@ const DEFAULT_PICKER_FONT_SIZE: (u16, u16) = (8, 16);
 /// terminal image protocol (used by the video export pipeline so it can
 /// embed cached PNGs into the SVG frames).
 static VIDEO_EXPORT_MODE: AtomicBool = AtomicBool::new(false);
+
+/// When true, the Unicode half-block raster counts as a usable way to draw
+/// diagrams, so mermaid renders as an image instead of falling back to source
+/// text. Set from `display.mermaid_halfblocks`; see `set_halfblocks_allowed`.
+static HALFBLOCKS_ALLOWED: AtomicBool = AtomicBool::new(false);
 
 /// Global picker for terminal capability detection
 /// Initialized once on first use

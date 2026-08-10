@@ -31,8 +31,7 @@ mod workspace;
 pub(super) use key_handling::reload_stale_remote_server_before_update;
 use queue_recovery::{
     recover_local_interleave_to_queue, recover_rejected_user_submission,
-    recover_stranded_soft_interrupts,
-    recover_undelivered_queued_continuation,
+    recover_stranded_soft_interrupts, recover_undelivered_queued_continuation,
 };
 // Re-export for sibling modules and tests that access reconnect state and helpers
 // through `super::remote::*` without reaching into private submodules directly.

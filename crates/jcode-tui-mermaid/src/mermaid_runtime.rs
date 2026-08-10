@@ -427,6 +427,17 @@ pub fn force_test_kitty_picker() {
     });
 }
 
+/// Force the global picker into the Unicode half-block protocol, the shape a
+/// terminal with no native image support presents. Lets a test exercise the
+/// `display.mermaid_halfblocks` decision without a real terminal.
+pub fn force_test_halfblocks_picker() {
+    PICKER.get_or_init(|| {
+        let mut picker = fast_picker();
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+        Some(picker)
+    });
+}
+
 /// Get the current protocol type (for debugging/display)
 pub fn protocol_type() -> Option<ProtocolType> {
     let real = PICKER
@@ -485,6 +496,21 @@ fn protocol_supports_native_images(
         )
 }
 
+/// Whether the half-block raster is allowed to stand in for a native image
+/// protocol, i.e. `display.mermaid_halfblocks`.
+///
+/// Half-blocks are ordinary colored text cells, so they are the one image path
+/// that survives a multiplexer repaint. Coarse, but a coarse picture beats
+/// twenty lines of `style c8 fill:#4a2c17` for someone trying to see a shape.
+pub fn halfblocks_allowed() -> bool {
+    HALFBLOCKS_ALLOWED.load(Ordering::Relaxed)
+}
+
+/// Set from config at startup (and by `/mermaid halfblocks` at runtime).
+pub fn set_halfblocks_allowed(enabled: bool) {
+    HALFBLOCKS_ALLOWED.store(enabled, Ordering::Relaxed);
+}
+
 /// Whether Mermaid and other image-only content can use a real terminal image
 /// protocol. Unicode half-block rendering intentionally does not count: it is a
 /// useful raster fallback, but Mermaid source is more useful than a degraded
@@ -493,7 +519,12 @@ pub fn native_image_protocol_available() -> bool {
     if let Some(enabled) = IMAGE_PROTOCOL_OVERRIDE.with(|cell| cell.get()) {
         return enabled;
     }
-    protocol_supports_native_images(protocol_type(), VIDEO_EXPORT_MODE.load(Ordering::Relaxed))
+    let protocol = protocol_type();
+    if protocol_supports_native_images(protocol, VIDEO_EXPORT_MODE.load(Ordering::Relaxed)) {
+        return true;
+    }
+    // Opt-in: treat the half-block raster as a real way to draw a diagram.
+    halfblocks_allowed() && matches!(protocol, Some(ProtocolType::Halfblocks))
 }
 
 fn protocol_uses_text_image_fallback(
@@ -506,6 +537,11 @@ fn protocol_uses_text_image_fallback(
 /// Whether images are currently rendered through ratatui-image's Unicode
 /// half-block fallback instead of a native terminal image protocol.
 pub fn uses_text_image_fallback() -> bool {
+    if halfblocks_allowed() {
+        // Half-blocks are being used as the image path, so there is no text
+        // fallback to warn about.
+        return false;
+    }
     protocol_uses_text_image_fallback(protocol_type(), VIDEO_EXPORT_MODE.load(Ordering::Relaxed))
 }
 

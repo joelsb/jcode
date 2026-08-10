@@ -62,6 +62,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "Open this session's mermaid diagrams as images",
     ),
     RegisteredCommand::hidden("/diagram", "Alias for /diagrams"),
+    RegisteredCommand::public("/mermaid", "Control how diagrams are drawn inline"),
     RegisteredCommand::public("/splitview", "Mirror the current chat in the side panel"),
     RegisteredCommand::public("/split-view", "Alias for /splitview"),
     RegisteredCommand::public("/btw", "Ask a side question in the side panel"),
@@ -1621,6 +1622,7 @@ impl App {
                 | "/todos"
                 | "/diagrams"
                 | "/diagram"
+                | "/mermaid"
                 | "/splitview"
                 | "/split-view"
                 | "/model"

@@ -2414,38 +2414,127 @@ fn test_credential_failure_breaker_resets_on_turn_success() {
     );
 }
 
+/// Feed one `AnthropicAccountRotated` to a remote session and report whether it
+/// asked for a redraw.
+///
+/// The account override is process-global, so this runs inside
+/// `with_temp_jcode_home`, which takes the shared env lock and clears the
+/// override on both sides. Without that these tests both race each other and
+/// read the developer's real `~/.jcode` auth file.
+fn drive_account_rotation_event(
+    provider: Option<&str>,
+    model: &str,
+    event: crate::protocol::ServerEvent,
+) -> (bool, u64, Option<String>, String) {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+        app.is_remote = true;
+        app.remote_provider_name = provider.map(str::to_string);
+        app.remote_provider_model = Some(model.to_string());
+        app.update_context_limit_for_model(model);
+
+        let needs_redraw = app.handle_server_event(event, &mut remote);
+
+        let last_message = app
+            .display_messages
+            .last()
+            .map(|message| format!("{message:?}"))
+            .unwrap_or_default();
+        (
+            needs_redraw,
+            app.context_limit,
+            crate::auth::claude::get_active_account_override(),
+            last_message,
+        )
+    })
+}
+
 #[test]
 fn rotation_event_keeps_the_model_context_limit_and_adopts_the_new_account() {
-    let mut app = create_test_app();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let _guard = rt.enter();
-    let mut remote = crate::tui::backend::RemoteConnection::dummy();
-
-    app.is_remote = true;
-    app.remote_provider_model = Some("claude-opus-5[1m]".to_string());
-    app.update_context_limit_for_model("claude-opus-5[1m]");
-    let expected_limit = app.context_limit;
+    let expected_limit = with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+        app.remote_provider_model = Some("claude-opus-5[1m]".to_string());
+        app.update_context_limit_for_model("claude-opus-5[1m]");
+        app.context_limit
+    });
     assert!(
         expected_limit > 200_000,
         "fixture must use a 1M model or this test cannot detect the clobber"
     );
 
-    app.handle_server_event(
+    let (needs_redraw, context_limit, override_label, _) = drive_account_rotation_event(
+        None,
+        "claude-opus-5[1m]",
         crate::protocol::ServerEvent::AnthropicAccountRotated {
             label: "claude-2".to_string(),
             previous_label: Some("claude-1".to_string()),
+            restored: false,
         },
-        &mut remote,
     );
 
+    assert!(
+        needs_redraw,
+        "a rotation arrives during a 429 retry with no stream deltas to repaint, so the notice \
+         and corrected context limit would stay invisible without a redraw"
+    );
     assert_eq!(
-        app.context_limit, expected_limit,
+        context_limit, expected_limit,
         "a rate-limit rotation must not shrink the window to the local provider default"
     );
     assert_eq!(
-        crate::auth::claude::active_account_label().as_deref(),
+        override_label.as_deref(),
         Some("claude-2"),
         "the client must mirror the account the daemon actually uses"
+    );
+}
+
+#[test]
+fn rotation_event_for_a_non_anthropic_session_is_ignored() {
+    let (needs_redraw, _, override_label, last_message) = drive_account_rotation_event(
+        Some("openai"),
+        "gpt-5",
+        crate::protocol::ServerEvent::AnthropicAccountRotated {
+            label: "claude-2".to_string(),
+            previous_label: Some("claude-1".to_string()),
+            restored: false,
+        },
+    );
+
+    assert!(
+        !needs_redraw,
+        "another session's Anthropic rotation is not this session's business"
+    );
+    assert_eq!(
+        override_label, None,
+        "the daemon fans this event out to every client, so a non-Anthropic session must not \
+         adopt the override"
+    );
+    assert!(
+        !last_message.contains("Rate limited"),
+        "a session on another provider must not be told it was rate limited: {last_message}"
+    );
+}
+
+#[test]
+fn restore_event_does_not_read_as_a_successful_switch() {
+    let (_, _, _, last_message) = drive_account_rotation_event(
+        None,
+        "claude-opus-5[1m]",
+        crate::protocol::ServerEvent::AnthropicAccountRotated {
+            label: "claude-1".to_string(),
+            previous_label: Some("claude-2".to_string()),
+            restored: true,
+        },
+    );
+
+    assert!(
+        last_message.contains("Every Anthropic account is rate limited"),
+        "the give-up path must not be worded as moving onto a working account: {last_message}"
     );
 }
 

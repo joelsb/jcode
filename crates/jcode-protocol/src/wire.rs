@@ -1281,6 +1281,11 @@ pub enum ServerEvent {
         label: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         previous_label: Option<String>,
+        /// True when every candidate account was rate limited and the daemon
+        /// put the original back, rather than moving onto a working one.
+        /// Defaulted so an older daemon that omits it still parses.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        restored: bool,
     },
 
     /// Notification from another agent (file conflict, message, shared context)
@@ -1478,6 +1483,7 @@ mod tests {
         let event = ServerEvent::AnthropicAccountRotated {
             label: "claude-2".to_string(),
             previous_label: Some("claude-1".to_string()),
+            restored: false,
         };
 
         let encoded = serde_json::to_string(&event).expect("event serializes");
@@ -1485,15 +1491,57 @@ mod tests {
             encoded.contains("\"anthropic_account_rotated\""),
             "the wire name is part of the protocol contract: {encoded}"
         );
+        assert!(
+            !encoded.contains("restored"),
+            "the common case must stay off the wire so older daemons look identical: {encoded}"
+        );
 
         match serde_json::from_str::<ServerEvent>(&encoded).expect("event deserializes") {
             ServerEvent::AnthropicAccountRotated {
                 label,
                 previous_label,
+                restored,
             } => {
                 assert_eq!(label, "claude-2");
                 assert_eq!(previous_label.as_deref(), Some("claude-1"));
+                assert!(!restored);
             }
+            other => panic!("round-trip produced the wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_account_rotated_defaults_restored_when_the_daemon_omits_it() {
+        let encoded = r#"{"type":"anthropic_account_rotated","label":"claude-2"}"#;
+
+        match serde_json::from_str::<ServerEvent>(encoded).expect("event deserializes") {
+            ServerEvent::AnthropicAccountRotated {
+                label,
+                previous_label,
+                restored,
+            } => {
+                assert_eq!(label, "claude-2");
+                assert_eq!(previous_label, None);
+                assert!(
+                    !restored,
+                    "an omitted flag must mean the ordinary rotation, not a restore"
+                );
+            }
+            other => panic!("round-trip produced the wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_account_restored_survives_the_round_trip() {
+        let event = ServerEvent::AnthropicAccountRotated {
+            label: "claude-1".to_string(),
+            previous_label: Some("claude-2".to_string()),
+            restored: true,
+        };
+
+        let encoded = serde_json::to_string(&event).expect("event serializes");
+        match serde_json::from_str::<ServerEvent>(&encoded).expect("event deserializes") {
+            ServerEvent::AnthropicAccountRotated { restored, .. } => assert!(restored),
             other => panic!("round-trip produced the wrong variant: {other:?}"),
         }
     }

@@ -286,6 +286,7 @@ fn account_rotated_server_event(rotated: &jcode_base::bus::AnthropicAccountRotat
     ServerEvent::AnthropicAccountRotated {
         label: rotated.label.clone(),
         previous_label: rotated.previous_label.clone(),
+        restored: rotated.restored,
     }
 }
 
@@ -887,8 +888,11 @@ pub(super) async fn handle_client(
                     }
                     Ok(BusEvent::AnthropicAccountRotated(rotated)) => {
                         // The daemon's own usage cache is account-blind too, so
-                        // drop it before the client asks for fresh numbers.
-                        jcode_base::usage::invalidate_anthropic_usage();
+                        // drop it *before* the client is told, otherwise the
+                        // /usage request this event provokes can be served the
+                        // pre-rotation snapshot. Awaited for that reason: the
+                        // deferred sync form loses that race.
+                        jcode_base::usage::invalidate_anthropic_usage_now().await;
                         let _ = client_event_tx.send(account_rotated_server_event(&rotated));
                     }
                     _ => {}

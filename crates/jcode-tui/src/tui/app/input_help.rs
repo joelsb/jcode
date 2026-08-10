@@ -49,6 +49,9 @@ impl App {
             "observe" => {
                 "/observe\nToggle transient observe mode for the side panel.\n\n/observe on\nEnable observe mode and focus the observe page.\n\n/observe off\nDisable observe mode.\n\n/observe status\nShow whether observe mode is enabled.\n\nObserve mode shows only the latest tool call or tool result added to context, and it is not persisted to disk."
             }
+            "mermaid" => {
+                "/mermaid\nShow how diagrams are currently drawn: the detected terminal image protocol, and whether the half-block fallback is on.\n\n/mermaid halfblocks [on|off]\nDraw diagrams inline as coarse colored blocks when the terminal has no native image protocol (Kitty/iTerm2/Sixel), instead of showing mermaid source.\n\nHalf-blocks are ordinary text cells, so unlike the native image protocols they survive a multiplexer repaint. That makes this the way to see diagrams inline inside tmux. The cost is resolution: dense text inside nodes can be unreadable, so use /diagrams to open the full-size PNG.\n\nSaved to config as display.mermaid_halfblocks. See docs/adr/0014."
+            }
             "diagrams" | "diagram" => {
                 "/diagrams\nRender this session's mermaid diagrams to PNG and open them in your image viewer.\n\nUse this when the transcript shows mermaid source instead of a picture: inside tmux/screen/zellij most terminals cannot draw inline images, so jcode keeps the readable source (see docs/adr/0014).\n\n/diagrams\nOpen every diagram in the transcript.\n\n/diagrams <n>\nOpen just diagram n, numbered from 1.\n\n/diagrams last\nOpen the most recent diagram.\n\n/diagrams list\nList the diagrams with their headings, without opening anything."
             }

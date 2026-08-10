@@ -1646,6 +1646,7 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         || handle_observe_command(app, trimmed)
         || handle_todos_view_command(app, trimmed)
         || super::diagrams_view::handle_diagrams_command(app, trimmed)
+        || super::mermaid_view::handle_mermaid_command(app, trimmed)
         || super::commands_overnight::handle_overnight_command(app, trimmed)
         || super::split_view::handle_split_view_command(app, trimmed)
         || handle_btw_command(app, trimmed)

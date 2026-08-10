@@ -192,6 +192,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "/diagrams",
         "Open this session's mermaid diagrams as images",
     ));
+    lines.push(help_entry(
+        "/mermaid",
+        "Control how diagrams draw inline (halfblocks on|off)",
+    ));
     lines.push(help_entry("/agents", "Configure models for agent roles"));
     lines.push(help_entry(
         "/swarm-prompt",

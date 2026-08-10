@@ -54,6 +54,23 @@ Two further guards are deliberate:
 - The survivor path only runs when `detect_multiplexer_from_env() != Multiplexer::None`. Outside a multiplexer the generic signals are authoritative, and a stale inherited `WEZTERM_*` var (e.g. a shell launched from WezTerm but displayed elsewhere) must not override them.
 - Empty values are not evidence. `env_is_set` rejects empty strings, because an unset var can arrive as `""`.
 
+## Amendment: half-blocks are the third option
+
+The framing above assumed two outcomes inside a multiplexer: a native image protocol, or mermaid source text. There is a third, and a user reported it as a regression they had personally lost: "it opens the diagram, but not on the TUI, which ran before, when I first installed jcode".
+
+They were right. Before upstream commit `414da9a4a` (2026-07-19, "fix(tui): show Mermaid source without image support"), `Halfblocks` counted as image support, so diagrams drew inline as coarse colored blocks on any terminal. That commit introduced `native_image_protocol_available()` excluding `Halfblocks`, on the reasoning that "Mermaid source is more useful than a degraded diagram". Defensible as a default, but it silently removed the only inline diagram rendering that works inside tmux, because half-blocks are ordinary colored text cells: tmux tracks them like any other character, so they survive every repaint that breaks the out-of-band protocols.
+
+So `display.mermaid_halfblocks` (default `false`, `/mermaid halfblocks on` to toggle and persist) restores the pre-July behavior for those who want it. The three-way choice inside a multiplexer is now explicit:
+
+| | inline picture | survives tmux repaint | resolution |
+|---|---|---|---|
+| Kitty placeholders | yes | yes | full |
+| iTerm2 / Sixel | yes | no, flickers | full |
+| half-blocks | yes | yes | coarse |
+| source text | no | n/a | n/a |
+
+Half-blocks stay off by default because the upstream judgement holds for the general case: dense text inside diagram nodes turns to mush at cell resolution, and someone who has never seen the option is better served by legible source. `/diagrams` covers the full-resolution need. But "off by default" is different from "unavailable", and the previous state of this work made it unavailable.
+
 ## Correction
 
 The first version of this ADR claimed the fix delivered working diagrams in tmux under WezTerm, on the evidence that the reported protocol changed from `Halfblocks` to `Iterm2`.
