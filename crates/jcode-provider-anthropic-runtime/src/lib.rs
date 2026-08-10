@@ -176,6 +176,26 @@ pub(crate) fn set_test_api_url_override(url: Option<String>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = url;
 }
 
+/// Ceiling on a retry sleep under `cfg(test)`.
+///
+/// The rate-limit and capacity backoffs are measured in seconds because that is
+/// what outlasts a real burst window. A test that drives an always-429 server
+/// through the whole budget would therefore really sleep for minutes, which is
+/// how a 5s suite became a 259s one. Production keeps the real clock; tests
+/// exercise the same branch and counters at a millisecond scale.
+#[cfg(test)]
+const TEST_MAX_RETRY_DELAY_MS: u64 = 5;
+
+/// Apply the test-only sleep ceiling. Identity in non-test builds.
+fn clamp_retry_delay(delay: std::time::Duration) -> std::time::Duration {
+    #[cfg(test)]
+    {
+        return delay.min(std::time::Duration::from_millis(TEST_MAX_RETRY_DELAY_MS));
+    }
+    #[cfg(not(test))]
+    delay
+}
+
 /// Returns the test-only endpoint override when one is installed, else `None`
 /// so the caller keeps whatever real URL it resolved. Compiled out entirely in
 /// non-test builds, where it is a constant `None` and the caller's URL stands.
@@ -501,6 +521,22 @@ const MAX_OVERLOADED_RETRIES: u32 = 4;
 
 /// Base delay for capacity backoff, giving ~2s, 4s, 8s across the retries above.
 const OVERLOADED_RETRY_BASE_DELAY_MS: u64 = 2000;
+
+/// Extra attempts reserved for a rate limit that account rotation could not
+/// escape, i.e. every account answered 429.
+///
+/// Anthropic enforces a short-window burst limit *in addition to* the 5-hour and
+/// weekly quotas, so "every account is rate limited" routinely means "every
+/// account is busy for the next few seconds", not "you are out of quota".
+/// Falling through to the transport budget gave such a burst 2 attempts ~200ms
+/// apart, which is far too fast to outlast it, so the turn died and offered a
+/// model downgrade while the user still had 80%+ of their weekly allowance.
+/// Same reasoning as `MAX_OVERLOADED_RETRIES`; see docs/adr/0015.
+const MAX_RATE_LIMIT_RETRIES: u32 = 5;
+
+/// Base delay for the rate-limit backoff, giving ~5s, 10s, 20s, 40s. A
+/// `retry-after` from the server always wins over this.
+const RATE_LIMIT_RETRY_BASE_DELAY_MS: u64 = 5000;
 
 /// Cached OAuth credentials
 #[derive(Clone)]
@@ -1768,6 +1804,10 @@ async fn run_stream_with_retries(
     // Capacity retries, counted separately again: an overload burst and a flaky
     // network are independent faults and must not consume each other's budget.
     let mut overloaded_retries: u32 = 0;
+    // Rate-limit retries, counted separately for the same reason: a burst limit
+    // that outlived account rotation is not a transport fault and must not be
+    // capped by the transport budget.
+    let mut rate_limit_retries: u32 = 0;
     let mut attempt: u32 = 0;
 
     while attempt < attempt_budget {
@@ -1791,7 +1831,7 @@ async fn run_stream_with_retries(
                     },
                 }))
                 .await;
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(clamp_retry_delay(delay)).await;
             jcode_base::logging::info(&format!(
                 "Retrying Anthropic API request (attempt {}/{})",
                 attempt_index + 1,
@@ -2043,11 +2083,58 @@ async fn run_stream_with_retries(
                     }
                 }
 
+                // Every account answered 429 (or rotation is off). Anthropic's
+                // short-window burst limit clears on the order of seconds, and
+                // the account quotas may be nowhere near spent, so wait it out
+                // on a rate-limit-shaped clock instead of dropping through to
+                // the ~200ms transport backoff and killing the turn.
+                if jcode_base::provider::error_looks_like_usage_limit(&error_str)
+                    && rate_limit_retries + 1 < MAX_RATE_LIMIT_RETRIES
+                {
+                    rate_limit_retries += 1;
+                    if saw_output {
+                        let _ = tx
+                            .send(Ok(StreamEvent::RetryRollback {
+                                attempt: attempt_index + 2,
+                                max: attempt_budget + 1,
+                            }))
+                            .await;
+                    }
+                    let delay = jcode_provider_core::retry_after::retry_after_from_error(&e)
+                        .unwrap_or_else(|| {
+                            jcode_provider_core::attempt_tracker::retry_backoff_delay(
+                                rate_limit_retries,
+                                RATE_LIMIT_RETRY_BASE_DELAY_MS,
+                            )
+                        });
+                    jcode_base::logging::info(&format!(
+                        "Anthropic rate limited on every account (attempt {}/{}), waiting {:?}: {}",
+                        rate_limit_retries, MAX_RATE_LIMIT_RETRIES, delay, e
+                    ));
+                    let _ = tx
+                        .send(Ok(StreamEvent::StatusDetail {
+                            detail: format!(
+                                "⏳ Every account rate limited; waiting {}s and retrying ({}/{})",
+                                delay.as_secs().max(1),
+                                rate_limit_retries,
+                                MAX_RATE_LIMIT_RETRIES
+                            ),
+                        }))
+                        .await;
+                    // Waiting out a shared limit is not the user's turn failing,
+                    // so it must not consume a transport attempt.
+                    attempt_budget += 1;
+                    next_retry_delay = Some(delay);
+                    last_error = Some(e);
+                    continue;
+                }
+
                 // Capacity rejection (`overloaded_error` / HTTP 529). Retryable,
                 // but on a longer clock than a transport fault and on its own
                 // budget, so a burst of overloads cannot exhaust the retries
                 // reserved for network faults (and vice versa).
-                if is_overloaded_error(&error_str) && overloaded_retries + 1 < MAX_OVERLOADED_RETRIES
+                if is_overloaded_error(&error_str)
+                    && overloaded_retries + 1 < MAX_OVERLOADED_RETRIES
                 {
                     overloaded_retries += 1;
                     if saw_output {
@@ -2074,14 +2161,13 @@ async fn run_stream_with_retries(
                     // consume an attempt the transport retries may still need.
                     attempt_budget += 1;
                     next_retry_delay = Some(
-                        jcode_provider_core::retry_after::retry_after_from_error(&e).unwrap_or_else(
-                            || {
+                        jcode_provider_core::retry_after::retry_after_from_error(&e)
+                            .unwrap_or_else(|| {
                                 jcode_provider_core::attempt_tracker::retry_backoff_delay(
                                     overloaded_retries,
                                     OVERLOADED_RETRY_BASE_DELAY_MS,
                                 )
-                            },
-                        ),
+                            }),
                     );
                     last_error = Some(e);
                     continue;
@@ -2561,9 +2647,7 @@ fn is_retryable_error(error_str: &str) -> bool {
 /// `stream_response` emits, because a bare "529" also occurs inside request ids
 /// and token counts.
 fn is_overloaded_error(error_str: &str) -> bool {
-    error_str.contains("overloaded")
-        || error_str.contains("(529")
-        || error_str.contains("529 ")
+    error_str.contains("overloaded") || error_str.contains("(529") || error_str.contains("529 ")
 }
 
 fn is_fable_scoped_limit_error(model: &str, error: &str) -> bool {
