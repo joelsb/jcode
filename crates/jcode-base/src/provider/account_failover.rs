@@ -28,6 +28,57 @@ pub fn prefer_account_failover_enabled() -> bool {
     config.provider.prefer_account_failover && config.provider.same_provider_account_failover
 }
 
+/// Whether the usage probe says every account's *quota* is spent, as opposed to
+/// requests merely bouncing right now.
+///
+/// Anthropic answers 429 for two different situations: a short-window burst
+/// limit that clears in seconds, and a 5-hour/weekly quota that does not clear
+/// until its reset. They are indistinguishable from the error alone, so the
+/// retry loop asks the usage probe: waiting out a burst is worth ~75s, waiting
+/// out a spent quota is not, since the reset can be hours away. See ADR-0015.
+///
+/// `false` when the probe is unavailable or reports headroom, so an unknown
+/// state keeps the (recoverable) waiting behavior rather than failing fast.
+pub fn all_accounts_quota_exhausted(provider: ActiveProvider) -> bool {
+    if let Some(forced) = QUOTA_EXHAUSTED_OVERRIDE.with(|cell| cell.get()) {
+        return forced;
+    }
+    account_usage_probe(provider)
+        .map(|probe| {
+            if probe.has_multiple_accounts() {
+                probe.all_accounts_exhausted()
+            } else {
+                // With a single account there is nothing to compare against, so
+                // `all_accounts_exhausted` is false by construction; the only
+                // meaningful signal is that account's own state.
+                probe.current_exhausted()
+            }
+        })
+        .unwrap_or(false)
+}
+
+thread_local! {
+    /// Scoped override for the quota verdict.
+    ///
+    /// Always compiled, not `cfg(test)`, because the consumer under test lives
+    /// in another crate (`jcode-provider-anthropic-runtime`) and a dependency's
+    /// `cfg(test)` is not active there. Thread-local and scoped, so parallel
+    /// tests cannot observe each other's value, and production never sets it.
+    static QUOTA_EXHAUSTED_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with the quota verdict forced, or `None` to restore real probing.
+/// Test-only seam; nothing in production calls this.
+pub fn with_quota_exhausted_override<T>(forced: Option<bool>, f: impl FnOnce() -> T) -> T {
+    QUOTA_EXHAUSTED_OVERRIDE.with(|cell| {
+        let previous = cell.replace(forced);
+        let result = f();
+        cell.set(previous);
+        result
+    })
+}
+
 /// Alternate account labels for `provider`, best-first: accounts the usage
 /// probe reports as neither exhausted nor erroring come before the rest, and
 /// the currently active account is always excluded.

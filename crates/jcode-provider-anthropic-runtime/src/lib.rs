@@ -2088,6 +2088,13 @@ async fn run_stream_with_retries(
                 // the ~200ms transport backoff and killing the turn.
                 if jcode_base::provider::error_looks_like_usage_limit(&error_str)
                     && rate_limit_retries + 1 < MAX_RATE_LIMIT_RETRIES
+                    // A spent quota does not clear for hours, so waiting is
+                    // pure delay: fail now and let the caller downgrade or
+                    // switch provider while the user watches. Only an
+                    // unexplained 429 (burst limit) is worth outlasting.
+                    && !jcode_base::provider::all_accounts_quota_exhausted(
+                        jcode_provider_core::ActiveProvider::Claude,
+                    )
                 {
                     rate_limit_retries += 1;
                     if saw_output {
