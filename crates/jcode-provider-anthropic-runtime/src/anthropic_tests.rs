@@ -2480,14 +2480,22 @@ async fn run_stream_with_retries_bounds_rotation_attempts_and_restores_original_
     );
 
     // attempt_budget starts at MAX_RETRIES and gains exactly one extra attempt
-    // per successful rotation; with a single rotation candidate that always
-    // 429s, the budget grows from MAX_RETRIES to MAX_RETRIES + 1 and then the
-    // loop must stop -- this is the assertion that an always-429 world cannot
-    // spin the retry loop forever.
+    // per successful rotation, plus one per rate-limit wait once rotation is
+    // exhausted (see docs/adr/0015: a burst limit needs a seconds-scale wait,
+    // not the ~200ms transport backoff).
+    //
+    // The number itself matters less than the property: every branch that grows
+    // the budget is bounded by its own counter, so an always-429 world stops
+    // instead of spinning forever.
+    let expected_calls = (MAX_RETRIES + 1 + (MAX_RATE_LIMIT_RETRIES - 1)) as usize;
     assert_eq!(
         server.call_count(),
-        (MAX_RETRIES + 1) as usize,
+        expected_calls,
         "the rotation+retry loop must terminate at the sized attempt budget instead of looping forever"
+    );
+    assert!(
+        server.call_count() < 20,
+        "sanity: the budget must stay small enough that a user is not left waiting through an unbounded retry storm"
     );
 
     assert_eq!(
@@ -2618,5 +2626,148 @@ fn a_request_id_containing_529_is_not_mistaken_for_a_capacity_error() {
             "anthropic api error (400 bad request): {\"request_id\":\"req_011cdj529hkfn\"}"
         ),
         "a request id that happens to contain 529 must not trigger capacity backoff"
+    );
+}
+
+/// A rate limit that survived account rotation must get a rate-limit-shaped
+/// wait, not the ~200ms transport backoff.
+///
+/// Anthropic enforces a short-window burst limit on top of the 5-hour and
+/// weekly quotas, so "every account is rate limited" is usually "every account
+/// is busy for a few seconds". The real report that motivated this had 83% of
+/// the weekly quota and 97% of the 5-hour window still unused, and the turn
+/// still died with a "switch to a smaller model" prompt.
+#[test]
+fn rate_limits_wait_on_a_rate_limit_clock_not_the_transport_clock() {
+    let sse = "anthropic api error (429 too many requests): {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"this request would exceed your account's rate limit. please try again later.\"},\"request_id\":\"req_011cdu3zr7sfucuaqxhrvkdd\"}";
+
+    assert!(
+        jcode_base::provider::error_looks_like_usage_limit(sse),
+        "the real 429 payload must be recognized as a usage limit"
+    );
+    assert!(
+        !is_overloaded_error(sse),
+        "a 429 is not a capacity rejection; it must not borrow that budget"
+    );
+
+    // The budget must be bigger than the transport budget, and the clock much
+    // slower. With MAX_RETRIES=2 at 200ms, the old path gave up in well under a
+    // second, which cannot outlast a burst window.
+    assert!(
+        MAX_RATE_LIMIT_RETRIES > MAX_RETRIES,
+        "a rate limit needs more attempts than a transport fault ({} vs {})",
+        MAX_RATE_LIMIT_RETRIES,
+        MAX_RETRIES
+    );
+    assert!(
+        RATE_LIMIT_RETRY_BASE_DELAY_MS >= 5000,
+        "waiting {}ms is far too eager for a burst limit",
+        RATE_LIMIT_RETRY_BASE_DELAY_MS
+    );
+
+    // Total wall time the retries can cover, which is what decides whether a
+    // burst is outlasted.
+    let total_ms: u64 = (1..MAX_RATE_LIMIT_RETRIES)
+        .map(|attempt| {
+            jcode_provider_core::attempt_tracker::retry_backoff_delay(
+                attempt,
+                RATE_LIMIT_RETRY_BASE_DELAY_MS,
+            )
+            .as_millis() as u64
+        })
+        .sum();
+    let old_total_ms: u64 = (1..MAX_RETRIES)
+        .map(|attempt| {
+            jcode_provider_core::attempt_tracker::retry_backoff_delay(attempt, RETRY_BASE_DELAY_MS)
+                .as_millis() as u64
+        })
+        .sum();
+
+    assert!(
+        total_ms >= 30_000,
+        "rate-limit retries only cover {total_ms}ms; a burst window can outlast that"
+    );
+    assert!(
+        total_ms > old_total_ms * 10,
+        "new budget ({total_ms}ms) must dwarf the transport budget ({old_total_ms}ms) it replaced"
+    );
+}
+
+/// The outcome that actually matters: a burst limit that clears while jcode is
+/// waiting must let the turn finish, not kill it.
+///
+/// Anthropic's short-window limit clears in seconds. Before this, a 429 that
+/// outlived account rotation fell through to the transport budget (2 attempts,
+/// ~200ms apart), so the turn died with a "switch to a smaller model" prompt
+/// while the user still had most of their weekly quota. Here every account 429s
+/// for the first few calls and then recovers, which is exactly that world.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_limit_that_clears_lets_the_turn_finish() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+
+    // 429 for the first four calls (initial + rotation + two waits), then the
+    // burst window passes and the request succeeds.
+    let server = MockAnthropicServer::start(|call_no| {
+        if call_no <= 4 {
+            (429, mock_429_body())
+        } else {
+            (200, mock_success_sse_body("recovered"))
+        }
+    })
+    .await;
+    set_test_api_url_override(Some(server.url()));
+
+    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+    let model_state = Arc::new(std::sync::RwLock::new(
+        "claude-3-5-haiku-20241022".to_string(),
+    ));
+
+    run_stream_with_retries(
+        Client::new(),
+        "fixture-access-claude-1".to_string(),
+        true,
+        e2e_test_request(),
+        tx,
+        Arc::new(RwLock::new(None)),
+        "claude-3-5-haiku-20241022".to_string(),
+        "test-session".to_string(),
+        model_state,
+    )
+    .await;
+
+    set_test_api_url_override(None);
+
+    let mut events = Vec::new();
+    while let Some(item) = rx.recv().await {
+        events.push(item);
+    }
+
+    let errors: Vec<String> = events
+        .iter()
+        .filter_map(|event| event.as_ref().err().map(|e| e.to_string()))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "the turn must survive a burst limit that clears; got errors: {errors:?}"
+    );
+
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            Ok(StreamEvent::TextDelta(delta)) => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text, "recovered",
+        "the retried attempt's output must reach the consumer"
+    );
+    assert!(
+        server.call_count() >= 5,
+        "expected the loop to keep trying past the burst, saw {} calls",
+        server.call_count()
     );
 }
