@@ -833,3 +833,101 @@ fn anthropic_model_scoped_exhaustion_matches_display_name_to_catalog_id() {
     };
     assert!(!below_limit.model_scoped_exhausted("claude-fable-5"));
 }
+
+/// The retry loop's fast-fail decision, expressed on the probe.
+///
+/// A 429 alone cannot distinguish "burst limited for a few seconds" from
+/// "quota spent until the reset". The first is worth waiting out (ADR-0015),
+/// the second is pure delay because the reset can be hours away. The
+/// `exhausted` flags are what separate them, so this pins the exact split the
+/// retry loop depends on.
+#[test]
+fn exhaustion_separates_a_spent_quota_from_a_burst_limit() {
+    let snapshot = |label: &str, exhausted: bool, error: Option<&str>| AccountUsageSnapshot {
+        label: label.to_string(),
+        email: None,
+        exhausted,
+        primary_label: None,
+        five_hour_ratio: Some(if exhausted { 1.0 } else { 0.1 }),
+        secondary_label: None,
+        seven_day_ratio: Some(if exhausted { 1.0 } else { 0.1 }),
+        resets_at: None,
+        error: error.map(str::to_string),
+    };
+
+    // The reported case: both accounts 429 but neither quota is spent. This is
+    // a burst limit, and the loop must be willing to wait it out.
+    let burst = AccountUsageProbe {
+        provider: MultiAccountProviderKind::Anthropic,
+        current_label: "claude-1".to_string(),
+        accounts: vec![
+            snapshot("claude-1", false, None),
+            snapshot("claude-2", false, None),
+        ],
+    };
+    assert!(
+        !burst.all_accounts_exhausted(),
+        "headroom on both accounts must not read as exhaustion, or a recoverable \
+         burst would fail instantly"
+    );
+
+    // Genuinely out of quota: waiting cannot help.
+    let spent = AccountUsageProbe {
+        provider: MultiAccountProviderKind::Anthropic,
+        current_label: "claude-1".to_string(),
+        accounts: vec![
+            snapshot("claude-1", true, None),
+            snapshot("claude-2", true, None),
+        ],
+    };
+    assert!(
+        spent.all_accounts_exhausted(),
+        "every account spent must read as exhaustion so the turn fails fast"
+    );
+
+    // One account still has room: rotation handles this, not waiting.
+    let mixed = AccountUsageProbe {
+        provider: MultiAccountProviderKind::Anthropic,
+        current_label: "claude-1".to_string(),
+        accounts: vec![
+            snapshot("claude-1", true, None),
+            snapshot("claude-2", false, None),
+        ],
+    };
+    assert!(
+        !mixed.all_accounts_exhausted(),
+        "a usable account left means the loop must not give up"
+    );
+
+    // An account that failed to probe carries no information, so the verdict
+    // rests on the ones that answered.
+    let erroring = AccountUsageProbe {
+        provider: MultiAccountProviderKind::Anthropic,
+        current_label: "claude-1".to_string(),
+        accounts: vec![
+            snapshot("claude-1", true, None),
+            snapshot("claude-2", false, Some("probe failed")),
+        ],
+    };
+    assert!(
+        erroring.all_accounts_exhausted(),
+        "with the only probed account spent, exhaustion is the honest verdict"
+    );
+
+    // But when *nothing* could be probed, the answer is "unknown", not
+    // "exhausted". `all()` is vacuously true on an empty set, so filtering the
+    // errors out first used to turn an unreachable usage endpoint into "every
+    // account is exhausted", which fails turns that would have succeeded.
+    let nothing_probed = AccountUsageProbe {
+        provider: MultiAccountProviderKind::Anthropic,
+        current_label: "claude-1".to_string(),
+        accounts: vec![
+            snapshot("claude-1", false, Some("probe failed")),
+            snapshot("claude-2", false, Some("probe failed")),
+        ],
+    };
+    assert!(
+        !nothing_probed.all_accounts_exhausted(),
+        "no evidence must not read as exhaustion"
+    );
+}

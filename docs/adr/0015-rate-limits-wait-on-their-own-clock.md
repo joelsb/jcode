@@ -47,13 +47,38 @@ Give a rate limit that account rotation could not escape its own retry budget an
 
 Because every branch that grows `attempt_budget` is bounded by its own counter, the loop still terminates: the worst case for an always-429 world is `MAX_RETRIES + 1 rotation + (MAX_RATE_LIMIT_RETRIES - 1)` = 7 requests, then a terminal error.
 
+## Amendment: only wait when waiting can help
+
+The decision above treats every 429 that outlives rotation as worth ~75s of waiting. A user pushed back on exactly the right point: if the account is genuinely out of credits, one attempt is enough to establish that, and waiting is pure delay.
+
+They are right, and the two cases are distinguishable. Anthropic's 429 does not say which limit was hit, but the usage probe already tracks `exhausted` per account, and `AccountUsageProbe::all_accounts_exhausted()` already existed. So the wait is now gated on it:
+
+- **Quota spent** (probe says every account exhausted): no waits. Rotation still tries each account once, because proving an account is limited costs exactly one request, then the turn fails immediately.
+- **Burst limit** (probe reports headroom, or cannot be reached): wait as described above, because the request is expected to succeed shortly.
+
+Unknown is treated as burst, not as exhaustion: an unreachable usage endpoint must not fail turns that would have succeeded.
+
+### A pre-existing bug this exposed
+
+Gating on `all_accounts_exhausted()` immediately made a burst-limit test fail, because the verdict was wrong in a way that predates this work:
+
+```rust
+self.accounts.iter()
+    .filter(|account| account.error.is_none())
+    .all(|account| account.exhausted)
+```
+
+`all()` is vacuously true on an empty iterator, so when *no* account could be probed, the filter emptied the set and the answer was `true`: "the usage endpoint is unreachable" was read as "every account is exhausted", the most pessimistic possible reading of no evidence. That also drove the startup path's "All accounts exhausted" warning, where it had been silently wrong.
+
+Fixed at the source: no probed accounts now means `false` (unknown), and only accounts that actually answered contribute to the verdict.
+
 ## Consequences
 
 A burst limit that clears within ~75s now finishes the user's turn instead of failing it. That is the common case when several agents share two accounts, which is exactly the swarm workload that triggered this.
 
 The costs:
 
-- A genuinely exhausted quota now fails ~75s slower than before, spent in visible `⏳ Every account rate limited; waiting Ns and retrying (n/5)` status lines rather than silently. Slower honest failure is the price of not abandoning recoverable work, and the status line keeps it from looking like a hang.
+- A genuinely exhausted quota fails as fast as before, because the amendment below skips the waits entirely once the usage probe confirms exhaustion. When the probe is unavailable, the ~75s wait applies and is spent in visible `⏳ Every account rate limited; waiting Ns and retrying (n/5)` status lines rather than silently.
 - Retrying into a limit consumes rate-limit headroom, which can marginally delay the window's recovery. Bounded by the 5-attempt cap and the seconds-scale backoff.
 - Three independent retry budgets (transport, capacity, rate limit) is more state to keep straight. That is deliberate: they are three different faults with three different clocks, and sharing them is precisely what caused this bug and ADR-0013's.
 
@@ -70,7 +95,7 @@ The costs:
 ## Revisit when
 
 - Anthropic exposes a burst-window reset in the 429 (a header or body field). Then wait exactly that long instead of backing off blindly.
-- The usage probe can distinguish "burst limited" from "quota exhausted" before the request. Then skip the waits entirely when the quota really is spent, removing the slower-honest-failure cost.
+- The usage probe becomes reliable enough to trust when it *cannot* reach the API. Today an unreachable probe is treated as "unknown" and takes the waiting path; if that proves wrong in practice, the default may need to flip.
 - Someone reports a hang around ~75s on a rate limit. That means the status line is not reading as progress and needs to become a countdown.
 
 ## Evidence
@@ -86,6 +111,10 @@ the turn must survive a burst limit that clears; got errors:
 ```
 
 `rate_limits_wait_on_a_rate_limit_clock_not_the_transport_clock` pins the policy: the real 429 payload classifies as a usage limit and not as capacity, the budget exceeds the transport budget, and the retries span >=30s, more than 10x the transport path. Its own negative control (restoring `2` / `200ms`) fails it.
+
+`a_spent_quota_fails_fast_instead_of_waiting_out_a_burst` drives the same always-429 server under both usage verdicts and compares request counts: an exhausted quota stops after rotation (3 requests, one per account plus the transport budget), while a burst limit keeps retrying. This is the property the amendment adds, checked as a difference in behavior rather than as a constant.
+
+`exhaustion_separates_a_spent_quota_from_a_burst_limit` pins the probe-level split, including the vacuous-truth case: two accounts with headroom is not exhaustion, two spent accounts is, and two *unprobed* accounts is not.
 
 `run_stream_with_retries_bounds_rotation_attempts_and_restores_original_account` was updated rather than deleted: it encoded the old bound of 3 requests and now asserts the new one, plus an explicit `< 20` sanity bound so the termination property is checked independently of the exact arithmetic.
 
