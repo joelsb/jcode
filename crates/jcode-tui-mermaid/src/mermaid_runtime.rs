@@ -108,12 +108,39 @@ pub(super) fn infer_protocol_from_multiplexer_survivors(
 }
 
 fn infer_protocol_from_multiplexer_survivors_env() -> Option<ProtocolType> {
-    infer_protocol_from_multiplexer_survivors(
+    let protocol = infer_protocol_from_multiplexer_survivors(
         std::env::var("WEZTERM_EXECUTABLE").ok().as_deref(),
         std::env::var("WEZTERM_PANE").ok().as_deref(),
         std::env::var("GHOSTTY_RESOURCES_DIR").ok().as_deref(),
         std::env::var("GHOSTTY_BIN_DIR").ok().as_deref(),
-    )
+    )?;
+    if protocol_is_multiplexer_stable(protocol) || multiplexer_images_opt_in() {
+        return Some(protocol);
+    }
+    None
+}
+
+/// Whether a protocol still renders correctly when a multiplexer repaints the
+/// screen underneath it.
+///
+/// Kitty's Unicode-placeholder path puts real characters in real cells, so a
+/// repaint reissues them and the image is restored. The iTerm2 path writes an
+/// out-of-band escape at the cursor with no cell content behind it: after a
+/// repaint the terminal still holds pixels the multiplexer knows nothing about,
+/// which shows up as diagrams that flicker, duplicate, or smear while
+/// scrolling. Sixel has the same out-of-band problem.
+fn protocol_is_multiplexer_stable(protocol: ProtocolType) -> bool {
+    matches!(protocol, ProtocolType::Kitty)
+}
+
+/// Opt back into out-of-band image protocols inside a multiplexer, accepting
+/// the repaint artifacts. `JCODE_MULTIPLEXER_IMAGES=1`.
+fn multiplexer_images_opt_in() -> bool {
+    std::env::var("JCODE_MULTIPLEXER_IMAGES")
+        .ok()
+        .as_deref()
+        .and_then(parse_env_bool)
+        .unwrap_or(false)
 }
 
 /// Protocol for the current process: generic env signals first, then

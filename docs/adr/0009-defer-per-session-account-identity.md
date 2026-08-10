@@ -24,6 +24,7 @@ Ship rotation with the process-global model, and record the limitation rather th
 Mitigations taken instead of a fix:
 - The restore path compare-and-swaps against the live override so it cannot clobber another session's deliberate `/account switch` ([ADR-0003](0003-restore-the-account-override-only-on-a-dead-end.md)).
 - The switch is announced to clients, so a user whose account changed underneath them can at least see it ([ADR-0007](0007-announce-rotation-to-clients-over-the-bus.md)).
+- That announcement has no session id and so reaches every client; a session on another provider filters it out client-side rather than adopting it ([ADR-0011](0011-filter-the-rotation-broadcast-client-side.md)). This narrows the blast radius to sessions that really are on Anthropic - it does not make the account per-session.
 
 The real fix - per-session account attribution, meaning a session-scoped account selection and a credential cache keyed by account - is an architectural change touching auth storage, the provider instance model, and the usage cache. It is out of proportion to a rate-limit failover patch.
 
