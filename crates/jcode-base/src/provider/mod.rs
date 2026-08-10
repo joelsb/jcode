@@ -1,5 +1,5 @@
 mod accessors;
-mod account_failover;
+pub mod account_failover;
 pub mod activation;
 pub mod anthropic;
 pub mod antigravity;
@@ -50,6 +50,10 @@ pub use account_failover::all_accounts_quota_exhausted;
 pub use account_failover::error_looks_like_usage_limit;
 pub use account_failover::prefer_account_failover_enabled;
 pub use account_failover::with_quota_exhausted_override;
+pub use account_failover::{
+    account_is_cooling_down, clear_account_cooldown, clear_all_account_cooldowns,
+    note_account_rate_limited,
+};
 pub use catalog_routes::{
     append_simplified_anthropic_model_routes, remote_current_openai_compatible_route_for_model,
     remote_model_is_server_copilot_only, remote_model_routes_fallback,

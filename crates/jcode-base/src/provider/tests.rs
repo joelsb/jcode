@@ -1128,3 +1128,89 @@ fn profile_catalog_cache_needs_refresh_for_missing_cache() {
         );
     });
 }
+
+/// The rate-limit cooldown that stops account ping-pong across requests.
+///
+/// Reported symptom: `claude-2 → claude-1 → claude-2 → claude-1`, three switches
+/// in a row, each one spending a real request to rediscover a limit the previous
+/// request had already hit. `tried_accounts` lives for a single request, so
+/// nothing carried that knowledge forward.
+#[test]
+fn a_rate_limited_account_is_remembered_across_requests() {
+    use crate::provider::{
+        account_is_cooling_down, clear_account_cooldown, clear_all_account_cooldowns,
+        note_account_rate_limited,
+    };
+    use jcode_provider_core::ActiveProvider;
+
+    clear_all_account_cooldowns();
+
+    assert!(
+        !account_is_cooling_down(ActiveProvider::Claude, "claude-1"),
+        "an account nobody has seen fail must be freely usable"
+    );
+
+    note_account_rate_limited(ActiveProvider::Claude, "claude-1");
+    assert!(
+        account_is_cooling_down(ActiveProvider::Claude, "claude-1"),
+        "the next request must remember this account just refused"
+    );
+    assert!(
+        !account_is_cooling_down(ActiveProvider::Claude, "claude-2"),
+        "one account's limit must not sideline the others"
+    );
+
+    // Cooldowns are per provider: an Anthropic limit says nothing about OpenAI.
+    assert!(
+        !account_is_cooling_down(ActiveProvider::OpenAI, "claude-1"),
+        "cooldowns must not leak across providers"
+    );
+
+    // A success proves the account is serving again, so it should not sit out
+    // the rest of the window.
+    clear_account_cooldown(ActiveProvider::Claude, "claude-1");
+    assert!(
+        !account_is_cooling_down(ActiveProvider::Claude, "claude-1"),
+        "a successful request must clear the cooldown immediately"
+    );
+
+    clear_all_account_cooldowns();
+}
+
+/// A cooling-down account must be *deprioritised*, never dropped: when every
+/// account is limited it is still the only thing left to try.
+#[test]
+fn cooling_down_accounts_sort_last_but_remain_candidates() {
+    use crate::provider::account_failover::same_provider_account_candidates_for_tests;
+    use crate::provider::{clear_all_account_cooldowns, note_account_rate_limited};
+    use jcode_provider_core::ActiveProvider;
+
+    clear_all_account_cooldowns();
+
+    let ordered = same_provider_account_candidates_for_tests(
+        ActiveProvider::Claude,
+        vec!["claude-1".to_string(), "claude-2".to_string()],
+    );
+    assert_eq!(
+        ordered,
+        vec!["claude-1".to_string(), "claude-2".to_string()],
+        "with no cooldowns the existing best-first order is preserved"
+    );
+
+    note_account_rate_limited(ActiveProvider::Claude, "claude-1");
+    let ordered = same_provider_account_candidates_for_tests(
+        ActiveProvider::Claude,
+        vec!["claude-1".to_string(), "claude-2".to_string()],
+    );
+    assert_eq!(
+        ordered,
+        vec!["claude-2".to_string(), "claude-1".to_string()],
+        "the account that just refused must be tried last, not first"
+    );
+    assert!(
+        ordered.contains(&"claude-1".to_string()),
+        "it must still be a candidate: when everything is limited it is all we have"
+    );
+
+    clear_all_account_cooldowns();
+}

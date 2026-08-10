@@ -1,5 +1,81 @@
 use super::ActiveProvider;
 
+/// How long an account stays on cooldown after it answered 429.
+///
+/// Anthropic's burst limit clears in seconds, so this is deliberately short: it
+/// exists to stop the *next* request re-proving what the last one just learned,
+/// not to take an account out of service.
+const RATE_LIMIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Accounts observed rate-limited recently, as `(provider, label) -> observed`.
+///
+/// `tried_accounts` inside the retry loop lives for one request. Nothing carried
+/// a 429 across requests, so every new request would rotate straight back into
+/// the account that had just refused it, and a burst on one account showed up
+/// as `claude-2 → claude-1 → claude-2 → claude-1`, spending real quota on each
+/// hop to rediscover the same fact.
+/// Keyed by `(provider name, label)` rather than the enum, so this does not
+/// force `Hash`/`Eq` onto a type shared across the whole provider layer.
+static RATE_LIMITED_ACCOUNTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(&'static str, String), std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Stable key for a provider.
+fn cooldown_provider_key(provider: ActiveProvider) -> &'static str {
+    match provider {
+        ActiveProvider::Claude => "claude",
+        ActiveProvider::OpenAI => "openai",
+        ActiveProvider::Copilot => "copilot",
+        ActiveProvider::Antigravity => "antigravity",
+        ActiveProvider::Gemini => "gemini",
+        ActiveProvider::Cursor => "cursor",
+        ActiveProvider::Bedrock => "bedrock",
+        ActiveProvider::OpenRouter => "openrouter",
+    }
+}
+
+/// Record that `label` answered with a rate limit just now.
+pub fn note_account_rate_limited(provider: ActiveProvider, label: &str) {
+    if let Ok(mut seen) = RATE_LIMITED_ACCOUNTS.lock() {
+        seen.insert(
+            (cooldown_provider_key(provider), label.to_string()),
+            std::time::Instant::now(),
+        );
+    }
+}
+
+/// Whether `label` refused a request within the cooldown window.
+pub fn account_is_cooling_down(provider: ActiveProvider, label: &str) -> bool {
+    let Ok(mut seen) = RATE_LIMITED_ACCOUNTS.lock() else {
+        return false;
+    };
+    let key = (cooldown_provider_key(provider), label.to_string());
+    match seen.get(&key) {
+        Some(observed) if observed.elapsed() < RATE_LIMIT_COOLDOWN => true,
+        Some(_) => {
+            // Expired: drop it so the map cannot grow without bound and the
+            // account is immediately eligible again.
+            seen.remove(&key);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Clear a cooldown, e.g. after a request on that account succeeds.
+pub fn clear_account_cooldown(provider: ActiveProvider, label: &str) {
+    if let Ok(mut seen) = RATE_LIMITED_ACCOUNTS.lock() {
+        seen.remove(&(cooldown_provider_key(provider), label.to_string()));
+    }
+}
+
+/// Test-only: forget every cooldown so tests start from a known state.
+pub fn clear_all_account_cooldowns() {
+    if let Ok(mut seen) = RATE_LIMITED_ACCOUNTS.lock() {
+        seen.clear();
+    }
+}
+
 pub(super) fn multi_account_provider_kind(
     provider: ActiveProvider,
 ) -> Option<crate::usage::MultiAccountProviderKind> {
@@ -162,6 +238,25 @@ pub(super) fn same_provider_account_candidates(provider: ActiveProvider) -> Vec<
         _ => {}
     }
 
+    // Accounts that refused a request moments ago go last rather than being
+    // dropped: they are the correct choice when everything else is limited too,
+    // but trying them first is what produced the observed
+    // `claude-2 → claude-1 → claude-2` ping-pong.
+    labels.sort_by_key(|label| account_is_cooling_down(provider, label));
+    labels
+}
+
+/// Test seam: apply only the cooldown ordering to a fixed candidate list.
+///
+/// The real `same_provider_account_candidates` also calls the network usage
+/// probe and reads the on-disk account store, neither of which a unit test can
+/// drive. This exposes the ordering rule on its own, which is the part that
+/// fixes the ping-pong.
+pub fn same_provider_account_candidates_for_tests(
+    provider: ActiveProvider,
+    mut labels: Vec<String>,
+) -> Vec<String> {
+    labels.sort_by_key(|label| account_is_cooling_down(provider, label));
     labels
 }
 
