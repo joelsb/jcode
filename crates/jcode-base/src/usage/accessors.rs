@@ -4,6 +4,15 @@ use super::*;
 static USAGE: tokio::sync::OnceCell<Arc<RwLock<UsageData>>> = tokio::sync::OnceCell::const_new();
 static REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// Bumped on every account-change invalidation.
+///
+/// `REFRESH_IN_FLIGHT` alone lets a fetch that started before an account switch
+/// land afterwards and stamp the previous account's numbers as fresh - and
+/// because the flag is then clear but the data looks fresh, no further refresh
+/// runs for a full `CACHE_DURATION`. A refresh compares the epoch it started
+/// under against the epoch on completion to detect exactly that.
+static USAGE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 pub(super) async fn get_usage() -> Arc<RwLock<UsageData>> {
     USAGE
         .get_or_init(|| async { Arc::new(RwLock::new(UsageData::default())) })
@@ -59,8 +68,15 @@ fn try_spawn_refresh(usage: Arc<RwLock<UsageData>>) {
         return;
     }
 
+    let started_epoch = USAGE_EPOCH.load(Ordering::SeqCst);
     tokio::spawn(async move {
-        refresh_usage(usage).await;
+        refresh_usage(usage.clone()).await;
+        if USAGE_EPOCH.load(Ordering::SeqCst) != started_epoch {
+            // The active account changed while this fetch was in flight, so
+            // what just landed describes the account we are no longer on.
+            // Re-mark it stale instead of serving it as fresh.
+            usage.write().await.mark_stale();
+        }
         REFRESH_IN_FLIGHT.store(false, Ordering::SeqCst);
     });
 }
@@ -84,10 +100,26 @@ pub async fn get() -> UsageData {
 
 /// Invalidate the cached Anthropic usage snapshot after an account change.
 ///
-/// Safe to call from sync contexts: when a Tokio runtime is available the
-/// write happens inline, otherwise the cache is left untouched rather than
-/// panicking (the next TTL expiry then repairs it).
+/// Prefer this over [`invalidate_anthropic_usage`] wherever the caller can
+/// await: the invalidation is complete when this returns, so a read that
+/// happens after it cannot be served the pre-switch snapshot.
+pub async fn invalidate_anthropic_usage_now() {
+    USAGE_EPOCH.fetch_add(1, Ordering::SeqCst);
+    let usage = get_usage().await;
+    usage.write().await.mark_stale();
+}
+
+/// Sync-callable form of [`invalidate_anthropic_usage_now`], for UI code that
+/// has no place to await.
+///
+/// The epoch bump is immediate, but the `mark_stale` write is *deferred* to a
+/// spawned task, so a read racing that task can still be served the pre-switch
+/// snapshot once. The epoch bump is what keeps that from persisting: an
+/// in-flight refresh started under the old account is re-marked stale when it
+/// lands. Without a Tokio runtime the cache is left to its TTL rather than
+/// panicking.
 pub fn invalidate_anthropic_usage() {
+    USAGE_EPOCH.fetch_add(1, Ordering::SeqCst);
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };

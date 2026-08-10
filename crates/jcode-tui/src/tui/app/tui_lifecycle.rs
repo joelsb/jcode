@@ -261,8 +261,8 @@ impl App {
                 // Linear growth, capped: a long overload should keep retrying on
                 // a steady cadence rather than drifting into multi-minute waits
                 // that look indistinguishable from a hang.
-                let backoff_secs = (base_delay_secs * u64::from(retry_attempts))
-                    .min(Self::RETRY_MAX_BACKOFF_SECS);
+                let backoff_secs =
+                    (base_delay_secs * u64::from(retry_attempts)).min(Self::RETRY_MAX_BACKOFF_SECS);
                 let retry_at = Instant::now() + Duration::from_secs(backoff_secs);
                 pending.retry_at = Some(retry_at);
                 Ok((retry_attempts, backoff_secs, retry_at))

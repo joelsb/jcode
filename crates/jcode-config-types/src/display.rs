@@ -54,6 +54,18 @@ pub struct DisplayConfig {
     /// it scrolls, like the sticky previous-prompt preview (default: true)
     #[serde(default = "default_true")]
     pub pin_todos: bool,
+    /// Draw mermaid diagrams with ratatui-image's Unicode half-block fallback
+    /// when the terminal has no native image protocol (default: false, which
+    /// shows the mermaid source instead).
+    ///
+    /// Half-blocks are ordinary colored text cells, so unlike the native image
+    /// protocols they survive a multiplexer repaint. That makes this the only
+    /// way to get an actual picture inline inside tmux under a terminal like
+    /// WezTerm. The cost is resolution: a diagram drawn in half-blocks is
+    /// coarse, and dense text inside nodes can become unreadable, which is why
+    /// it is not the default. See docs/adr/0014.
+    #[serde(default)]
+    pub mermaid_halfblocks: bool,
     /// Show idle animation before first prompt (default: false)
     pub idle_animation: bool,
     /// Keep the idle animation running for the whole session instead of only
@@ -133,6 +145,7 @@ impl Default for DisplayConfig {
             show_diffs: None,
             pin_images: true,
             pin_todos: true,
+            mermaid_halfblocks: false,
             queue_mode: false,
             auto_server_reload: true,
             mouse_capture: true,

@@ -1228,8 +1228,9 @@ pub(in crate::tui::app) fn handle_server_event(
                 // - which the client considered idle. Both must go back on the
                 // queue rather than surface a raw error: the user's message is
                 // not invalid, the server is simply still busy.
-                let recovered = recover_undelivered_queued_continuation(app, "server busy rejection")
-                    || recover_rejected_user_submission(app, "server busy rejection");
+                let recovered =
+                    recover_undelivered_queued_continuation(app, "server busy rejection")
+                        || recover_rejected_user_submission(app, "server busy rejection");
                 if recovered {
                     app.is_processing = true;
                     app.status = ProcessingStatus::Thinking(Instant::now());

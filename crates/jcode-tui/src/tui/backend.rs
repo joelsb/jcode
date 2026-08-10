@@ -1882,8 +1882,14 @@ mod tests {
         let line = br#"{"type":"anthropic_account_rotated","label":"claude-2"}"#.to_vec();
         match remote.classify_protocol_line(line, &mut stray_lines) {
             LineOutcome::Event(event) => match *event {
-                ServerEvent::AnthropicAccountRotated { label, .. } => {
+                ServerEvent::AnthropicAccountRotated {
+                    label, restored, ..
+                } => {
                     assert_eq!(label, "claude-2");
+                    assert!(
+                        !restored,
+                        "a daemon that omits the flag means an ordinary rotation"
+                    );
                 }
                 other => panic!("expected the rotation event, got {other:?}"),
             },

@@ -105,6 +105,27 @@ impl App {
         (provider, model)
     }
 
+    /// Whether an Anthropic account-change event belongs to some other session.
+    ///
+    /// The rotation bus event carries no session id, so the daemon fans it out
+    /// to every connected client. A session on another provider must ignore it
+    /// rather than print an Anthropic rate-limit notice and adopt an account
+    /// override it never uses.
+    pub(in crate::tui::app) fn ignores_anthropic_account_events(&self) -> bool {
+        let (provider, model) = self.remote_effort_identity();
+        let provider = provider.unwrap_or_default().to_ascii_lowercase();
+        let model = model.unwrap_or_default().to_ascii_lowercase();
+        if provider.is_empty() && model.is_empty() {
+            // Identity has not settled yet. Fail open: a stray notice costs
+            // less than dropping a rotation that really is ours and leaving
+            // the usage widget pointed at an exhausted account.
+            return false;
+        }
+        !(provider.contains("anthropic")
+            || provider.contains("claude")
+            || model.starts_with("claude-"))
+    }
+
     /// Best-known current reasoning effort for the remote session. Falls back
     /// to the configured provider-family default when the server has not
     /// reported one yet, so pre-settle effort cycling starts from the value the

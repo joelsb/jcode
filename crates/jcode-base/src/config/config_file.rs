@@ -244,6 +244,18 @@ impl Config {
         Ok(())
     }
 
+    /// Update the persisted mermaid half-block preference.
+    pub fn set_mermaid_halfblocks(enabled: bool) -> anyhow::Result<()> {
+        let mut cfg = Self::load();
+        cfg.display.mermaid_halfblocks = enabled;
+        cfg.save()?;
+        crate::logging::info(&format!(
+            "Saved display.mermaid_halfblocks to config: {}",
+            enabled
+        ));
+        Ok(())
+    }
+
     /// Update the persisted show-agentgrep-output preference.
     pub fn set_show_agentgrep_output(show: bool) -> anyhow::Result<()> {
         let mut cfg = Self::load();

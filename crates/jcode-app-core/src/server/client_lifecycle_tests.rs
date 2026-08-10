@@ -1421,16 +1421,36 @@ mod account_rotation_forwarding_tests {
         let rotated = jcode_base::bus::AnthropicAccountRotated {
             label: "claude-2".to_string(),
             previous_label: Some("claude-1".to_string()),
+            restored: false,
         };
 
         match account_rotated_server_event(&rotated) {
             ServerEvent::AnthropicAccountRotated {
                 label,
                 previous_label,
+                restored,
             } => {
                 assert_eq!(label, "claude-2");
                 assert_eq!(previous_label.as_deref(), Some("claude-1"));
+                assert!(!restored);
             }
+            other => panic!("expected the rotation wire event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bus_restore_keeps_its_flag_on_the_wire() {
+        let rotated = jcode_base::bus::AnthropicAccountRotated {
+            label: "claude-1".to_string(),
+            previous_label: Some("claude-2".to_string()),
+            restored: true,
+        };
+
+        match account_rotated_server_event(&rotated) {
+            ServerEvent::AnthropicAccountRotated { restored, .. } => assert!(
+                restored,
+                "dropping the flag here would make the client word a give-up as a switch"
+            ),
             other => panic!("expected the rotation wire event, got {other:?}"),
         }
     }
