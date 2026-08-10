@@ -80,6 +80,59 @@ fn detect_multiplexer_from_env() -> Multiplexer {
     )
 }
 
+/// Recover the *outer* terminal's graphics protocol from environment markers
+/// that survive a multiplexer.
+///
+/// tmux overwrites `TERM_PROGRAM` with `tmux` and rewrites `TERM` to
+/// `tmux-256color`, so `infer_protocol_from_env` sees no graphics hint and
+/// mermaid silently degrades to source text inside tmux. Terminal-specific
+/// markers like `WEZTERM_EXECUTABLE` / `WEZTERM_PANE` and Ghostty's
+/// `GHOSTTY_RESOURCES_DIR` are exported by the terminal itself and are still
+/// present in the multiplexer's child environment, so they identify the outer
+/// terminal when the generic signals have been masked.
+pub(super) fn infer_protocol_from_multiplexer_survivors(
+    wezterm_executable: Option<&str>,
+    wezterm_pane: Option<&str>,
+    ghostty_resources_dir: Option<&str>,
+    ghostty_bin_dir: Option<&str>,
+) -> Option<ProtocolType> {
+    if env_is_set(wezterm_executable) || env_is_set(wezterm_pane) {
+        // Same reasoning as the direct WezTerm branch: its iTerm2 path is the
+        // glitch-free one.
+        return Some(ProtocolType::Iterm2);
+    }
+    if env_is_set(ghostty_resources_dir) || env_is_set(ghostty_bin_dir) {
+        return Some(ProtocolType::Kitty);
+    }
+    None
+}
+
+fn infer_protocol_from_multiplexer_survivors_env() -> Option<ProtocolType> {
+    infer_protocol_from_multiplexer_survivors(
+        std::env::var("WEZTERM_EXECUTABLE").ok().as_deref(),
+        std::env::var("WEZTERM_PANE").ok().as_deref(),
+        std::env::var("GHOSTTY_RESOURCES_DIR").ok().as_deref(),
+        std::env::var("GHOSTTY_BIN_DIR").ok().as_deref(),
+    )
+}
+
+/// Protocol for the current process: generic env signals first, then
+/// outer-terminal markers that survive a multiplexer.
+pub(super) fn infer_protocol_for_current_env() -> Option<ProtocolType> {
+    if let Some(protocol) = infer_protocol_from_env(
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("LC_TERMINAL").ok().as_deref(),
+        std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
+    ) {
+        return Some(protocol);
+    }
+    if detect_multiplexer_from_env() == Multiplexer::None {
+        return None;
+    }
+    infer_protocol_from_multiplexer_survivors_env()
+}
+
 fn parse_env_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -235,12 +288,7 @@ fn fast_picker() -> Picker {
     #[allow(deprecated)]
     let mut picker = Picker::from_fontsize(font_size);
     picker.set_protocol_type(ProtocolType::Halfblocks);
-    if let Some(protocol) = infer_protocol_from_env(
-        std::env::var("TERM").ok().as_deref(),
-        std::env::var("TERM_PROGRAM").ok().as_deref(),
-        std::env::var("LC_TERMINAL").ok().as_deref(),
-        std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
-    ) {
+    if let Some(protocol) = infer_protocol_for_current_env() {
         picker.set_protocol_type(protocol);
     }
     picker
@@ -312,12 +360,7 @@ pub(crate) fn prewarm_svg_font_db_async() {
 /// in-memory cache registration.
 pub fn init_picker() {
     PICKER.get_or_init(|| {
-        let env_protocol = infer_protocol_from_env(
-            std::env::var("TERM").ok().as_deref(),
-            std::env::var("TERM_PROGRAM").ok().as_deref(),
-            std::env::var("LC_TERMINAL").ok().as_deref(),
-            std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
-        );
+        let env_protocol = infer_protocol_for_current_env();
         let multiplexer = detect_multiplexer_from_env();
         let probe_override = std::env::var("JCODE_MERMAID_PICKER_PROBE")
             .ok()
@@ -748,6 +791,40 @@ mod tests {
         // Herdr/tmux advertise a bland TERM with no graphics hints.
         assert_eq!(
             infer_protocol_from_env(Some("xterm-256color"), None, None, None),
+            None
+        );
+    }
+
+    /// Inside tmux, `TERM_PROGRAM` becomes `tmux` and `TERM` becomes
+    /// `tmux-256color`, so the generic signals are gone. The terminal's own
+    /// exported markers survive and must recover the protocol, otherwise
+    /// mermaid degrades to source text for every tmux user.
+    #[test]
+    fn multiplexer_survivor_markers_recover_the_outer_terminal() {
+        assert_eq!(
+            infer_protocol_from_multiplexer_survivors(
+                Some("/Applications/WezTerm.app/Contents/MacOS/wezterm-gui"),
+                Some("0"),
+                None,
+                None,
+            ),
+            Some(ProtocolType::Iterm2),
+            "WezTerm behind tmux must still get its iTerm2 image path"
+        );
+        assert_eq!(
+            infer_protocol_from_multiplexer_survivors(None, None, Some("/usr/share/ghostty"), None),
+            Some(ProtocolType::Kitty),
+            "Ghostty behind tmux must still get the Kitty protocol"
+        );
+        assert_eq!(
+            infer_protocol_from_multiplexer_survivors(None, None, None, None),
+            None,
+            "no markers means no guess"
+        );
+        // Empty values are not evidence: tmux can pass through an unset var
+        // as an empty string.
+        assert_eq!(
+            infer_protocol_from_multiplexer_survivors(Some(""), Some(""), Some(""), Some("")),
             None
         );
     }
