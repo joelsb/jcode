@@ -72,6 +72,24 @@ self.accounts.iter()
 
 Fixed at the source: no probed accounts now means `false` (unknown), and only accounts that actually answered contribute to the verdict.
 
+## Amendment 2: remember a 429 across requests
+
+A user reported the rotation announcements ping-ponging:
+
+```
+⚡ Rate limited; switched Anthropic account: claude-2 → claude-1
+⚡ Rate limited; switched Anthropic account: claude-1 → claude-2
+⚡ Rate limited; switched Anthropic account: claude-2 → claude-1
+```
+
+Three switches in a row, and two minutes later a manual switch back to `claude-1` worked immediately, because it had never been quota-limited at all.
+
+The cause is that `tried_accounts` lives for exactly one request. Each new request starts with an empty list, so it rotates straight back into the account that refused the previous request, spends a real request rediscovering the same burst limit, rotates away again, and repeats. The knowledge that "claude-1 said no five seconds ago" existed only inside the request that learned it.
+
+So a rate limit is now recorded per account, with a 60s cooldown, and cooling-down accounts sort *last* among rotation candidates. Deliberately last rather than excluded: when every account is limited, the cooling one is still the only thing left to try, and dropping it would turn a recoverable state into a hard failure. A successful request clears that account's cooldown immediately, so an account that recovers early is not sidelined for the rest of the window.
+
+The window is short on purpose. It exists to stop the *next* request re-proving what the last one just learned, not to take an account out of service; a burst clears in seconds, and 60s is comfortably longer than that while still expiring well inside a normal working session.
+
 ## Consequences
 
 A burst limit that clears within ~75s now finishes the user's turn instead of failing it. That is the common case when several agents share two accounts, which is exactly the swarm workload that triggered this.
@@ -115,6 +133,8 @@ the turn must survive a burst limit that clears; got errors:
 `a_spent_quota_fails_fast_instead_of_waiting_out_a_burst` drives the same always-429 server under both usage verdicts and compares request counts: an exhausted quota stops after rotation (3 requests, one per account plus the transport budget), while a burst limit keeps retrying. This is the property the amendment adds, checked as a difference in behavior rather than as a constant.
 
 `exhaustion_separates_a_spent_quota_from_a_burst_limit` pins the probe-level split, including the vacuous-truth case: two accounts with headroom is not exhaustion, two spent accounts is, and two *unprobed* accounts is not.
+
+`a_rate_limited_account_is_remembered_across_requests` and `cooling_down_accounts_sort_last_but_remain_candidates` cover the cooldown: a 429 is remembered, it does not leak to other accounts or other providers, a success clears it, and a cooling account sorts last while remaining a candidate. Negative control: removing the `sort_by_key` makes the ordering test fail with "the account that just refused must be tried last, not first".
 
 `run_stream_with_retries_bounds_rotation_attempts_and_restores_original_account` was updated rather than deleted: it encoded the old bound of 3 requests and now asserts the new one, plus an explicit `< 20` sanity bound so the termination property is checked independently of the exact arithmetic.
 
