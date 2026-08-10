@@ -1870,6 +1870,18 @@ async fn run_stream_with_retries(
         {
             Ok(()) => {
                 let _ = attempt_guard.finish().await;
+                // This account is serving again, so drop any cooldown from an
+                // earlier refusal instead of avoiding it for the full window.
+                if account_rotation_enabled
+                    && let Some(label) = current_account
+                        .clone()
+                        .or_else(|| Some(auth::claude::primary_account_label()))
+                {
+                    jcode_base::provider::clear_account_cooldown(
+                        jcode_provider_core::ActiveProvider::Claude,
+                        &label,
+                    );
+                }
                 return; // Success
             }
             Err(e) => {
@@ -2024,6 +2036,19 @@ async fn run_stream_with_retries(
                 // instead; only when every account is limited does the caller
                 // fall through to a model downgrade.
                 if should_rotate_account(account_rotation_enabled, &error_str) {
+                    // Remember which account refused, so the *next* request does
+                    // not rotate straight back into it. Without this, each
+                    // request starts with an empty `tried_accounts` and
+                    // re-discovers the same limit, burning a request per hop.
+                    if let Some(label) = current_account
+                        .clone()
+                        .or_else(|| Some(auth::claude::primary_account_label()))
+                    {
+                        jcode_base::provider::note_account_rate_limited(
+                            jcode_provider_core::ActiveProvider::Claude,
+                            &label,
+                        );
+                    }
                     match switch_to_next_claude_account(&credentials, &mut tried_accounts).await {
                         Some((switched_label, switched_token)) => {
                             let previous_label = current_account
