@@ -49,6 +49,9 @@ impl App {
             "observe" => {
                 "/observe\nToggle transient observe mode for the side panel.\n\n/observe on\nEnable observe mode and focus the observe page.\n\n/observe off\nDisable observe mode.\n\n/observe status\nShow whether observe mode is enabled.\n\nObserve mode shows only the latest tool call or tool result added to context, and it is not persisted to disk."
             }
+            "diagrams" | "diagram" => {
+                "/diagrams\nRender this session's mermaid diagrams to PNG and open them in your image viewer.\n\nUse this when the transcript shows mermaid source instead of a picture: inside tmux/screen/zellij most terminals cannot draw inline images, so jcode keeps the readable source (see docs/adr/0014).\n\n/diagrams\nOpen every diagram in the transcript.\n\n/diagrams <n>\nOpen just diagram n, numbered from 1.\n\n/diagrams last\nOpen the most recent diagram.\n\n/diagrams list\nList the diagrams with their headings, without opening anything."
+            }
             "todos" | "todo" => {
                 "/todos\nShow the current session's todo list as an inline card in the chat (press again, or the todo-card hotkey, to dismiss the trailing card). The card live-updates as the todo list changes.\n\n/todos panel\nToggle the legacy dedicated todo screen in the side panel.\n\n/todos pin\nToggle pinning the full todo list to the top of the chat transcript while it scrolls (saved to config as display.pin_todos, off by default).\n\n/todos on\nEnable the side-panel todo screen and focus it.\n\n/todos off\nDisable the side-panel todo screen.\n\n/todos status\nShow todo card/panel/pin status."
             }

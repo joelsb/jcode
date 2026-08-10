@@ -95,6 +95,7 @@ mod split_view;
 mod state_ui;
 mod state_ui_input_helpers;
 pub(crate) use state_ui_input_helpers::registered_command_entries;
+mod diagrams_view;
 mod state_ui_maintenance;
 mod state_ui_messages;
 mod state_ui_runtime;
