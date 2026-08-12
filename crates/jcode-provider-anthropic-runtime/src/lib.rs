@@ -533,8 +533,19 @@ const OVERLOADED_RETRY_BASE_DELAY_MS: u64 = 2000;
 const MAX_RATE_LIMIT_RETRIES: u32 = 5;
 
 /// Base delay for the rate-limit backoff, giving ~5s, 10s, 20s, 40s. A
-/// `retry-after` from the server always wins over this.
+/// `retry-after` from the server always wins over this, up to
+/// `MAX_BURST_RETRY_AFTER`.
 const RATE_LIMIT_RETRY_BASE_DELAY_MS: u64 = 5000;
+
+/// Longest server `retry-after` this loop will honour for a *burst* limit.
+///
+/// Anthropic answers a spent 5-hour quota and a momentary burst with the same
+/// 429, and attaches the same `retry-after: 60`. Honouring that verbatim turned
+/// the burst path into four consecutive 60s sleeps: a four-minute silence for a
+/// limit that either clears in seconds or does not clear for hours, so waiting a
+/// full minute is wrong in both directions. Capping applies only to this path;
+/// the quota path no longer waits at all. See ADR-0016.
+const MAX_BURST_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Cached OAuth credentials
 #[derive(Clone)]
@@ -1806,6 +1817,10 @@ async fn run_stream_with_retries(
     // that outlived account rotation is not a transport fault and must not be
     // capped by the transport budget.
     let mut rate_limit_retries: u32 = 0;
+    // Whether the "every account is out of quota, earliest reset X" notice has
+    // been shown. Once per turn: the branch that emits it is reached by every
+    // later failing attempt.
+    let mut announced_quota_exhaustion = false;
     let mut attempt: u32 = 0;
 
     while attempt < attempt_budget {
@@ -1868,14 +1883,15 @@ async fn run_stream_with_retries(
         {
             Ok(()) => {
                 let _ = attempt_guard.finish().await;
-                // This account is serving again, so drop any cooldown from an
-                // earlier refusal instead of avoiding it for the full window.
+                // This account is serving again, so drop any cooldown *and* any
+                // cached limit verdict from an earlier refusal, rather than
+                // avoiding it for the full window.
                 if account_rotation_enabled
                     && let Some(label) = current_account
                         .clone()
                         .or_else(|| Some(auth::claude::primary_account_label()))
                 {
-                    jcode_base::provider::clear_account_cooldown(
+                    jcode_base::provider::clear_account_rate_limit(
                         jcode_provider_core::ActiveProvider::Claude,
                         &label,
                     );
@@ -2038,17 +2054,30 @@ async fn run_stream_with_retries(
                     // not rotate straight back into it. Without this, each
                     // request starts with an empty `tried_accounts` and
                     // re-discovers the same limit, burning a request per hop.
+                    //
+                    // This records the limit in the per-account usage cache too,
+                    // which is what the rotation decision reads. Recording only
+                    // the cooldown left a stale "has headroom" snapshot in place,
+                    // so the candidate list kept offering the blocked account
+                    // and the "every account is spent" fast-fail never fired.
+                    // See ADR-0017.
                     if let Some(label) = current_account
                         .clone()
                         .or_else(|| Some(auth::claude::primary_account_label()))
                     {
-                        jcode_base::provider::note_account_rate_limited(
+                        jcode_base::provider::note_account_rate_limited_with_reset(
                             jcode_provider_core::ActiveProvider::Claude,
                             &label,
+                            account_reset_hint(&label),
                         );
                     }
                     match switch_to_next_claude_account(&credentials, &mut tried_accounts).await {
-                        Some((switched_label, switched_token)) => {
+                        Some(switched) => {
+                            let AccountSwitch {
+                                label: switched_label,
+                                token: switched_token,
+                                claimed_shared_override,
+                            } = switched;
                             let previous_label = current_account
                                 .clone()
                                 .unwrap_or_else(auth::claude::primary_account_label);
@@ -2056,10 +2085,19 @@ async fn run_stream_with_retries(
                             // The client renders usage from its own process and
                             // cannot see this process's account override, so a
                             // rotation is invisible to it unless announced.
-                            jcode_base::bus::Bus::global().publish_anthropic_account_rotated(
-                                switched_label.clone(),
-                                Some(previous_label.clone()),
-                            );
+                            //
+                            // Announced only when this request actually moved the
+                            // shared override. Otherwise the switch is local to
+                            // this request, and the broadcast carries no session
+                            // id (ADR-0011), so it would repoint every other
+                            // session's usage widget at an account they are not
+                            // on. See ADR-0018.
+                            if claimed_shared_override {
+                                jcode_base::bus::Bus::global().publish_anthropic_account_rotated(
+                                    switched_label.clone(),
+                                    Some(previous_label.clone()),
+                                );
+                            }
                             jcode_base::logging::info(&format!(
                                 "Same-provider account failover: Anthropic rate-limited ({}); retrying '{}' on account '{}'",
                                 e, model_name, switched_label
@@ -2130,7 +2168,12 @@ async fn run_stream_with_retries(
                             }))
                             .await;
                     }
+                    // A server `retry-after` still wins, but capped: Anthropic
+                    // sends the same `retry-after: 60` for a burst as for a
+                    // spent quota, and four consecutive minutes of silence is
+                    // the wrong response to either. See ADR-0016.
                     let delay = jcode_provider_core::retry_after::retry_after_from_error(&e)
+                        .map(|hint| hint.min(MAX_BURST_RETRY_AFTER))
                         .unwrap_or_else(|| {
                             jcode_provider_core::attempt_tracker::retry_backoff_delay(
                                 rate_limit_retries,
@@ -2157,6 +2200,32 @@ async fn run_stream_with_retries(
                     next_retry_delay = Some(delay);
                     last_error = Some(e);
                     continue;
+                }
+
+                // Every account's quota really is spent. Waiting cannot help, so
+                // say when it *can*: a bare 429 plus an offer to downgrade the
+                // model reads as a jcode fault and hides the one fact the user
+                // needs, which is that the quota returns at a specific time.
+                // Costs nothing on the happy path, and reads only cached usage.
+                //
+                // Announced at most once per turn: this branch is reached by
+                // every subsequent failing attempt, and repeating the same
+                // countdown reads as progress when nothing is progressing.
+                if !announced_quota_exhaustion
+                    && jcode_base::provider::error_looks_like_usage_limit(&error_str)
+                    && let Some((label, resets_in)) = jcode_base::provider::earliest_account_reset(
+                        jcode_provider_core::ActiveProvider::Claude,
+                    )
+                {
+                    announced_quota_exhaustion = true;
+                    let _ = tx
+                        .send(Ok(StreamEvent::StatusDetail {
+                            detail: format!(
+                                "⛔ Every Anthropic account is out of quota; earliest reset {} ({})",
+                                resets_in, label
+                            ),
+                        }))
+                        .await;
                 }
 
                 // Capacity rejection (`overloaded_error` / HTTP 529). Retryable,
@@ -2281,8 +2350,17 @@ fn next_untried_account<'a>(candidates: &'a [String], tried: &[String]) -> Optio
         .find(|candidate| !tried.iter().any(|seen| seen == candidate))
 }
 
-/// Point the process-wide Anthropic account override at the next untried
-/// account and return its label plus a usable access token.
+/// Outcome of a successful account rotation.
+struct AccountSwitch {
+    label: String,
+    token: String,
+    /// Whether this rotation moved the process-wide override, and so whether the
+    /// switch is visible to other sessions on this daemon.
+    claimed_shared_override: bool,
+}
+
+/// Point this request at the next untried account and return its label plus a
+/// usable access token.
 ///
 /// Accounts whose credentials cannot be loaded or refreshed are recorded as
 /// tried, skipped, and rolled back, so one broken login neither blocks the rest
@@ -2292,7 +2370,7 @@ fn next_untried_account<'a>(candidates: &'a [String], tried: &[String]) -> Optio
 async fn switch_to_next_claude_account(
     credentials: &Arc<RwLock<Option<CachedCredentials>>>,
     tried: &mut Vec<String>,
-) -> Option<(String, String)> {
+) -> Option<AccountSwitch> {
     loop {
         let candidates = jcode_base::provider::account_failover_candidates(
             jcode_provider_core::ActiveProvider::Claude,
@@ -2301,23 +2379,57 @@ async fn switch_to_next_claude_account(
         tried.push(label.clone());
 
         let override_before = auth::claude::active_account_label();
-        auth::claude::set_active_account_override(Some(label.clone()));
-        jcode_base::auth::AuthStatus::invalidate_cached_status();
+
+        // The override is process-wide and one daemon serves many sessions
+        // (ADR-0009), so several sessions sharing two accounts used to push each
+        // other back and forth: A rotates everyone to claude-1, B hits a burst
+        // there and rotates everyone back to claude-2, and so on, which is the
+        // `claude-2 → claude-1 → claude-2` flapping users see.
+        //
+        // A rotation still moves *this* request, but it only rewrites the shared
+        // override when it has something better to say: when the account already
+        // active is one this request has proven refuses it. If another session
+        // has meanwhile settled on a different account, and this request has not
+        // yet tried it, leave the shared pointer alone rather than dragging that
+        // session off a working account. See ADR-0018.
+        let claim_shared_override = override_before
+            .as_deref()
+            .map(|active| tried.iter().any(|seen| seen == active))
+            .unwrap_or(true);
+
+        if claim_shared_override {
+            auth::claude::set_active_account_override(Some(label.clone()));
+            jcode_base::auth::AuthStatus::invalidate_cached_status();
+        }
 
         match credentials_for_claude_account(&label).await {
             Ok(fresh) => {
                 let access_token = fresh.access_token.clone();
                 let mut cached = credentials.write().await;
                 *cached = Some(fresh);
-                return Some((label, access_token));
+                // Confirm the new account's real headroom in the background, so
+                // the *next* decision is based on fresh data rather than on
+                // whatever this rotation happened to believe. Deliberately not
+                // awaited: a blocking probe here would add a network round trip
+                // in front of every rotation, on the exact path the user already
+                // experiences as a stall, and the probe endpoint can itself be
+                // rate-limited. See ADR-0017.
+                spawn_account_usage_refresh(label.clone());
+                return Some(AccountSwitch {
+                    label,
+                    token: access_token,
+                    claimed_shared_override: claim_shared_override,
+                });
             }
             Err(err) => {
                 jcode_base::logging::warn(&format!(
                     "Cannot use Anthropic account '{}' for account failover: {:#}",
                     label, err
                 ));
-                auth::claude::set_active_account_override(override_before);
-                jcode_base::auth::AuthStatus::invalidate_cached_status();
+                if claim_shared_override {
+                    auth::claude::set_active_account_override(override_before);
+                    jcode_base::auth::AuthStatus::invalidate_cached_status();
+                }
             }
         }
     }
@@ -2351,6 +2463,68 @@ async fn credentials_for_claude_account(label: &str) -> Result<CachedCredentials
         refresh_token: refreshed.refresh_token,
         expires_at: refreshed.expires_at,
     })
+}
+
+/// Whether a rotation should kick a background usage refresh.
+///
+/// Always on in production. Off by default under `cfg(test)` and switchable per
+/// test, because the refresh is a detached task that writes to a process-global
+/// cache: it outlived its own test, deleted the usage snapshots a *later* test
+/// had seeded, and replaced them with probe errors, flipping that test's
+/// quota-versus-burst verdict. Seen as `a_burst_limit_that_clears_lets_the_turn_finish`
+/// failing roughly one run in four while passing under `--test-threads=1`.
+#[cfg(test)]
+static POST_ROTATION_USAGE_REFRESH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable or disable the post-rotation usage refresh for one test.
+#[cfg(test)]
+pub(crate) fn set_post_rotation_usage_refresh_for_tests(enabled: bool) {
+    POST_ROTATION_USAGE_REFRESH.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn post_rotation_usage_refresh_enabled() -> bool {
+    #[cfg(test)]
+    {
+        POST_ROTATION_USAGE_REFRESH.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+/// Refresh `label`'s usage snapshot in the background.
+///
+/// Fire and forget on purpose: the value is for the *next* decision, not this
+/// one, so nothing waits on it and a failure only leaves the verdict unknown,
+/// which the rotation logic already handles as "not exhausted".
+fn spawn_account_usage_refresh(label: String) {
+    if !post_rotation_usage_refresh_enabled() {
+        return;
+    }
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        if let Err(err) = jcode_base::usage::refresh_account_usage(&label).await {
+            jcode_base::logging::info(&format!(
+                "Could not refresh usage for Anthropic account '{}' after rotation: {:#}",
+                label, err
+            ));
+        }
+    });
+}
+
+/// The reset time already known for `label`, from cached usage only.
+///
+/// Never fetches. This runs on the failure path of a live request, where a
+/// network round trip is exactly the latency the user is complaining about, and
+/// the probe endpoint can itself be rate-limited. A missing hint simply means the
+/// 429 is treated as an unexplained burst, which is the safe reading.
+fn account_reset_hint(label: &str) -> Option<String> {
+    jcode_base::usage::cached_anthropic_account_usage_any_age(label)
+        .and_then(|usage| usage.blocking_reset_at())
 }
 
 /// Whether a finished request still owes the account override a rollback.

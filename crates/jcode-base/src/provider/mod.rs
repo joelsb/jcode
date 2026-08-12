@@ -47,12 +47,14 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 pub use account_failover::account_failover_candidates;
 pub use account_failover::all_accounts_quota_exhausted;
+pub use account_failover::earliest_account_reset;
 pub use account_failover::error_looks_like_usage_limit;
 pub use account_failover::prefer_account_failover_enabled;
 pub use account_failover::with_quota_exhausted_override;
 pub use account_failover::{
-    account_is_cooling_down, clear_account_cooldown, clear_all_account_cooldowns,
-    note_account_rate_limited,
+    account_is_cooling_down, clear_account_cooldown, clear_account_rate_limit,
+    clear_all_account_cooldowns, note_account_rate_limited, note_account_rate_limited_until,
+    note_account_rate_limited_with_reset,
 };
 pub use catalog_routes::{
     append_simplified_anthropic_model_routes, remote_current_openai_compatible_route_for_model,

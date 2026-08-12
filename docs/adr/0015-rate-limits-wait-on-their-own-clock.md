@@ -90,6 +90,14 @@ So a rate limit is now recorded per account, with a 60s cooldown, and cooling-do
 
 The window is short on purpose. It exists to stop the *next* request re-proving what the last one just learned, not to take an account out of service; a burst clears in seconds, and 60s is comfortably longer than that while still expiring well inside a normal working session.
 
+## Correction: the exhaustion verdict this ADR relies on was wrong
+
+The amendment above gates the waiting on `all_accounts_exhausted()`, and calls that a reliable way to tell a spent quota from a burst. It was not, and this ADR's central promise, "a genuinely exhausted quota fails as fast as before", did not hold in practice.
+
+The underlying predicate required *both* the 5-hour and weekly windows to be full. An account at 5h=100% / 7d=49% is blocked for hours and reported as having headroom, so the fast-fail never fired and exactly the behaviour this ADR set out to prevent, minutes of waiting on a limit that cannot clear, is what a user hit on 2026-08-12. The `~75s` figure was also optimistic: Anthropic attaches `retry-after: 60` to a quota 429, and this ADR lets a server hint win unconditionally, so the real wait was four full minutes.
+
+Corrected in [ADR-0016](0016-exhaustion-is-any-window-not-every-window.md), which makes exhaustion a disjunction, caps the honoured `retry-after` on the burst path, and adds a reset countdown to the terminal failure. The retry-budget and separate-clock decisions recorded here stand unchanged; only the verdict feeding them was broken. Recorded rather than edited away because the reasoning that failed, trusting a probe's summary field without checking the predicate behind it, is the useful part.
+
 ## Consequences
 
 A burst limit that clears within ~75s now finishes the user's turn instead of failing it. That is the common case when several agents share two accounts, which is exactly the swarm workload that triggered this.
