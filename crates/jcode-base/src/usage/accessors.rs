@@ -219,12 +219,18 @@ pub fn has_extra_usage() -> bool {
 /// Used for account rotation - checks if a particular account is exhausted.
 /// Returns an error if the fetch fails (network, auth, etc.).
 /// Results are cached per-account to avoid hammering the API.
+///
+/// Keyed by `label`, not by access token. It used to key by token prefix, which
+/// meant this path and the `/usage` path wrote *different* entries for the same
+/// account, and neither could invalidate the other's. A token rotation also
+/// silently orphaned the old entry. See ADR-0017.
 pub fn fetch_usage_for_account_sync(
+    label: &str,
     access_token: &str,
     refresh_token: &str,
     expires_at: i64,
 ) -> Result<UsageData> {
-    let cache_key = anthropic_usage_cache_key(access_token, None);
+    let cache_key = anthropic_usage_cache_key(access_token, Some(label));
 
     if let Some(cached) = cached_anthropic_usage(&cache_key) {
         return Ok(cached);
@@ -298,10 +304,25 @@ fn anthropic_account_usage_probe_sync() -> Option<AccountUsageProbe> {
 
     let mut snapshots = Vec::with_capacity(accounts.len());
     for account in &accounts {
-        let usage = if account.label == current_label && active_cached.fetched_at.is_some() {
+        // Per-account cache first, for *every* account including the active one.
+        //
+        // The active account used to be served straight from the single-slot
+        // `get_sync()` snapshot, which is account-blind and knows nothing about a
+        // 429 recorded against this label. That made the rate-limit evidence
+        // from `note_anthropic_account_rate_limited` invisible on exactly the
+        // account that had just been refused, which is the one the decision is
+        // about. See ADR-0017.
+        let usage = if let Some(cached) = cached_anthropic_account_usage(&account.label) {
+            Ok(cached)
+        } else if account.label == current_label && active_cached.fetched_at.is_some() {
             Ok(active_cached.clone())
         } else {
-            fetch_usage_for_account_sync(&account.access, &account.refresh, account.expires)
+            fetch_usage_for_account_sync(
+                &account.label,
+                &account.access,
+                &account.refresh,
+                account.expires,
+            )
         };
 
         match usage {
@@ -407,6 +428,38 @@ async fn fetch_usage_for_account(
 pub async fn fetch_usage_for_access_token(access_token: &str) -> Result<UsageData> {
     let cache_key = anthropic_usage_cache_key(access_token, None);
     fetch_anthropic_usage_data(access_token.to_string(), cache_key).await
+}
+
+/// Refresh and cache the usage snapshot for one Anthropic account, by label.
+///
+/// Bypasses the freshness TTL: callers use this when they have a *reason* to
+/// believe the cached verdict is wrong (an account rotation just happened, a 429
+/// just arrived), which is precisely when the TTL is the wrong gate.
+///
+/// Errors are returned rather than cached as exhaustion: a failed probe means
+/// "unknown", and recording it as a limit would take a healthy account out of
+/// rotation because its usage endpoint was briefly unreachable.
+pub async fn refresh_account_usage(label: &str) -> Result<UsageData> {
+    let accounts = auth::claude::list_accounts()?;
+    let account = accounts
+        .into_iter()
+        .find(|account| account.label == label)
+        .with_context(|| format!("No Anthropic account labelled '{label}'"))?;
+
+    if account.expires < chrono::Utc::now().timestamp_millis() {
+        anyhow::bail!("OAuth token for account '{label}' is expired");
+    }
+
+    // Drop the existing entry first. `fetch_anthropic_usage_data` returns the
+    // cached value when one is still fresh, so refreshing over a live entry
+    // would return the very snapshot this call exists to replace.
+    invalidate_anthropic_account_usage(label);
+
+    fetch_anthropic_usage_data(
+        account.access.clone(),
+        anthropic_usage_cache_key(&account.access, Some(label)),
+    )
+    .await
 }
 
 /// Get usage data synchronously (returns cached data, triggers refresh if stale)

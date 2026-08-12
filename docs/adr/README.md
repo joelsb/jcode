@@ -30,4 +30,7 @@ Format: Michael Nygard's ADR template, trimmed to the sections this codebase act
 | [0012](0012-announce-a-dead-end-restore-as-its-own-outcome.md) | Announce a dead-end restore as its own outcome, not as a switch | Accepted |
 | [0013](0013-capacity-rejections-retry-on-their-own-budget.md) | Anthropic capacity rejections retry on their own budget and clock | Accepted |
 | [0014](0014-recover-outer-terminal-image-protocol-behind-a-multiplexer.md) | Recover the outer terminal's image protocol from env markers that survive a multiplexer | Accepted |
-| [0015](0015-rate-limits-wait-on-their-own-clock.md) | A rate limit that outlives account rotation waits on its own budget and clock | Accepted |
+| [0015](0015-rate-limits-wait-on-their-own-clock.md) | A rate limit that outlives account rotation waits on its own budget and clock | Accepted, exhaustion predicate superseded by 0016 |
+| [0016](0016-exhaustion-is-any-window-not-every-window.md) | An account is exhausted when *any* usage window is spent, not every one | Accepted |
+| [0017](0017-invalidate-the-cache-the-decision-reads.md) | Invalidate and correct the per-account usage cache the rotation decision reads | Accepted |
+| [0018](0018-claim-the-shared-account-override-only-when-better-informed.md) | A rotation claims the shared account override only when better informed | Accepted |

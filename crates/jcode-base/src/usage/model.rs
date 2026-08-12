@@ -85,6 +85,53 @@ impl UsageData {
         })
     }
 
+    /// Utilization at or above which Anthropic refuses further requests on a
+    /// window. Not 1.0: the reported ratio is rounded, and a window displayed
+    /// as 100% has already started refusing.
+    pub const EXHAUSTED_RATIO: f32 = 0.99;
+
+    /// Whether *any* window is spent, and so the account cannot serve a request
+    /// until that window resets.
+    ///
+    /// Anthropic applies the 5-hour and 7-day limits independently and blocks a
+    /// request when **either** is full, so this is a disjunction. It read
+    /// `five_hour >= 0.99 && seven_day >= 0.99` until 2026-08-12, which made an
+    /// account at 5h=100% / 7d=49% report as having headroom: rotation kept
+    /// selecting the blocked account, the "every account is exhausted"
+    /// fast-fail never fired, and a turn spent ~4 minutes waiting out a limit
+    /// that could not clear for hours. See ADR-0016.
+    pub fn exhausted(&self) -> bool {
+        self.five_hour >= Self::EXHAUSTED_RATIO || self.seven_day >= Self::EXHAUSTED_RATIO
+    }
+
+    /// When the window that is actually blocking will reset.
+    ///
+    /// The reset time only means something when paired with the window it
+    /// belongs to. Reporting the 5-hour reset for an account blocked by its
+    /// 7-day window would promise recovery hours before it can happen, so this
+    /// picks the reset of a spent window, preferring the sooner of the two when
+    /// both are spent, and falls back to whatever reset is known otherwise.
+    pub fn blocking_reset_at(&self) -> Option<String> {
+        let five_hour_spent = self.five_hour >= Self::EXHAUSTED_RATIO;
+        let seven_day_spent = self.seven_day >= Self::EXHAUSTED_RATIO;
+
+        match (five_hour_spent, seven_day_spent) {
+            // Both spent: the account is usable again only once the later one
+            // clears, but the sooner reset is the honest "check back at" time,
+            // and `usage_reset_passed` re-probes from there.
+            (true, true) => self
+                .five_hour_resets_at
+                .clone()
+                .or_else(|| self.seven_day_resets_at.clone()),
+            (true, false) => self.five_hour_resets_at.clone(),
+            (false, true) => self.seven_day_resets_at.clone(),
+            (false, false) => self
+                .five_hour_resets_at
+                .clone()
+                .or_else(|| self.seven_day_resets_at.clone()),
+        }
+    }
+
     /// Check if data is stale and should be refreshed
     pub fn is_stale(&self) -> bool {
         if usage_reset_passed([
@@ -226,6 +273,15 @@ impl OpenAIUsageData {
         }
     }
 
+    /// Whether *any* reported window is spent.
+    ///
+    /// Same disjunction as [`UsageData::exhausted`] and for the same reason: a
+    /// provider refuses the request as soon as one window fills, so requiring
+    /// every window to be full reports a blocked account as usable. See
+    /// ADR-0016.
+    ///
+    /// Only windows the provider actually reported are considered, so a missing
+    /// window is not read as either full or free.
     pub fn exhausted(&self) -> bool {
         if self.hard_limit_reached {
             return true;
@@ -235,11 +291,33 @@ impl OpenAIUsageData {
             return false;
         }
 
-        let mut windows = [self.five_hour.as_ref(), self.seven_day.as_ref()]
+        [self.five_hour.as_ref(), self.seven_day.as_ref()]
             .into_iter()
             .flatten()
-            .peekable();
-        windows.peek().is_some() && windows.all(|window| window.usage_ratio >= 0.99)
+            .any(|window| window.usage_ratio >= UsageData::EXHAUSTED_RATIO)
+    }
+
+    /// When the window that is actually blocking will reset, preferring a spent
+    /// window's reset over an unspent one's. Same reasoning as
+    /// [`UsageData::blocking_reset_at`].
+    pub fn blocking_reset_at(&self) -> Option<String> {
+        let windows = [
+            self.five_hour.as_ref(),
+            self.seven_day.as_ref(),
+            self.spark.as_ref(),
+        ];
+
+        windows
+            .into_iter()
+            .flatten()
+            .filter(|window| window.usage_ratio >= UsageData::EXHAUSTED_RATIO)
+            .find_map(|window| window.resets_at.clone())
+            .or_else(|| {
+                windows
+                    .into_iter()
+                    .flatten()
+                    .find_map(|window| window.resets_at.clone())
+            })
     }
 
     pub fn diagnostic_fields(&self) -> String {

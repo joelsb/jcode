@@ -1137,6 +1137,7 @@ fn profile_catalog_cache_needs_refresh_for_missing_cache() {
 /// nothing carried that knowledge forward.
 #[test]
 fn a_rate_limited_account_is_remembered_across_requests() {
+    let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
     use crate::provider::{
         account_is_cooling_down, clear_account_cooldown, clear_all_account_cooldowns,
         note_account_rate_limited,
@@ -1177,10 +1178,13 @@ fn a_rate_limited_account_is_remembered_across_requests() {
     clear_all_account_cooldowns();
 }
 
-/// A cooling-down account must be *deprioritised*, never dropped: when every
-/// account is limited it is still the only thing left to try.
+/// A cooling-down account must be *skipped while an alternative exists*, and
+/// still offered when it is the only thing left: dropping it outright would turn
+/// a recoverable rate limit into a hard failure (ADR-0015), while merely sorting
+/// it last let a spent account be picked whenever every candidate was cooling.
 #[test]
-fn cooling_down_accounts_sort_last_but_remain_candidates() {
+fn cooling_down_accounts_are_skipped_but_remain_a_last_resort() {
+    let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
     use crate::provider::account_failover::same_provider_account_candidates_for_tests;
     use crate::provider::{clear_all_account_cooldowns, note_account_rate_limited};
     use jcode_provider_core::ActiveProvider;
@@ -1204,12 +1208,81 @@ fn cooling_down_accounts_sort_last_but_remain_candidates() {
     );
     assert_eq!(
         ordered,
-        vec!["claude-2".to_string(), "claude-1".to_string()],
-        "the account that just refused must be tried last, not first"
+        vec!["claude-2".to_string()],
+        "the account that just refused must not be offered while a healthy one exists"
+    );
+
+    // Now every account is limited, so the cooling ones are all that is left.
+    note_account_rate_limited(ActiveProvider::Claude, "claude-2");
+    let ordered = same_provider_account_candidates_for_tests(
+        ActiveProvider::Claude,
+        vec!["claude-1".to_string(), "claude-2".to_string()],
+    );
+    assert_eq!(
+        ordered.len(),
+        2,
+        "when everything is limited every account must stay a candidate: {:?}",
+        ordered
+    );
+
+    clear_all_account_cooldowns();
+}
+
+/// A rate limit that names a reset must be remembered until that reset, not for
+/// a flat 60s.
+///
+/// This is the defect behind the observed ping-pong: `claude-2` was blocked for
+/// ~3 hours by a spent 5-hour window, the cooldown forgot it after a minute, and
+/// rotation selected it again, and again.
+#[test]
+fn a_known_reset_outlasts_the_burst_cooldown() {
+    let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
+    use crate::provider::account_failover::same_provider_account_candidates_for_tests;
+    use crate::provider::{
+        clear_all_account_cooldowns, note_account_rate_limited, note_account_rate_limited_until,
+    };
+    use jcode_provider_core::ActiveProvider;
+
+    clear_all_account_cooldowns();
+
+    // A reset three hours out, i.e. far beyond the 60s burst window.
+    note_account_rate_limited_until(
+        ActiveProvider::Claude,
+        "claude-2",
+        Some(chrono::Utc::now() + chrono::Duration::hours(3)),
+    );
+
+    assert!(
+        crate::provider::account_is_cooling_down(ActiveProvider::Claude, "claude-2"),
+        "an account with a 3h reset must still be on cooldown"
+    );
+    assert_eq!(
+        same_provider_account_candidates_for_tests(
+            ActiveProvider::Claude,
+            vec!["claude-2".to_string(), "claude-1".to_string()],
+        ),
+        vec!["claude-1".to_string()],
+        "the quota-blocked account must be skipped in favour of the healthy one"
+    );
+
+    // A later burst-shaped note must not shorten a known long cooldown.
+    note_account_rate_limited(ActiveProvider::Claude, "claude-2");
+    assert!(
+        crate::provider::account_is_cooling_down(ActiveProvider::Claude, "claude-2"),
+        "a 60s note arriving later must not shrink the 3h deadline"
+    );
+
+    // A reset already in the past carries no information about the future, and
+    // must fall back to the short burst window rather than expiring instantly.
+    clear_all_account_cooldowns();
+    note_account_rate_limited_until(
+        ActiveProvider::Claude,
+        "claude-1",
+        Some(chrono::Utc::now() - chrono::Duration::hours(1)),
     );
     assert!(
-        ordered.contains(&"claude-1".to_string()),
-        "it must still be a candidate: when everything is limited it is all we have"
+        crate::provider::account_is_cooling_down(ActiveProvider::Claude, "claude-1"),
+        "a past reset must still produce the short burst cooldown, not zero"
     );
 
     clear_all_account_cooldowns();
