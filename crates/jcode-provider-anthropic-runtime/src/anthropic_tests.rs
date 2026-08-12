@@ -2064,6 +2064,16 @@ struct MockAnthropicServer {
 
 impl MockAnthropicServer {
     async fn start(mut respond: impl FnMut(u32) -> (u16, String) + Send + 'static) -> Self {
+        Self::start_with_request_inspection(move |call_no, _authorization| respond(call_no)).await
+    }
+
+    /// Like [`Self::start`], but the responder also sees the request's
+    /// `Authorization` header, so a test can answer differently per *account*
+    /// rather than per call number. Needed to observe which account a rotation
+    /// actually landed on, which call-ordering alone cannot distinguish.
+    async fn start_with_request_inspection(
+        mut respond: impl FnMut(u32, &str) -> (u16, String) + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let authorizations = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2077,9 +2087,12 @@ impl MockAnthropicServer {
                 };
                 call_no += 1;
                 let authorization = read_request_authorization(&mut socket).await;
-                authorizations_task.lock().unwrap().push(authorization);
+                authorizations_task
+                    .lock()
+                    .unwrap()
+                    .push(authorization.clone());
 
-                let (status, body) = respond(call_no);
+                let (status, body) = respond(call_no, &authorization);
                 let response = format!(
                     "HTTP/1.1 {status} {reason}\r\ncontent-type: text/event-stream\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n{body}",
                     status = status,
@@ -2435,6 +2448,16 @@ async fn run_stream_with_retries_bounds_rotation_attempts_and_restores_original_
     let temp = tempfile::TempDir::new().unwrap();
     let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
     seed_two_claude_accounts();
+    // Force the quota verdict rather than depending on ambient cache state.
+    //
+    // The per-account usage cache is process-global and keyed by label, so any
+    // other test that seeds or probes `claude-1`/`claude-2` decides this test's
+    // quota-versus-burst branch for it. Seeding the cache here is not enough
+    // either, because a detached post-rotation refresh from another test can
+    // overwrite it mid-run. The thread-local override is the seam built for
+    // exactly this (see `with_quota_exhausted_override`), and `false` states the
+    // premise of this test: nothing is out of quota, so every 429 is a burst.
+    jcode_base::provider::clear_all_account_cooldowns();
 
     let candidates = jcode_base::provider::account_failover_candidates(
         jcode_provider_core::ActiveProvider::Claude,
@@ -2453,18 +2476,21 @@ async fn run_stream_with_retries_bounds_rotation_attempts_and_restores_original_
         "claude-3-5-haiku-20241022".to_string(),
     ));
 
-    run_stream_with_retries(
-        Client::new(),
-        "fixture-access-claude-1".to_string(),
-        true,
-        e2e_test_request(),
-        tx,
-        Arc::new(RwLock::new(None)),
-        "claude-3-5-haiku-20241022".to_string(),
-        "test-session".to_string(),
-        model_state,
-    )
-    .await;
+    // The override is thread-local and the runtime is multi-threaded, so it is
+    // set inside the same future that runs the loop.
+    jcode_base::provider::with_quota_exhausted_override(Some(false), || {
+        futures::executor::block_on(run_stream_with_retries(
+            Client::new(),
+            "fixture-access-claude-1".to_string(),
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+        ));
+    });
 
     set_test_api_url_override(None);
 
@@ -2519,7 +2545,7 @@ async fn switch_to_next_claude_account_terminates_once_candidates_are_exhausted(
 
     let first = switch_to_next_claude_account(&credentials, &mut tried).await;
     assert_eq!(
-        first.as_ref().map(|(label, _)| label.as_str()),
+        first.as_ref().map(|switch| switch.label.as_str()),
         Some("claude-2"),
         "the only untried candidate must be picked"
     );
@@ -2707,6 +2733,16 @@ async fn a_burst_limit_that_clears_lets_the_turn_finish() {
     let temp = tempfile::TempDir::new().unwrap();
     let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
     seed_two_claude_accounts();
+    // Force the quota verdict rather than depending on ambient cache state.
+    //
+    // The per-account usage cache is process-global and keyed by label, so any
+    // other test that seeds or probes `claude-1`/`claude-2` decides this test's
+    // quota-versus-burst branch for it. Seeding the cache here is not enough
+    // either, because a detached post-rotation refresh from another test can
+    // overwrite it mid-run. The thread-local override is the seam built for
+    // exactly this (see `with_quota_exhausted_override`), and `false` states the
+    // premise of this test: nothing is out of quota, so every 429 is a burst.
+    jcode_base::provider::clear_all_account_cooldowns();
 
     // 429 for the first four calls (initial + rotation + two waits), then the
     // burst window passes and the request succeeds.
@@ -2725,18 +2761,21 @@ async fn a_burst_limit_that_clears_lets_the_turn_finish() {
         "claude-3-5-haiku-20241022".to_string(),
     ));
 
-    run_stream_with_retries(
-        Client::new(),
-        "fixture-access-claude-1".to_string(),
-        true,
-        e2e_test_request(),
-        tx,
-        Arc::new(RwLock::new(None)),
-        "claude-3-5-haiku-20241022".to_string(),
-        "test-session".to_string(),
-        model_state,
-    )
-    .await;
+    // The override is thread-local and the runtime is multi-threaded, so it is
+    // set inside the same future that runs the loop.
+    jcode_base::provider::with_quota_exhausted_override(Some(false), || {
+        futures::executor::block_on(run_stream_with_retries(
+            Client::new(),
+            "fixture-access-claude-1".to_string(),
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+        ));
+    });
 
     set_test_api_url_override(None);
 
@@ -2830,4 +2869,173 @@ async fn a_spent_quota_fails_fast_instead_of_waiting_out_a_burst() {
         burst_calls > spent_calls,
         "a burst limit must still be waited out ({burst_calls} vs {spent_calls} calls)"
     );
+}
+
+/// A spent 5-hour window must make the turn fail *fast*, on the exact numbers
+/// from the 2026-08-12 incident.
+///
+/// This drives the real retry loop with the real usage probe (no
+/// `with_quota_exhausted_override`), against a server that answers 429 for every
+/// account, and seeds the per-account usage cache with what the user actually
+/// had: `claude-2` at 5h=100% / 7d=49% and `claude-1` at 5h=100% / 7d=24%. Both
+/// accounts are therefore quota-blocked for hours, so the correct behaviour is
+/// to stop after proving it once per account, with no waits.
+///
+/// Measured as a *request count* rather than as elapsed time, so it stays honest
+/// under the `clamp_retry_delay` test clamp: waiting costs extra requests, and
+/// `MAX_RATE_LIMIT_RETRIES` waits would push it well past the rotation budget.
+///
+/// Negative control: restoring `exhausted` to `five_hour && seven_day` makes
+/// every account look like it has headroom, the quota fast-fail stops firing,
+/// and the count jumps from 3 to 7. Verified by hand on 2026-08-12; that is the
+/// four-minute hang the user reported, in test form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spent_five_hour_window_fails_fast_instead_of_waiting_minutes() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::provider::clear_all_account_cooldowns();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+
+    // Seeded as usage snapshots, deliberately *not* via the 429 path: that path
+    // also sets a rotation cooldown, and a cooldown alone is enough to steer
+    // rotation, which would hide whether the `exhausted` predicate is right.
+    let reset = (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339();
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(
+        "claude-2",
+        1.0,
+        0.49,
+        Some(reset.clone()),
+    );
+    jcode_base::usage::seed_anthropic_account_usage_for_tests("claude-1", 1.0, 0.24, Some(reset));
+
+    let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+    set_test_api_url_override(Some(server.url()));
+
+    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+    let model_state = Arc::new(std::sync::RwLock::new(
+        "claude-3-5-haiku-20241022".to_string(),
+    ));
+
+    run_stream_with_retries(
+        Client::new(),
+        "fixture-access-claude-1".to_string(),
+        true,
+        e2e_test_request(),
+        tx,
+        Arc::new(RwLock::new(None)),
+        "claude-3-5-haiku-20241022".to_string(),
+        "test-session".to_string(),
+        model_state,
+    )
+    .await;
+
+    set_test_api_url_override(None);
+
+    let mut details = Vec::new();
+    while let Some(event) = rx.recv().await {
+        if let Ok(StreamEvent::StatusDetail { detail }) = event {
+            details.push(detail);
+        }
+    }
+
+    assert_eq!(
+        server.call_count(),
+        (MAX_RETRIES + 1) as usize,
+        "a quota wall must cost one request per account and no waits; details: {details:?}"
+    );
+    assert!(
+        !details
+            .iter()
+            .any(|detail| detail.contains("Every account rate limited; waiting")),
+        "a quota wall must not be waited out as if it were a burst: {details:?}"
+    );
+
+    // And the user must be told when the quota returns, instead of being left
+    // with a bare 429 and an offer to downgrade the model.
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("out of quota") && detail.contains("earliest reset")),
+        "the failure must name the earliest reset time: {details:?}"
+    );
+
+    // The usage cache is process-global, so a seeded verdict must not outlive
+    // this test and steer an unrelated one.
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// A rotation must refresh the new account's usage snapshot, in the background.
+///
+/// Guards the switch that keeps this refresh from leaking across tests: a
+/// `cfg(test)` flag that silently disabled a real feature would be worse than
+/// the flakiness it fixes, so one test turns it on and observes it firing.
+///
+/// Observed through the cache rather than through the network: the refresh
+/// *replaces* whatever entry the rotated-to account had, so a planted sentinel
+/// disappearing is proof the refresh ran. The probe cannot succeed here (the
+/// fixture tokens are not real credentials and the usage endpoint is not mocked),
+/// which is the point: even a failing refresh must invalidate the stale verdict
+/// rather than leave it in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_refreshes_the_new_accounts_usage_in_the_background() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // A stale "has headroom" verdict for the account the rotation will land on.
+    jcode_base::usage::seed_anthropic_account_usage_for_tests("claude-2", 0.10, 0.10, None);
+    assert!(
+        jcode_base::usage::cached_anthropic_account_usage_any_age("claude-2").is_some(),
+        "precondition: claude-2 has a cached verdict"
+    );
+
+    set_post_rotation_usage_refresh_for_tests(true);
+    let credentials: Arc<RwLock<Option<CachedCredentials>>> = Arc::new(RwLock::new(None));
+    let mut tried = vec!["claude-1".to_string()];
+    let switched = switch_to_next_claude_account(&credentials, &mut tried).await;
+    assert_eq!(
+        switched.as_ref().map(|switch| switch.label.as_str()),
+        Some("claude-2"),
+        "precondition: the rotation must land on claude-2"
+    );
+
+    // The refresh is detached, so poll rather than assume it has been scheduled.
+    //
+    // The check is "the seeded verdict is gone", not "the entry is gone": a failed
+    // probe caches an error entry of its own, so the entry can exist again while
+    // still no longer asserting the stale 10% headroom. An error entry reports
+    // `exhausted == false`, i.e. "unknown", which is the correct reading of a
+    // probe that could not be reached.
+    let mut refreshed = false;
+    for _ in 0..100 {
+        match jcode_base::usage::cached_anthropic_account_usage_any_age("claude-2") {
+            None => {
+                refreshed = true;
+                break;
+            }
+            Some(usage) if usage.last_error.is_some() => {
+                refreshed = true;
+                break;
+            }
+            Some(_) => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    set_post_rotation_usage_refresh_for_tests(false);
+
+    assert!(
+        refreshed,
+        "a rotation must not leave the new account's stale usage verdict in place"
+    );
+
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
 }

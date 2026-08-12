@@ -13,12 +13,19 @@ mod provider_fetch;
 pub use accessors::*;
 use api_keys::enqueue_api_key_usage_tasks;
 use cache::*;
+// Explicit: `use cache::*` is a private import, so the per-account cache
+// controls have to be re-exported to reach the provider layer that needs them.
+pub use cache::{
+    cached_anthropic_account_usage_any_age, clear_anthropic_account_usage_for_tests,
+    invalidate_anthropic_account_usage, note_anthropic_account_rate_limited,
+    seed_anthropic_account_usage_for_tests,
+};
 pub use jcode_usage_types::{ProviderUsage, ProviderUsageProgress, UsageLimit};
 pub use model::*;
 use provider_fetch::*;
 
 use anyhow::{Context, Result};
-pub use display::{format_reset_time, format_usage_bar};
+pub use display::{format_reset_time, format_usage_bar, parse_reset_at};
 use display::{format_token_count, humanize_key, provider_usage_cache_is_fresh};
 use openai_helpers::{parse_openai_usage_payload, usage_percent_to_ratio};
 use std::collections::HashMap;
