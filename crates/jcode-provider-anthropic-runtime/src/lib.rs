@@ -2532,12 +2532,54 @@ fn account_reset_hint(label: &str) -> Option<String> {
 /// Only a rotation that ran out of accounts does: if the request is sitting on
 /// an account that worked, that account is the useful one to keep, and if it
 /// never moved there is nothing to undo.
+///
+/// One exception, and it is the whole point of the dead-end restore being
+/// conditional: never hand the session back to an account whose *quota* is
+/// spent. ADR-0003 restores on a dead end because when every account is limited
+/// the original is as good as any other, which is true for a burst limit that
+/// clears in seconds and false for a 5-hour quota with hours left on it. With
+/// the reset times now known (ADR-0016) the two cases are distinguishable, so a
+/// dead end that ends on a merely burst-limited account keeps it rather than
+/// rolling back onto a wall. Without this the *next* turn starts on the blocked
+/// account again, which is the cross-turn half of the flapping users report.
 fn should_restore_account(
     original: &Option<String>,
     ours: &Option<String>,
     rotation_exhausted: bool,
 ) -> bool {
-    rotation_exhausted && ours != original
+    if !rotation_exhausted || ours == original {
+        return false;
+    }
+
+    // Restoring onto a spent quota would undo the one useful thing this request
+    // learned. Only a *known* quota block counts: an unknown verdict keeps the
+    // existing restore behaviour rather than silently changing it.
+    !account_quota_is_blocked(original.as_deref())
+}
+
+/// Whether `label`'s cached usage says a window is spent and has not yet reset.
+///
+/// Reads cache only, at any age; this runs on a request's cleanup path. An
+/// unknown verdict answers `false`, so nothing here can strand a session on an
+/// account merely because its usage could not be probed.
+fn account_quota_is_blocked(label: Option<&str>) -> bool {
+    let Some(label) = label else {
+        // No original override means the primary account, whose label is what
+        // the rest of the rotation machinery uses for exactly this lookup.
+        return account_quota_is_blocked(Some(&auth::claude::primary_account_label()));
+    };
+
+    let Some(usage) = jcode_base::usage::cached_anthropic_account_usage_any_age(label) else {
+        return false;
+    };
+    if !usage.exhausted() {
+        return false;
+    }
+    usage
+        .blocking_reset_at()
+        .and_then(|reset| jcode_base::usage::parse_reset_at(&reset))
+        .map(|reset| reset > chrono::Utc::now())
+        .unwrap_or(false)
 }
 
 /// Put the account override back where the request found it.
