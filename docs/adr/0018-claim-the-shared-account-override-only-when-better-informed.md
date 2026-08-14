@@ -95,3 +95,13 @@ Concurrency reaches this code only as *state another session left behind*: which
 Writing the integration test surfaced a limitation that reading the code had not. `same_provider_account_candidates` excludes the *currently active* account from the candidate list. So with two accounts, the situation this decision guards against cannot arise: if another session holds `claude-1` and this request has already tried `claude-2`, there is no third account left to rotate to, and the rotation ends before the question is asked. The test needs a third account to reach the branch at all.
 
 That materially narrows the claim. For the reported incident, which is two accounts, **this decision changes nothing**; the flapping there is fixed by ADR-0016 and ADR-0017 making the verdict correct, not by this. This matters from three accounts up, and it remains the right shape for a shared pointer, but it should not be credited with fixing the two-account case.
+
+## Correction (2026-08-14): the two-account case was not fixed by 0016/0017 either
+
+The paragraph above says the two-account flapping "is fixed by ADR-0016 and ADR-0017 making the verdict correct". That prediction was wrong, and it is worth recording rather than editing away.
+
+On 2026-08-14 the same alternating pattern reappeared with two accounts, on a binary carrying 0016, 0017, this ADR, *and* the single-session cross-turn fix. Five concurrent sessions, four of them rotating within 25 seconds.
+
+The reason the earlier reasoning missed it: 0016/0017 make each session's verdict correct **given the information it has**, and this ADR gates who may *write* the shared pointer. None of them serialise the *decision*, so with several sessions hitting one limit simultaneously, every session still evaluates a correct-but-stale view and every session still rotates. Correct inputs do not help when the race is in the timing.
+
+Fixed by [ADR-0020](0020-serialise-account-rotation.md), which serialises rotation and has followers adopt the leader's account. The "no-op with only two accounts" observation above remains true of *this* decision in isolation.
