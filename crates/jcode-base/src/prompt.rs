@@ -229,6 +229,10 @@ impl SplitSystemPrompt {
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
+    /// When false (SKILL.md `disable-model-invocation: true`), the skill is
+    /// excluded from the rendered "Available Skills" section. It remains
+    /// invocable by the user via `/name`.
+    pub model_invocable: bool,
 }
 
 const SKILL_DESC_MAX_CHARS: usize = 120;
@@ -248,12 +252,19 @@ fn clip_skill_description(description: &str) -> String {
 }
 
 fn build_available_skills_section(available_skills: &[SkillInfo]) -> Option<String> {
-    if available_skills.is_empty() {
+    // Skills that opt out via `disable-model-invocation: true` are filtered
+    // here, at the single point where the section is rendered, so a new call
+    // site cannot silently re-expose them. They stay usable via `/name`.
+    let listed: Vec<&SkillInfo> = available_skills
+        .iter()
+        .filter(|skill| skill.model_invocable)
+        .collect();
+    if listed.is_empty() {
         return None;
     }
 
     let mut section = "# Available Skills\n\nYou have access to the following skills that the user can invoke with `/skillname`:\n".to_string();
-    for skill in available_skills {
+    for skill in listed {
         section.push_str(&format!(
             "\n- `/{} ` - {}",
             skill.name,

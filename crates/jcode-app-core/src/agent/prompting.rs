@@ -98,6 +98,7 @@ impl Agent {
             .map(|skill| crate::prompt::SkillInfo {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
+                model_invocable: skill.model_invocable,
             })
             .collect();
 

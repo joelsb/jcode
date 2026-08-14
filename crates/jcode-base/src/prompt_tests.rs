@@ -99,6 +99,7 @@ fn full_and_split_prompt_builders_use_the_same_one_line_skill_descriptions() {
     let skills = vec![SkillInfo {
         name: "example".to_string(),
         description: format!("First line\n\t{}", "д".repeat(SKILL_DESC_MAX_CHARS + 20)),
+        model_invocable: true,
     }];
     let expected = build_available_skills_section(&skills).expect("skills section");
 
@@ -595,4 +596,176 @@ fn project_system_prompt_file_replaces_default_base_prompt() {
     assert_eq!(load_base_system_prompt(Some(&dir)), DEFAULT_SYSTEM_PROMPT);
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A skill that opts out via `disable-model-invocation: true` must not appear in
+/// the rendered "Available Skills" section, while normal skills still do.
+///
+/// This guards a real regression: `SkillFrontmatter` used to parse only
+/// `name`/`description`/`allowed-tools`, so serde silently dropped the
+/// `disable-model-invocation` key. The flag therefore looked honoured (it is, in
+/// Claude Code) while every opted-out skill was still advertised to the model,
+/// costing ~2.5k prompt tokens here and inviting unrequested self-invocation.
+/// Names below are real skills that carry the flag on this setup.
+#[test]
+fn opted_out_skills_are_excluded_from_available_skills_section() {
+    let skills = vec![
+        SkillInfo {
+            name: "caveman".to_string(),
+            description: "opted out of model invocation".to_string(),
+            model_invocable: false,
+        },
+        SkillInfo {
+            name: "dain-jira".to_string(),
+            description: "also opted out".to_string(),
+            model_invocable: false,
+        },
+        SkillInfo {
+            name: "browse".to_string(),
+            description: "normal model-invocable skill".to_string(),
+            model_invocable: true,
+        },
+    ];
+
+    let (split, info) = build_system_prompt_split(None, &skills, false, None, None);
+    let rendered = format!("{}\n\n{}", split.static_part, split.dynamic_part);
+
+    assert!(
+        rendered.contains("/browse"),
+        "model-invocable skills must still be listed"
+    );
+    assert!(
+        !rendered.contains("/caveman"),
+        "`disable-model-invocation: true` skill leaked into the system prompt"
+    );
+    assert!(
+        !rendered.contains("/dain-jira"),
+        "`disable-model-invocation: true` skill leaked into the system prompt"
+    );
+    assert!(
+        info.skills_chars > 0,
+        "skills section should still be accounted for"
+    );
+
+    // The non-split builder shares the same renderer; assert it too so a future
+    // divergence between the two paths cannot silently re-expose opted-out skills.
+    let (full, _) = build_system_prompt_full(None, &skills, false, None, None);
+    assert!(full.contains("/browse"));
+    assert!(!full.contains("/caveman"));
+}
+
+/// When every skill opts out, the section must be omitted entirely rather than
+/// emitting an empty "Available Skills" header with no entries.
+#[test]
+fn available_skills_section_is_omitted_when_all_skills_opt_out() {
+    let skills = vec![SkillInfo {
+        name: "caveman".to_string(),
+        description: "opted out".to_string(),
+        model_invocable: false,
+    }];
+
+    let (split, info) = build_system_prompt_split(None, &skills, false, None, None);
+
+    assert!(!split.static_part.contains("# Available Skills"));
+    assert_eq!(info.skills_chars, 0);
+}
+
+/// Frontmatter parsing must actually read the flag. Without this, the filter
+/// above is correct but never triggers in production.
+#[test]
+fn skill_frontmatter_parses_disable_model_invocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let opted_out = dir.path().join("caveman");
+    std::fs::create_dir_all(&opted_out).unwrap();
+    std::fs::write(
+        opted_out.join("SKILL.md"),
+        "---\nname: caveman\ndescription: opted out\ndisable-model-invocation: true\n---\n\nbody\n",
+    )
+    .unwrap();
+
+    let normal = dir.path().join("browse");
+    std::fs::create_dir_all(&normal).unwrap();
+    std::fs::write(
+        normal.join("SKILL.md"),
+        "---\nname: browse\ndescription: normal\n---\n\nbody\n",
+    )
+    .unwrap();
+
+    let mut registry = crate::skill::SkillRegistry::default();
+    registry.load_from_dir_for_test(dir.path()).unwrap();
+
+    assert!(!registry.get("caveman").unwrap().model_invocable);
+    assert!(registry.get("browse").unwrap().model_invocable);
+}
+
+/// Parse the exact frontmatter shapes that exist on disk, including a YAML
+/// folded scalar (`description: >`) with the flag placed *after* the folded
+/// block. The other tests use the inline `description: text` form; a parser that
+/// handled only that form would pass them while silently failing on the real
+/// `~/.jcode/skills/caveman/SKILL.md`, so this pins the real-world shape.
+#[test]
+fn real_world_frontmatter_shapes_parse_the_flag() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Verbatim shape of ~/.jcode/skills/caveman/SKILL.md
+    let folded = dir.path().join("caveman");
+    std::fs::create_dir_all(&folded).unwrap();
+    std::fs::write(
+        folded.join("SKILL.md"),
+        "---\nname: caveman\ndescription: >\n  Ultra-compressed communication mode. Cuts token usage ~75% by dropping\n  filler, articles, and pleasantries while keeping full technical accuracy.\ndisable-model-invocation: true\n---\n\nbody\n",
+    )
+    .unwrap();
+
+    // Verbatim shape of ~/.jcode/skills/grill-me/SKILL.md
+    let inline = dir.path().join("grill-me");
+    std::fs::create_dir_all(&inline).unwrap();
+    std::fs::write(
+        inline.join("SKILL.md"),
+        "---\nname: grill-me\ndescription: A relentless interview to sharpen a plan or design.\ndisable-model-invocation: true\n---\n\nbody\n",
+    )
+    .unwrap();
+
+    let mut registry = crate::skill::SkillRegistry::default();
+    registry.load_from_dir_for_test(dir.path()).unwrap();
+
+    assert!(
+        !registry.get("caveman").unwrap().model_invocable,
+        "folded-scalar description must not break flag parsing"
+    );
+    assert!(!registry.get("grill-me").unwrap().model_invocable);
+}
+
+/// Report the real prompt cost of the skills installed on this machine.
+/// Ignored by default (it reads the developer's own `~/.jcode/skills`), but it
+/// is the only check that measures the actual shipped prompt rather than
+/// synthetic fixtures. Run with:
+///   cargo test -p jcode-base real_installed_skill_cost -- --ignored --nocapture
+#[test]
+#[ignore]
+fn real_installed_skill_cost() {
+    let registry = crate::skill::SkillRegistry::load_global().unwrap();
+    let all = registry.list();
+    let infos: Vec<SkillInfo> = all
+        .iter()
+        .map(|s| SkillInfo {
+            name: s.name.clone(),
+            description: s.description.clone(),
+            model_invocable: s.model_invocable,
+        })
+        .collect();
+
+    let (_, info) = build_system_prompt_with_context(None, &infos, false);
+    let opted_out = all.iter().filter(|s| !s.model_invocable).count();
+
+    println!(
+        "installed={} opted_out={} visible={} skills_chars={} ~tokens={}",
+        all.len(),
+        opted_out,
+        all.len() - opted_out,
+        info.skills_chars,
+        info.skills_chars / 4
+    );
+    for skill in all.iter().filter(|s| s.model_invocable) {
+        println!("  visible: /{}", skill.name);
+    }
 }

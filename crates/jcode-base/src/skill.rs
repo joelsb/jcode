@@ -17,6 +17,11 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub allowed_tools: Option<Vec<String>>,
+    /// False when the SKILL.md frontmatter sets `disable-model-invocation: true`.
+    /// Such skills stay fully usable via explicit `/name` invocation, but are
+    /// omitted from the "Available Skills" system-prompt section so the model is
+    /// never tempted to self-invoke them (and so they cost zero prompt tokens).
+    pub model_invocable: bool,
     pub content: String,
     pub path: PathBuf,
     search_text: String,
@@ -28,6 +33,9 @@ struct SkillFrontmatter {
     description: String,
     #[serde(rename = "allowed-tools")]
     allowed_tools: Option<String>,
+    /// Claude Code compatible opt-out from model-initiated invocation.
+    #[serde(rename = "disable-model-invocation", default)]
+    disable_model_invocation: bool,
 }
 
 /// Registry of available skills
@@ -454,6 +462,18 @@ impl SkillRegistry {
 
     /// Load skills from a directory
     fn load_from_dir(&mut self, dir: &Path) -> Result<()> {
+        self.load_from_dir_inner(dir)
+    }
+
+    /// Test-only wrapper over the private directory loader, so tests can verify
+    /// frontmatter parsing (notably `disable-model-invocation`) without widening
+    /// the real API surface.
+    #[cfg(test)]
+    pub fn load_from_dir_for_test(&mut self, dir: &Path) -> Result<()> {
+        self.load_from_dir_inner(dir)
+    }
+
+    fn load_from_dir_inner(&mut self, dir: &Path) -> Result<()> {
         if !dir.is_dir() {
             return Ok(());
         }
@@ -486,6 +506,7 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            disable_model_invocation,
         } = frontmatter;
 
         let allowed_tools =
@@ -496,6 +517,7 @@ impl SkillRegistry {
             name,
             description,
             allowed_tools,
+            model_invocable: !disable_model_invocation,
             content: body,
             path: path.to_path_buf(),
             search_text,
@@ -946,6 +968,7 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             allowed_tools: None,
+            model_invocable: true,
             content: content.to_string(),
             path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
             search_text: build_skill_search_text(name, description, content),
