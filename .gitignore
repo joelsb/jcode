@@ -22,3 +22,10 @@ captures/
 /*.avif
 /*.mp4
 /*.png
+
+# Local agent scratch: Lavish review artifacts and Superpowers state. These are
+# per-developer working files, not project assets. Left untracked they also mark
+# every build "dirty", which puts a misleading `-dirty` suffix on the installed
+# version string.
+.lavish/
+.superpowers/
