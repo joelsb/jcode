@@ -34,3 +34,4 @@ Format: Michael Nygard's ADR template, trimmed to the sections this codebase act
 | [0016](0016-exhaustion-is-any-window-not-every-window.md) | An account is exhausted when *any* usage window is spent, not every one | Accepted |
 | [0017](0017-invalidate-the-cache-the-decision-reads.md) | Invalidate and correct the per-account usage cache the rotation decision reads | Accepted |
 | [0018](0018-claim-the-shared-account-override-only-when-better-informed.md) | A rotation claims the shared account override only when better informed | Accepted |
+| [0019](0019-only-turn-terminal-events-clear-resumed-turn-state.md) | Only turn-terminal events (Interrupted/Done/Error) clear the re-adopted-turn marker | Accepted |

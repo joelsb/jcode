@@ -1147,3 +1147,88 @@ fn remote_submit_input_never_strands_a_local_pending_turn() {
         "the prompt should be queued for the remote tick loop"
     );
 }
+
+/// Reproduces the token-burning resubmit loop: a busy-rejected user prompt is
+/// re-queued and the client re-adopts the running turn via
+/// `remote_resume_activity`. If a later, unrelated tool-lifecycle event for
+/// that same still-running turn arrives while `current_message_id` is still
+/// `None` (normal: the client never got an id back for the re-adopted turn),
+/// the blanket "clear resume activity on any stream/terminal event" reset
+/// wipes the marker even though the turn has not actually finished. The next
+/// `process_remote_followups` tick then sees `is_processing && current_message_id
+/// == None && remote_resume_activity == None` and treats the re-adopted turn as
+/// a "restored startup/queued followup", flips `is_processing` back to false,
+/// and redispatches the same queued prompt - forever, once per tick, burning
+/// tokens on every redispatch.
+#[test]
+fn busy_rejection_requeue_does_not_resubmit_on_every_tool_event() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+
+    // Simulate the busy-rejection recovery path: a plain user prompt was
+    // submitted while the server was still finishing a prior turn (server_events
+    // ServerEvent::Error{"Already processing a message"} handling).
+    app.rate_limit_pending_message = Some(super::super::PendingRemoteMessage {
+        content: "find the bug and make it only swich accout once!".to_string(),
+        images: vec![],
+        is_system: false,
+        system_reminder: None,
+        auto_retry: false,
+        retry_attempts: 0,
+        retry_at: None,
+    });
+
+    app.handle_server_event(
+        ServerEvent::Error {
+            id: 9,
+            message: "Already processing a message".to_string(),
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+
+    assert!(app.is_processing);
+    assert!(app.current_message_id.is_none());
+    assert!(
+        app.remote_resume_activity.is_some(),
+        "busy rejection must re-adopt the running turn"
+    );
+    assert_eq!(app.queued_messages(), &["find the bug and make it only swich accout once!"]);
+
+    // Track how many times the queued prompt actually gets (re)dispatched.
+    let mut dispatch_count = 0usize;
+
+    // Simulate several ticks, each carrying one unrelated tool-lifecycle event
+    // for the still-running (re-adopted) turn - exactly what the real running
+    // turn produces continuously while the client waits.
+    for _ in 0..5 {
+        app.handle_server_event(
+            ServerEvent::ToolStart {
+                id: "tool_1".to_string(),
+                name: "bash".to_string(),
+            },
+            &mut remote,
+        );
+        rt.block_on(process_remote_followups(&mut app, &mut remote));
+        if app.rate_limit_pending_message.is_some() && app.queued_messages().is_empty() {
+            // The queued prompt was dequeued and sent again: a resubmit.
+            dispatch_count += 1;
+            // Restore back to "busy rejected, still queued" state to let the
+            // loop keep going, mirroring the real server rejecting it again.
+            let pending = app.rate_limit_pending_message.take().unwrap();
+            app.is_processing = false;
+            app.current_message_id = None;
+            app.queued_messages.push(pending.content);
+        }
+    }
+
+    assert_eq!(
+        dispatch_count, 0,
+        "a busy-rejected prompt must not be redispatched merely because \
+         unrelated tool-lifecycle events keep arriving for the still-running \
+         turn (token-burning resubmit loop regression)"
+    );
+}

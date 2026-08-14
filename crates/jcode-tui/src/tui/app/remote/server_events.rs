@@ -581,30 +581,26 @@ pub(in crate::tui::app) fn handle_server_event(
         app.last_stream_activity = Some(Instant::now());
     }
 
+    // Only clear the "re-adopted running turn" marker on events that actually
+    // *resolve* a turn (Interrupted/Done/Error). This used to also fire on
+    // every live progress event (TextDelta, ToolStart, ToolInput, ToolExec,
+    // ToolDone, TokenUsage, ConnectionPhase, ...), which are evidence the
+    // re-adopted turn is still running, not that it finished.
+    //
+    // A busy-rejected message re-adopts the still-running turn by setting
+    // `remote_resume_activity` with `current_message_id == None` (issue: no id
+    // to correlate against). While that turn keeps streaming, the server sends
+    // a steady flow of these progress events. Clearing the marker on each one
+    // made `synthetic_startup_dispatch` in `process_remote_followups` see
+    // `is_processing && current_message_id.is_none() && remote_resume_activity
+    // .is_none()` on the very next tick, mistake the still-running turn for an
+    // idle restored-startup state, flip `is_processing` back to false, and
+    // redispatch the same queued prompt again - once per progress event,
+    // forever, burning tokens on every redispatch (2026-08-14 token-burn
+    // incident: 500+ resubmits of one prompt in a single session).
     if matches!(
         &event,
-        ServerEvent::TextDelta { .. }
-            | ServerEvent::TextReplace { .. }
-            | ServerEvent::ReasoningDelta { .. }
-            | ServerEvent::ReasoningDone { .. }
-            | ServerEvent::ToolStart { .. }
-            | ServerEvent::ToolInput { .. }
-            | ServerEvent::ToolExec { .. }
-            | ServerEvent::ToolDone { .. }
-            | ServerEvent::SidePaneImages { .. }
-            | ServerEvent::GeneratedImage { .. }
-            | ServerEvent::BatchProgress { .. }
-            | ServerEvent::TokenUsage { .. }
-            | ServerEvent::KvCacheRequest { .. }
-            | ServerEvent::ConnectionType { .. }
-            | ServerEvent::ConnectionPhase { .. }
-            | ServerEvent::StatusDetail { .. }
-            | ServerEvent::MessageEnd { .. }
-            | ServerEvent::RetryRollback { .. }
-            | ServerEvent::UpstreamProvider { .. }
-            | ServerEvent::Interrupted
-            | ServerEvent::Done { .. }
-            | ServerEvent::Error { .. }
+        ServerEvent::Interrupted | ServerEvent::Done { .. } | ServerEvent::Error { .. }
     ) {
         app.remote_resume_activity = None;
     }
