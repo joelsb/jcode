@@ -389,18 +389,18 @@ impl AuthStatus {
     }
 
     /// Returns true if at least one provider has usable credentials.
+    ///
+    /// Derived from the same catalog + `state_for_provider` resolution that
+    /// builds the per-provider rows, rather than a hand-written list of struct
+    /// fields. The hand-written list omitted every provider whose credentials
+    /// do not live in a named field, notably the OpenAI-compatible profiles
+    /// (Cerebras, Groq, Together, ...), so a user whose *only* configured
+    /// provider was one of those was told nothing was available while the table
+    /// directly above it showed that provider as `available`.
     pub fn has_any_available(&self) -> bool {
-        self.anthropic.state == AuthState::Available
-            || self.jcode == AuthState::Available
-            || self.openai == AuthState::Available
-            || self.openrouter == AuthState::Available
-            || self.azure == AuthState::Available
-            || self.bedrock == AuthState::Available
-            || self.copilot == AuthState::Available
-            || self.antigravity == AuthState::Available
-            || self.gemini == AuthState::Available
-            || self.cursor == AuthState::Available
-            || self.grok_build == AuthState::Available
+        jcode_provider_metadata::login_providers()
+            .iter()
+            .any(|provider| self.state_for_provider(*provider) == AuthState::Available)
     }
 
     /// Emit a structured, non-secret snapshot of which providers currently have
