@@ -30,6 +30,8 @@ Sessions *not* holding the limited turn benefit from the switch and carry on. Th
 
 ADR-0016 and ADR-0017 remove the main driver, since a genuinely blocked account is now excluded from rotation, so there is much less to oscillate about. But two sessions hitting the same *burst* limit seconds apart still push each other, and the fix for that is independent of the verdict being right.
 
+**Correction, added after this was tested:** the reasoning above is sound, but its application to the reported incident is not. With only two accounts this decision is unreachable, because the candidate list already excludes the active account, so there is nothing left to rotate to at the moment the question would be asked. See the Evidence section. The five-session incident was a two-account incident, and it is fixed by ADR-0016 and ADR-0017, not by this. This decision is correct for three or more accounts and was kept on that basis.
+
 ## Decision
 
 A rotation always moves the request that is rotating. It rewrites the **shared** override only when it has strictly better information than whatever is there now:
@@ -75,12 +77,21 @@ The costs, stated plainly:
 
 ## Evidence
 
-Honest limitation, recorded deliberately: this decision has **no direct automated test**. The behaviour it changes requires two concurrent requests racing one process-global override inside one daemon, and the existing test harness drives `run_stream_with_retries` one request at a time against a mock server. Writing that race convincingly is a larger piece of work than the change itself, and a test that merely called the helper twice in sequence would assert the mechanics while proving nothing about the concurrency it exists for.
+Written first as "no direct test, this needs two concurrent daemons". That was the wrong frame, and testing it properly changed what this decision is understood to do.
 
-What is covered:
+Concurrency reaches this code only as *state another session left behind*: which account is currently active, and which accounts this request has already tried. Those are two values, so the policy is a pure function of them, now extracted as `should_claim_shared_override` and covered as a decision table by `a_rotation_claims_the_shared_override_only_when_better_informed`:
 
-- `switch_to_next_claude_account_terminates_once_candidates_are_exhausted` and `run_stream_with_retries_bounds_rotation_attempts_and_restores_original_account` both exercise the single-session path, where `claim_shared_override` is always true (the active account is in `tried`), so they confirm the common case is unchanged.
-- `rotation_publishes_an_account_rotated_bus_event` confirms a claimed rotation is still announced.
-- `restore_claude_account_skips_write_when_another_session_changed_the_override` covers the neighbouring compare-and-swap from ADR-0003, which this change deliberately mirrors in shape.
+| Active account | This request has tried | Claim the shared pointer? |
+|---|---|---|
+| `claude-1` | `claude-1` | yes, it knows the pointer is wrong |
+| `claude-1` | `claude-2` | **no**, it knows nothing about `claude-1` |
+| `claude-1` | `claude-2`, `claude-1` | yes, it has proven both refuse it |
+| none | anything | yes, preserves pre-ADR-0018 behaviour |
 
-The gap is the multi-session case, which is exactly the case ADR-0009 deferred, and it should be closed by the test infrastructure that per-session identity will need anyway. Until then this rests on reading, not on a passing test, and should be treated with the suspicion that deserves.
+`a_rotation_leaves_another_sessions_account_alone` drives the real `switch_to_next_claude_account` against the real process-global override, with the other session simulated by writing the same global it would have written, and asserts the override is untouched afterwards. Negative control for both: forcing `should_claim_shared_override` back to `true` fails them with "a request must not move a session onto an account it has not tried" and "the rotation must report that it did not claim the shared override".
+
+### What the test exposed: this is a no-op with only two accounts
+
+Writing the integration test surfaced a limitation that reading the code had not. `same_provider_account_candidates` excludes the *currently active* account from the candidate list. So with two accounts, the situation this decision guards against cannot arise: if another session holds `claude-1` and this request has already tried `claude-2`, there is no third account left to rotate to, and the rotation ends before the question is asked. The test needs a third account to reach the branch at all.
+
+That materially narrows the claim. For the reported incident, which is two accounts, **this decision changes nothing**; the flapping there is fixed by ADR-0016 and ADR-0017 making the verdict correct, not by this. This matters from three accounts up, and it remains the right shape for a shared pointer, but it should not be credited with fixing the two-account case.
