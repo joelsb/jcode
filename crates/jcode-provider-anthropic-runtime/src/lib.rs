@@ -2386,6 +2386,14 @@ struct AccountSwitch {
     claimed_shared_override: bool,
 }
 
+/// Serialises account rotation across every session on this daemon.
+///
+/// A `tokio` mutex rather than a `std` one because it is held across the
+/// credential load, which awaits; blocking a runtime worker there would stall
+/// unrelated sessions. Contention is inherently tiny: rotation happens only on a
+/// 429, and the critical section is one credential read.
+static ACCOUNT_ROTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Point this request at the next untried account and return its label plus a
 /// usable access token.
 ///
@@ -2394,10 +2402,56 @@ struct AccountSwitch {
 /// nor leaves the override pointing at an account that cannot serve a request.
 /// Returns `None` once no account is left, with the override unchanged from the
 /// caller's perspective.
+///
+/// Rotation is serialised process-wide. One daemon serves every session
+/// (ADR-0009), so when a shared limit trips, all of them reach this function
+/// within a second or two. Deciding concurrently is a check-then-act race: the
+/// cooldown that would warn the others off an account is only recorded once the
+/// first 429 comes *back*, and by then everyone has already committed. The
+/// observed result (2026-08-14) was four sessions alternating between two
+/// accounts inside 25 seconds, each announcing its own switch.
+///
+/// Holding the lock across the decision makes the winner's move visible to the
+/// followers, who then adopt it instead of rotating again. See ADR-0020.
 async fn switch_to_next_claude_account(
     credentials: &Arc<RwLock<Option<CachedCredentials>>>,
     tried: &mut Vec<String>,
 ) -> Option<AccountSwitch> {
+    // Held across credential loading (an await) so a follower cannot slip in
+    // between the leader claiming the override and that claim being usable.
+    let _rotation = ACCOUNT_ROTATION_LOCK.lock().await;
+
+    // Re-read the shared state now that we hold the lock. A sibling session may
+    // have rotated the whole pool while this request was queued here, in which
+    // case the work is already done and rotating again would just spend another
+    // account. Adopting the sibling's account is both correct and free.
+    if let Some(active) = auth::claude::active_account_label()
+        && !tried.iter().any(|seen| seen == &active)
+        && !jcode_base::provider::account_is_cooling_down(
+            jcode_provider_core::ActiveProvider::Claude,
+            &active,
+        )
+        && let Ok(fresh) = credentials_for_claude_account(&active).await
+    {
+        tried.push(active.clone());
+        let access_token = fresh.access_token.clone();
+        {
+            let mut cached = credentials.write().await;
+            *cached = Some(fresh);
+        }
+        jcode_base::logging::info(&format!(
+            "Adopting the account a concurrent session already rotated to: '{active}'"
+        ));
+        return Some(AccountSwitch {
+            label: active,
+            token: access_token,
+            // The leader already announced this move; a second announcement
+            // would show the user one switch line per session for a single
+            // pool-wide rotation.
+            claimed_shared_override: false,
+        });
+    }
+
     loop {
         let candidates = jcode_base::provider::account_failover_candidates(
             jcode_provider_core::ActiveProvider::Claude,

@@ -3456,3 +3456,103 @@ async fn no_candidates_still_waits_out_a_burst_rather_than_failing() {
 
     jcode_base::provider::clear_all_account_cooldowns();
 }
+
+/// Five concurrent sessions sharing two accounts must not each rotate.
+///
+/// The real incident (2026-08-14, five open sessions on one daemon): every
+/// session hits the same 5-hour limit within a few seconds of the others, and
+/// each independently decides to rotate. The log shows four different sessions
+/// alternating `claude-1 -> claude-2 -> claude-1` inside 25 seconds, and the
+/// user sees a wall of "Rate limited; switched Anthropic account" lines.
+///
+/// This is *not* the single-session cross-turn flapping fixed earlier (that one
+/// is identifiable by the "restored" line, which is absent here). It is a
+/// check-then-act race between sessions: the cooldown that would tell session B
+/// "claude-2 is limited, do not go there" is only recorded once B's own 429
+/// comes back, and all five sessions pass the check before any of their requests
+/// return.
+///
+/// The property under test is the one the user actually feels: given one shared
+/// pool of accounts, N concurrent sessions reacting to the same limit must
+/// perform *one* pool-wide move, not N. Followers must observe the leader's
+/// move and reuse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_sessions_rotate_the_shared_pool_only_once() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // Every session starts where the daemon left them: on claude-1, which has
+    // just started returning 429 for all of them at once.
+    jcode_base::auth::claude::set_active_account_override(Some("claude-1".to_string()));
+
+    const SESSIONS: usize = 5;
+    let mut handles = Vec::with_capacity(SESSIONS);
+    for _ in 0..SESSIONS {
+        handles.push(tokio::spawn(async move {
+            let credentials: Arc<RwLock<Option<CachedCredentials>>> = Arc::new(RwLock::new(None));
+            // Each session has tried the account it was on and now wants out,
+            // which is exactly the state five sessions reach simultaneously.
+            let mut tried = vec!["claude-1".to_string()];
+            switch_to_next_claude_account(&credentials, &mut tried)
+                .await
+                .map(|switch| (switch.label, switch.claimed_shared_override))
+        }));
+    }
+
+    let mut labels = Vec::new();
+    let mut claims = 0usize;
+    let mut dead_ends = 0usize;
+    for handle in handles {
+        match handle.await.unwrap() {
+            Some((label, claimed)) => {
+                labels.push(label);
+                if claimed {
+                    claims += 1;
+                }
+            }
+            None => dead_ends += 1,
+        }
+    }
+
+    // Serialising alone is not enough. With the leader holding the only other
+    // account, a follower that still runs the full rotation finds every
+    // candidate either active or already tried and reports a dead end, which
+    // sends a perfectly serviceable turn into the rate-limit wait. Followers
+    // must *adopt* the leader's account instead.
+    assert_eq!(
+        dead_ends, 0,
+        "no session may dead-end while a usable account exists, saw {dead_ends} of {SESSIONS} \
+         (followers are re-running rotation instead of adopting the leader's account)"
+    );
+
+    // Exactly one session may move the shared pool. The others must follow it,
+    // not re-decide: N claims is N announcements to the user and N chances to
+    // land on an account a sibling has already spent.
+    assert_eq!(
+        claims, 1,
+        "exactly one concurrent session may claim the shared override, saw {claims} of {SESSIONS} \
+         (this is the multi-session rotation stampede: each session announces its own switch)"
+    );
+
+    // And they must all end up on the same account. Splitting the pool is how
+    // the alternating claude-1/claude-2 pattern appears in the log.
+    let settled: std::collections::BTreeSet<&str> =
+        labels.iter().map(String::as_str).collect();
+    assert_eq!(
+        settled.len(),
+        1,
+        "all sessions must converge on one account, saw {settled:?}"
+    );
+    assert!(
+        !settled.contains("claude-1"),
+        "no session may settle back on the limited account it was rotating away from"
+    );
+
+    jcode_base::provider::clear_all_account_cooldowns();
+    jcode_base::auth::claude::set_active_account_override(None);
+}

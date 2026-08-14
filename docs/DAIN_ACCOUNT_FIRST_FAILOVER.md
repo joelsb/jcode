@@ -102,9 +102,19 @@ Compounding it, and each fixed here:
 
 - **Two usage caches existed and rotation invalidated the wrong one.** The single-slot `USAGE` cache (account-blind, feeds the widget) was invalidated with the epoch guard from Part 2. The *per-account* `ANTHROPIC_USAGE_CACHE`, which is what `account_usage_probe_sync` and therefore every rotation decision reads, had **no invalidation path at all**: only a 300s TTL, stretched to 900s by `RATE_LIMIT_BACKOFF`. A 429 could not correct the verdict that contradicted it. The two also used different key shapes for the same account (token prefix versus label), so neither could invalidate the other. Now label-keyed throughout, corrected by a 429, and refreshed in the background after a rotation. See ADR-0017.
 - **The rotation cooldown was a flat 60s from Part 2**, sized for a burst limit. Applied to a 3-hour quota wall it meant jcode forgot within a minute and reselected the blocked account. It now stores an expiry sized to the real reset, clamped to [60s, 6h].
-- **A cooling account was only sorted last**, which is not enough when every candidate is cooling, since the order among equals is arbitrary. It is now skipped while a healthy candidate exists, and kept as a last resort otherwise.
+- **A cooling account was only sorted last**, which is not enough when every candidate is cooling, since the order among equals is arbitrary. It is now skipped entirely: when every account is cooling the candidate list comes back empty and the request falls through to the ADR-0015 wait, which is strictly cheaper than paying another 429 to learn what the cooldown already knew. (Superseded the earlier "kept as a last resort" rule, which caused a switch-and-restore on every turn.)
 - **A quota `retry-after: 60` was honoured verbatim on the burst path**, producing the four-minute silence. Capped at 15s, and the terminal failure now names the earliest reset rather than offering a model downgrade that shares the same limit.
 - **The process-global override let concurrent sessions drag each other between accounts.** A rotation now claims the shared override only when the currently-active account is one this request has already proven refuses it. This narrows ADR-0009's blast radius; it does not resolve it. See ADR-0018.
+
+## Part 4 - The Concurrency Behind the Rest (2026-08-14)
+
+Parts 1-3 made each session's *verdict* correct. They did not make concurrent sessions agree, and with five sessions open on one daemon the switch spam came back on a binary carrying every fix above.
+
+- **Rotation was a check-then-act race across sessions.** Five sessions hit the same 5-hour limit within seconds; each read the candidate list, each picked the other account, each fired. The cooldown that would have warned the others off is only recorded when the first 429 comes *back*, by which point everyone has committed. Observed: four distinct sessions alternating `claude-1`/`claude-2` inside 25 seconds.
+- **Rotation is now serialised** on a process-wide async mutex, and a session that acquires it re-reads the shared state first: if a sibling already moved the pool to a usable account, it adopts that account instead of rotating again. One pool-wide move, one switch line, regardless of how many sessions are open. See ADR-0020.
+- **The lock alone is not the fix.** Without the adopt path the leader takes the only other account and every follower dead-ends into the rate-limit wait: measured 4 of 5. Both halves are pinned by negative controls in `concurrent_sessions_rotate_the_shared_pool_only_once`.
+
+Diagnostic worth keeping: single-session cross-turn flapping always pairs a switch with a **"restored"** line. Multi-session stampede shows switches with no restores. Same-looking symptom, different bug, different fix.
 
 Note for anyone touching the caches: the per-account cache is the one decisions read. Invalidating the single-slot one alone looks correct and changes nothing.
 
