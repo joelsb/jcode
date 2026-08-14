@@ -3148,3 +3148,102 @@ async fn a_later_turn_does_not_return_to_the_quota_blocked_account() {
     jcode_base::usage::clear_anthropic_account_usage_for_tests();
     jcode_base::provider::clear_all_account_cooldowns();
 }
+
+/// The cross-session policy from ADR-0018, as a decision table.
+///
+/// Previously untested and resting on code reading alone, on the grounds that
+/// it "needs two concurrent daemons". That was the wrong frame: concurrency
+/// reaches this decision only as *state another session left behind*, namely
+/// which account is active and which ones this request has already tried. Those
+/// are the two inputs, so the policy is testable directly.
+#[test]
+fn a_rotation_claims_the_shared_override_only_when_better_informed() {
+    let tried = |labels: &[&str]| -> Vec<String> { labels.iter().map(|l| l.to_string()).collect() };
+
+    // Single-session case, and the overwhelmingly common one: the request is on
+    // the account it started on, has proven that account refuses it, and so
+    // knows more than the shared pointer does.
+    assert!(
+        should_claim_shared_override(Some("claude-1"), &tried(&["claude-1"])),
+        "a request that proved the active account refuses it must move the pointer"
+    );
+
+    // The flapping case. Another session has settled on claude-1 while this
+    // request was working through claude-2. This request has NOT tried claude-1,
+    // so it knows nothing about it and must not drag that session off it.
+    assert!(
+        !should_claim_shared_override(Some("claude-1"), &tried(&["claude-2"])),
+        "a request must not move a session onto an account it has not tried"
+    );
+
+    // Once this request has also proven claude-1 refuses it, it is again the
+    // better-informed party and may claim the pointer.
+    assert!(
+        should_claim_shared_override(Some("claude-1"), &tried(&["claude-2", "claude-1"])),
+        "having proven every account refuses it, the request may claim the pointer"
+    );
+
+    // No override set means the primary account with nothing learned about it;
+    // claiming preserves the pre-ADR-0018 behaviour rather than silently
+    // changing it.
+    assert!(
+        should_claim_shared_override(None, &tried(&["claude-1"])),
+        "an unset override must still be claimable"
+    );
+}
+
+/// The same policy exercised through the real rotation, against the real
+/// process-global override, rather than through the pure helper.
+///
+/// This is the part a decision table cannot prove: that `switch_to_next_claude_account`
+/// actually consults the policy and actually leaves the shared override alone
+/// when told to. Simulating the other session is a one-line write to the same
+/// global the other session would have written, which is precisely what it
+/// leaves behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_leaves_another_sessions_account_alone() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    // A third account, because with only two this path is unreachable: the
+    // candidate list excludes whatever account is currently active, so when
+    // another session holds claude-1 and this request has already tried
+    // claude-2, nothing is left to rotate to and the question never arises.
+    // Documented in ADR-0018 as a real limitation of the contained fix.
+    jcode_base::auth::claude::upsert_account(jcode_base::auth::claude::AnthropicAccount {
+        label: "claude-3".to_string(),
+        access: "fixture-access-claude-3".to_string(),
+        refresh: String::new(),
+        expires: chrono::Utc::now().timestamp_millis() + 3_600_000,
+        email: None,
+        subscription_type: Some("max".to_string()),
+        scopes: vec![],
+    })
+    .unwrap();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // Another session on this daemon has settled on claude-1.
+    jcode_base::auth::claude::set_active_account_override(Some("claude-1".to_string()));
+
+    // Our request has been working through claude-2 and has not tried claude-1.
+    let credentials: Arc<RwLock<Option<CachedCredentials>>> = Arc::new(RwLock::new(None));
+    let mut tried = vec!["claude-2".to_string()];
+
+    let switched = switch_to_next_claude_account(&credentials, &mut tried).await;
+    let switched = switched.expect("a candidate must be available");
+
+    assert!(
+        !switched.claimed_shared_override,
+        "the rotation must report that it did not claim the shared override"
+    );
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label().as_deref(),
+        Some("claude-1"),
+        "the other session's account must be exactly as it left it"
+    );
+
+    jcode_base::provider::clear_all_account_cooldowns();
+}
