@@ -359,6 +359,9 @@ mod tests {
         let route_selection = jcode_provider_core::RouteSelection::from_model_route(gpt_route);
         let flagship_routes = JcodeProvider::model_routes_for(JcodeTier::Flagship);
         let expected_models = vec![
+            // DAIN patch: `claude-opus-4-6[1m]` is added to CURATED_MODELS on
+            // this branch, so the curated set is one longer than upstream's.
+            "claude-opus-4-6[1m]",
             "claude-opus-4-8",
             "claude-opus-5",
             "claude-sonnet-4-6",
@@ -410,7 +413,7 @@ mod tests {
         assert_eq!(route_selection.api_method, "jcode-subscription");
         assert_eq!(route_selection.provider_label, "Jcode Subscription");
         assert_eq!(plus_routes, flagship_routes);
-        assert_eq!(flagship_routes.len(), 20);
+        assert_eq!(flagship_routes.len(), 21);
         assert!(
             flagship_routes
                 .iter()
