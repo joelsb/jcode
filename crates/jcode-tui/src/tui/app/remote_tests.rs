@@ -1162,6 +1162,15 @@ fn remote_submit_input_never_strands_a_local_pending_turn() {
 /// tokens on every redispatch.
 #[test]
 fn busy_rejection_requeue_does_not_resubmit_on_every_tool_event() {
+    // Serialise against the other tests that swap `JCODE_HOME`. `create_test_app`
+    // and the reload-followup test both touch process-global env, so without this
+    // lock the two race: this test ran while
+    // `handle_post_connect_dispatches_reload_followup_even_if_history_snapshot_looks_busy`
+    // had `JCODE_HOME` pointed at its own temp dir, and that test then failed on
+    // `PostConnectOutcome::Ready` roughly one parallel run in one. Serial runs
+    // always passed, which is the signature of shared-state pollution rather
+    // than a logic fault.
+    let _guard = crate::storage::lock_test_env();
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
@@ -1196,7 +1205,10 @@ fn busy_rejection_requeue_does_not_resubmit_on_every_tool_event() {
         app.remote_resume_activity.is_some(),
         "busy rejection must re-adopt the running turn"
     );
-    assert_eq!(app.queued_messages(), &["find the bug and make it only swich accout once!"]);
+    assert_eq!(
+        app.queued_messages(),
+        &["find the bug and make it only swich accout once!"]
+    );
 
     // Track how many times the queued prompt actually gets (re)dispatched.
     let mut dispatch_count = 0usize;
