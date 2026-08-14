@@ -2125,6 +2125,31 @@ fn next_untried_account<'a>(candidates: &'a [String], tried: &[String]) -> Optio
         .find(|candidate| !tried.iter().any(|seen| seen == candidate))
 }
 
+/// Whether a rotation may rewrite the *shared*, process-wide account override.
+///
+/// The rotation always moves the request that is rotating; this decides only
+/// whether every other session on the daemon is moved with it.
+///
+/// The rule: claim the shared pointer when the currently-active account is one
+/// this request has already proven refuses it, i.e. when this request knows
+/// something the pointer does not. If another session has meanwhile settled on
+/// an account this request has not tried, leave the pointer alone rather than
+/// dragging that session off an account that may be working for it.
+///
+/// `None` (no override set) means the primary account with nothing yet learned
+/// about it, so claiming is correct and matches the previous behaviour.
+///
+/// Pure and separated from the rotation loop precisely so this policy is
+/// testable without two live daemons: the concurrency it guards against reaches
+/// this code only as *state another session left behind*, which is exactly the
+/// two arguments. See ADR-0018.
+fn should_claim_shared_override(active: Option<&str>, tried: &[String]) -> bool {
+    match active {
+        Some(active) => tried.iter().any(|seen| seen == active),
+        None => true,
+    }
+}
+
 /// Outcome of a successful account rotation.
 struct AccountSwitch {
     label: String,
@@ -2159,18 +2184,12 @@ async fn switch_to_next_claude_account(
         // (ADR-0009), so several sessions sharing two accounts used to push each
         // other back and forth: A rotates everyone to claude-1, B hits a burst
         // there and rotates everyone back to claude-2, and so on, which is the
-        // `claude-2 → claude-1 → claude-2` flapping users see.
+        // `claude-2 -> claude-1 -> claude-2` flapping users see.
         //
         // A rotation still moves *this* request, but it only rewrites the shared
-        // override when it has something better to say: when the account already
-        // active is one this request has proven refuses it. If another session
-        // has meanwhile settled on a different account, and this request has not
-        // yet tried it, leave the shared pointer alone rather than dragging that
-        // session off a working account. See ADR-0018.
-        let claim_shared_override = override_before
-            .as_deref()
-            .map(|active| tried.iter().any(|seen| seen == active))
-            .unwrap_or(true);
+        // override when it has something better to say. See ADR-0018 and
+        // `should_claim_shared_override`.
+        let claim_shared_override = should_claim_shared_override(override_before.as_deref(), tried);
 
         if claim_shared_override {
             auth::claude::set_active_account_override(Some(label.clone()));
