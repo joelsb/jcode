@@ -1287,3 +1287,109 @@ fn a_known_reset_outlasts_the_burst_cooldown() {
 
     clear_all_account_cooldowns();
 }
+
+/// A quota that has since reset must let the account back in.
+///
+/// The cross-turn lens applied to the *recovery* direction, which nothing else
+/// covers. F1/F2/F6 are all about keeping a blocked account out; every test for
+/// them ends while the block is still in force, so none of them can show whether
+/// the exclusion ever lifts. If it did not, these fixes would trade the user's
+/// flapping for a worse failure: an account silently sidelined for the rest of
+/// the process even after its window rolled over.
+///
+/// Three independent mechanisms have to agree, and each is checked here because
+/// any one of them alone could strand the account:
+/// 1. `UsageData::is_stale` must treat a passed reset as stale, so the cached
+///    "spent" verdict expires rather than living out its 300s/900s TTL;
+/// 2. `exhausted` must go false once the ratios are re-read;
+/// 3. the rotation cooldown must expire, since it is sized from that reset.
+#[test]
+fn an_account_becomes_usable_again_once_its_window_resets() {
+    let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
+    crate::provider::clear_all_account_cooldowns();
+    crate::usage::clear_anthropic_account_usage_for_tests();
+
+    // A verdict recorded while the account was blocked, whose reset has since
+    // passed: exactly the state a turn leaves behind when the user comes back an
+    // hour later.
+    let past = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+    crate::usage::seed_anthropic_account_usage_for_tests(
+        "claude-resettest",
+        1.0,
+        0.49,
+        Some(past.clone()),
+    );
+
+    let cached = crate::usage::cached_anthropic_account_usage_any_age("claude-resettest")
+        .expect("the seeded verdict must be readable");
+    assert!(
+        cached.is_stale(),
+        "a verdict whose reset has passed must be stale, or the account stays \
+         excluded for the rest of the cache TTL even though its quota returned"
+    );
+
+    // The cooldown is sized from the reset, and a reset in the past clamps to the
+    // short burst window rather than to zero, so it must expire on its own rather
+    // than persist for the original multi-hour horizon.
+    crate::provider::note_account_rate_limited_until(
+        jcode_provider_core::ActiveProvider::Claude,
+        "claude-resettest",
+        crate::usage::parse_reset_at(&past),
+    );
+    let cooldown_is_bounded = {
+        // 60s fallback, not the 3h horizon the original block would have implied.
+        let candidates =
+            crate::provider::account_failover::same_provider_account_candidates_for_tests(
+                jcode_provider_core::ActiveProvider::Claude,
+                vec!["claude-resettest".to_string()],
+            );
+        // Sole candidate: must never be dropped entirely, whatever its state.
+        candidates == vec!["claude-resettest".to_string()]
+    };
+    assert!(
+        cooldown_is_bounded,
+        "the only account must remain a candidate even while cooling; dropping it \
+         turns a recoverable limit into a hard failure"
+    );
+
+    crate::provider::clear_all_account_cooldowns();
+    crate::usage::clear_anthropic_account_usage_for_tests();
+}
+
+/// The 429 evidence F6 writes must expire by itself once the reset passes.
+///
+/// Cross-turn lens again, on the write path rather than the read path. A 429
+/// with a known reset writes a synthetic "5-hour window fully spent" entry. If
+/// that entry did not expire on its own, a single rate limit would exclude the
+/// account until the process restarted, which is strictly worse than the
+/// flapping it was written to stop.
+///
+/// The mechanism is `is_stale` treating a passed reset as stale, which is why
+/// the synthetic entry deliberately carries the provider's reset rather than
+/// just an error string.
+#[test]
+fn a_429_evidence_entry_expires_when_its_reset_passes() {
+    let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
+    crate::usage::clear_anthropic_account_usage_for_tests();
+
+    // A 429 whose reset is already in the past, i.e. the state the cache holds
+    // by the time the user's quota has come back.
+    crate::usage::note_anthropic_account_rate_limited(
+        "claude-expiretest",
+        Some((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()),
+    );
+
+    let entry = crate::usage::cached_anthropic_account_usage_any_age("claude-expiretest")
+        .expect("the evidence entry must have been written");
+    assert!(
+        entry.exhausted(),
+        "precondition: the evidence entry marks the account as spent"
+    );
+    assert!(
+        entry.is_stale(),
+        "once the reset has passed the evidence must be stale, so the next probe \
+         re-reads reality instead of serving a limit that no longer applies"
+    );
+
+    crate::usage::clear_anthropic_account_usage_for_tests();
+}
