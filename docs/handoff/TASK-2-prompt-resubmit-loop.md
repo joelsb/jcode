@@ -1,6 +1,13 @@
 # TASK 2: Same prompt resubmitted 335 times (token burn)
 
-**Status:** delegated to a child session, which may not have finished. **Assume nothing is fixed; verify first.**
+**Status: DONE.** Fixed by the delegated session, merged to `mine` (`3fba700b1`), built and installed.
+
+Root cause found: a busy-rejected prompt re-adopted the running turn via
+`remote_resume_activity` with `current_message_id == None`, and a blanket reset
+cleared that marker on almost every server event including plain progress events.
+Cleared mid-turn, `process_remote_followups` read the state as idle-restored-startup
+and redispatched the same prompt - once per progress event, for as long as the turn
+kept streaming. Kept below for the original evidence.
 **Branch:** `mine`
 **Child session:** `session_daisy_1786708230532_419069395c9813d3` (check whether it committed anything)
 **Owner:** whoever picks this up next. Self-contained; read this file only.
