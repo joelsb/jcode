@@ -64,13 +64,49 @@ A real fix is per-session account attribution, which is an architectural change 
 
 Rotation happens in the daemon, but the TUI is a separate process that renders usage from its own `crate::usage::get_sync()` cache, so a rotation used to be invisible: the widget kept showing the exhausted account's 5-hour reset.
 
-The runtime now publishes `BusEvent::AnthropicAccountRotated` on every account change (including the restore when every account is limited).
+The runtime now publishes `BusEvent::AnthropicAccountRotated` on every account change.
 `client_lifecycle.rs` forwards it to each subscribed client as `ServerEvent::AnthropicAccountRotated` and drops the daemon's own usage cache.
 The client mirrors the account with an override (not a persisted switch), invalidates its auth and usage caches, prints the switch, and recomputes the context limit from the active model.
+Because the event changes what the widget shows while no stream deltas are arriving to repaint - a rotation happens during a 429 retry - the client handler returns `needs_redraw = true`.
 
-`UsageData` carries no account identity and its staleness is time-based, so an account change now calls `usage::invalidate_anthropic_usage()`; without it a fresh-but-wrong snapshot is served until the TTL expires.
+The give-up path (every candidate limited, original override put back) publishes the same event with `restored: true`, via `publish_anthropic_account_restored`.
+Without that flag the client wording reads as "carrying on elsewhere" when the truth is "out of options".
+The field is `#[serde(default)]` and skipped when false, so an older daemon that omits it still parses and still means an ordinary rotation.
 
-All account-switch paths use `refresh_context_limit_after_account_change()` instead of assigning `provider.context_window()`, which dropped 1M windows down to the local default of 200k.
+The bus event has no session id, so the daemon fans it out to *every* connected client - unlike `BatchProgress` and `SidePanelUpdated`, which filter on `client_session_id`.
+The client therefore drops the event when its own session is positively on another provider (`App::ignores_anthropic_account_events`), failing open while provider identity is still unsettled.
+Adding a session id to the event needs the same per-session account attribution that the section above defers.
+
+`UsageData` carries no account identity and its staleness is time-based, so an account change invalidates it explicitly; without that a fresh-but-wrong snapshot is served until the TTL expires.
+Two forms exist for this: `usage::invalidate_anthropic_usage_now()` awaits the write and is what the daemon uses, because it sends the wire event immediately afterwards and the client's `/usage` round-trip would otherwise race a deferred write; `usage::invalidate_anthropic_usage()` is the sync form for UI code with nowhere to await.
+Both bump `USAGE_EPOCH`, which exists because `REFRESH_IN_FLIGHT` alone lets a fetch that started before the switch land afterwards and stamp the previous account's numbers as fresh - and once they look fresh, no refresh runs for a full `CACHE_DURATION`.
+A refresh that completes under a changed epoch re-marks the cache stale instead.
+
+The remote account-switch paths (`auth_account_commands.rs` x4, `remote.rs` x2) use `refresh_context_limit_after_account_change()` instead of assigning `provider.context_window()`, which dropped 1M windows to the local default of 200k.
+Only the remote sites were ever wrong: `app.provider` is an inert stub in remote mode, whereas the local `AnthropicProvider::context_window()` is `context_window::resolve(&self.model())` and already model-aware.
+The two local sites in `auth.rs` were converted for consistency, not to fix a bug.
+
+## Part 3 - The Verdict Behind It All (August 2026)
+
+Parts 1 and 2 got the *mechanism* right and were still defeated by a wrong *fact*.
+
+`AccountUsageSnapshot::exhausted` required **both** the 5-hour and weekly windows to be full:
+
+```rust
+exhausted: usage.five_hour >= 0.99 && usage.seven_day >= 0.99,   // wrong
+```
+
+Anthropic blocks a request when **either** is full. An account at 5h=100% / 7d=49% is hard-blocked for hours and was reported as having headroom, so rotation kept selecting it, the "every account is spent" fast-fail never fired, and turns spent four 60s waits on a limit that could not clear. Fixed as a disjunction, with `blocking_reset_at()` reporting the reset of the window that is actually blocking. See ADR-0016.
+
+Compounding it, and each fixed here:
+
+- **Two usage caches existed and rotation invalidated the wrong one.** The single-slot `USAGE` cache (account-blind, feeds the widget) was invalidated with the epoch guard from Part 2. The *per-account* `ANTHROPIC_USAGE_CACHE`, which is what `account_usage_probe_sync` and therefore every rotation decision reads, had **no invalidation path at all**: only a 300s TTL, stretched to 900s by `RATE_LIMIT_BACKOFF`. A 429 could not correct the verdict that contradicted it. The two also used different key shapes for the same account (token prefix versus label), so neither could invalidate the other. Now label-keyed throughout, corrected by a 429, and refreshed in the background after a rotation. See ADR-0017.
+- **The rotation cooldown was a flat 60s from Part 2**, sized for a burst limit. Applied to a 3-hour quota wall it meant jcode forgot within a minute and reselected the blocked account. It now stores an expiry sized to the real reset, clamped to [60s, 6h].
+- **A cooling account was only sorted last**, which is not enough when every candidate is cooling, since the order among equals is arbitrary. It is now skipped while a healthy candidate exists, and kept as a last resort otherwise.
+- **A quota `retry-after: 60` was honoured verbatim on the burst path**, producing the four-minute silence. Capped at 15s, and the terminal failure now names the earliest reset rather than offering a model downgrade that shares the same limit.
+- **The process-global override let concurrent sessions drag each other between accounts.** A rotation now claims the shared override only when the currently-active account is one this request has already proven refuses it. This narrows ADR-0009's blast radius; it does not resolve it. See ADR-0018.
+
+Note for anyone touching the caches: the per-account cache is the one decisions read. Invalidating the single-slot one alone looks correct and changes nothing.
 
 ## Files Changed
 
@@ -90,6 +126,13 @@ All account-switch paths use `refresh_context_limit_after_account_change()` inst
 - `crates/jcode-base/src/config/default_file.rs` - Added config comment
 - `crates/jcode-base/src/config.rs` - Added env var to known list
 
+### Part 3 (the exhaustion verdict and the caches)
+- `crates/jcode-base/src/usage/model.rs` - `UsageData::exhausted` is now a disjunction over windows; added `EXHAUSTED_RATIO` and `blocking_reset_at()`; same change for the OpenAI-shaped `all` -> `any`
+- `crates/jcode-base/src/usage/cache.rs` - Per-account cache controls that did not exist before: `invalidate_anthropic_account_usage`, `note_anthropic_account_rate_limited`, `cached_anthropic_account_usage`, plus test seams
+- `crates/jcode-base/src/usage/accessors.rs` - Probe reads the per-account cache for *every* account including the active one; `fetch_usage_for_account_sync` keyed by label not token; added `refresh_account_usage`
+- `crates/jcode-base/src/provider/account_failover.rs` - Cooldown stores an expiry rather than a start (`note_account_rate_limited_until`); cooling accounts skipped while a healthy one exists (`demote_cooling_down_accounts`); `note_account_rate_limited_with_reset`, `clear_account_rate_limit`, `earliest_account_reset`
+- `crates/jcode-provider-anthropic-runtime/src/lib.rs` - `MAX_BURST_RETRY_AFTER` caps a quota `retry-after` on the burst path; quota failures announce the earliest reset once per turn; rotation claims the shared override only when better informed (`AccountSwitch::claimed_shared_override`) and kicks a background usage refresh
+
 ## Commits
 
 ```
@@ -97,7 +140,11 @@ All account-switch paths use `refresh_context_limit_after_account_change()` inst
 2c9502d feat: add prefer_account_failover config option
 6273711 feat: wire rate_limit flag into TUI fallback route picker
 c0eeca7 feat: skip model downgrade on rate-limit, prefer cross-provider fallback
+
+9dfe8d2 fix(anthropic): treat any spent usage window as an exhausted account
 ```
+
+ADRs: [0016](adr/0016-exhaustion-is-any-window-not-every-window.md) (the verdict), [0017](adr/0017-invalidate-the-cache-the-decision-reads.md) (the caches), [0018](adr/0018-claim-the-shared-account-override-only-when-better-informed.md) (cross-session), plus a correction recorded in [0015](adr/0015-rate-limits-wait-on-their-own-clock.md).
 
 ## Config
 
