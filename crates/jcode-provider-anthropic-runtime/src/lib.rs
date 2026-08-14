@@ -2570,10 +2570,29 @@ fn should_restore_account(
         return false;
     }
 
-    // Restoring onto a spent quota would undo the one useful thing this request
-    // learned. Only a *known* quota block counts: an unknown verdict keeps the
-    // existing restore behaviour rather than silently changing it.
-    !account_quota_is_blocked(original.as_deref())
+    // Never hand the session back to an account that just refused it.
+    //
+    // ADR-0003 restores on a dead end because "when every account is limited the
+    // original is as good as any other". That is true only of the *instant* the
+    // request ends. It ignores that the next turn then starts on an account
+    // already known to be limited, rotates away again, is restored again, and so
+    // on: one switch plus one restore per turn, for as long as the limit lasts.
+    //
+    // Gating on quota alone (the first version of this fix) was too narrow: on a
+    // burst limit no account is quota-spent, so the gate never fired and the
+    // loop continued. The cooldown is the signal that covers both cases, because
+    // every 429 records one, sized to the real reset when known and to a short
+    // burst window otherwise.
+    //
+    // When the original is *not* limited, the restore still happens, which keeps
+    // ADR-0003's actual purpose: undoing an exploratory hop that led nowhere.
+    let original_label = original
+        .clone()
+        .unwrap_or_else(auth::claude::primary_account_label);
+    !jcode_base::provider::account_is_cooling_down(
+        jcode_provider_core::ActiveProvider::Claude,
+        &original_label,
+    )
 }
 
 /// Whether `label`'s cached usage says a window is spent and has not yet reset.

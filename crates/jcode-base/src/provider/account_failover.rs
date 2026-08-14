@@ -373,21 +373,29 @@ pub(super) fn same_provider_account_candidates(provider: ActiveProvider) -> Vec<
     demote_cooling_down_accounts(provider, labels)
 }
 
-/// Drop cooling-down accounts while at least one non-cooling candidate remains;
-/// otherwise keep every candidate, cooling ones sorted last.
+/// Drop cooling-down accounts from the candidate list.
 ///
-/// Never returns an empty list for a non-empty input: exhausting the candidate
-/// list turns a recoverable rate limit into a hard failure, which is exactly
-/// what ADR-0015 warned against.
+/// Rotation exists to find an account that is *not* limited. Once every
+/// alternative is known-limited there is nothing to find, and hopping onto one
+/// of them buys a second 429 rather than a response.
+///
+/// This used to return the cooling accounts when none were ready, on the
+/// reasoning that "a limited account is better than no candidate at all". That
+/// reasoning is wrong for a shared limit, and it is what produced the reported
+/// flapping: with two accounts both burst-limited, every turn rotated onto the
+/// other one, failed there too, and announced a switch. One switch and one
+/// restore per turn, indefinitely, while the burst lasted.
+///
+/// Returning nothing does not fail the turn. The caller's `None` branch is the
+/// dead-end path, which is precisely where the rate-limit *wait* lives
+/// (ADR-0015): the turn then backs off on the account it already has, which is
+/// the correct response to "everything is limited right now" and costs one
+/// request per attempt instead of two.
 fn demote_cooling_down_accounts(provider: ActiveProvider, labels: Vec<String>) -> Vec<String> {
-    let (cooling, ready): (Vec<String>, Vec<String>) = labels
+    labels
         .into_iter()
-        .partition(|label| account_is_cooling_down(provider, label));
-
-    if ready.is_empty() {
-        return cooling;
-    }
-    ready
+        .filter(|label| !account_is_cooling_down(provider, label))
+        .collect()
 }
 
 /// Test seam: apply only the cooldown demotion to a fixed candidate list.
