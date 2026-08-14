@@ -2296,6 +2296,13 @@ impl RotationFixture {
         let temp = tempfile::TempDir::new().unwrap();
         let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
         seed_two_claude_accounts();
+        // Cooldowns and the per-account usage cache are process-global and
+        // survive `JCODE_HOME` being swapped, so a 429 recorded by an earlier
+        // test leaks in here and silently empties the candidate list. Harmless
+        // while a cooling account was still offered as a last resort; fatal now
+        // that a known-limited account is excluded outright.
+        jcode_base::provider::clear_all_account_cooldowns();
+        jcode_base::usage::clear_anthropic_account_usage_for_tests();
 
         assert_eq!(
             jcode_base::provider::account_failover_candidates(
@@ -2524,10 +2531,20 @@ async fn run_stream_with_retries_bounds_rotation_attempts_and_restores_original_
         "sanity: the budget must stay small enough that a user is not left waiting through an unbounded retry storm"
     );
 
+    // The session stays on the account it rotated to, rather than being handed
+    // back to the one that had already refused it.
+    //
+    // This assertion previously required the opposite, per ADR-0003's original
+    // rule ("on a dead end the original is as good as any other"). That rule
+    // made every subsequent turn start on a known-limited account, rotate away,
+    // and be restored again: one switch plus one restore per turn, which is the
+    // flapping users reported. Neither account can serve this test, so which one
+    // it ends on cannot be justified by success; what matters is that the choice
+    // is not reset, so the next turn inherits what this one learned.
     assert_eq!(
         jcode_base::auth::claude::active_account_label().as_deref(),
-        Some("claude-1"),
-        "every account limited: the original account override must be restored"
+        Some("claude-2"),
+        "a dead end must not restore the session onto an account known to be limited"
     );
 
     server.stop();
@@ -3238,6 +3255,195 @@ async fn a_rotation_leaves_another_sessions_account_alone() {
         jcode_base::auth::claude::active_account_label().as_deref(),
         Some("claude-1"),
         "the other session's account must be exactly as it left it"
+    );
+
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// The user's screenshot, as a test: a burst limit must not rotate accounts on
+/// every single turn, forever.
+///
+/// The *burst* case, distinct from `a_later_turn_does_not_return_to_the_quota_blocked_account`
+/// which covers the quota case. Both accounts have headroom here (the user's
+/// were at 0% and 34% of their 5-hour windows), so nothing is quota-blocked, the
+/// ADR-0003 dead-end restore fires on every turn, and each turn ends on the
+/// account it started on:
+///
+/// ```text
+/// turn 1: switching claude-1 to claude-2 ... restored claude-1
+/// turn 2: switching claude-1 to claude-2 ... restored claude-1   <- identical
+/// turn 3: switching claude-1 to claude-2 ... restored claude-1   <- forever
+/// ```
+///
+/// What is measured is the number of *rotation announcements*, not which account
+/// each turn starts on. An earlier version of this test asserted the latter and
+/// passed against the bug: because every turn is restored to where it began, the
+/// starting account never changes, so "it never switches" and "it switches and
+/// switches back every turn" are indistinguishable by that measure. The
+/// observable that separates them is how many times the runtime says it is
+/// switching.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_limit_does_not_rotate_on_every_turn() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // Both accounts have real headroom: a burst limit, not a quota wall.
+    jcode_base::usage::seed_anthropic_account_usage_for_tests("claude-1", 0.00, 0.38, None);
+    jcode_base::usage::seed_anthropic_account_usage_for_tests("claude-2", 0.34, 0.62, None);
+    jcode_base::auth::claude::set_active_account("claude-1").unwrap();
+
+    let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+    set_test_api_url_override(Some(server.url()));
+
+    let mut rotations = 0usize;
+    for _ in 0..3 {
+        let start = jcode_base::auth::claude::active_account_label()
+            .unwrap_or_else(jcode_base::auth::claude::primary_account_label);
+
+        let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+        let model_state = Arc::new(std::sync::RwLock::new(
+            "claude-3-5-haiku-20241022".to_string(),
+        ));
+
+        run_stream_with_retries(
+            Client::new(),
+            format!("fixture-access-{start}"),
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+        )
+        .await;
+
+        while let Some(event) = rx.recv().await {
+            if let Ok(StreamEvent::StatusDetail { detail }) = event
+                && detail.contains("switching Claude account")
+            {
+                rotations += 1;
+            }
+        }
+    }
+
+    set_test_api_url_override(None);
+
+    // One rotation total is correct: the first turn learns the active account is
+    // limited and moves. Every later turn should already know, and stay put.
+    // Three rotations across three turns is the reported bug.
+    assert!(
+        rotations <= 1,
+        "a burst limit must be learned once, not re-learned every turn; \
+         saw {rotations} rotations across 3 turns"
+    );
+
+    // The point of not rotating is that it costs a request. Rotating onto a
+    // known-limited account buys a second 429 per turn and nothing else, so the
+    // request count is the property worth pinning alongside the announcement.
+    // Measured 2026-08-14: 21 requests before this fix, 19 after, because each
+    // avoided hop is one fewer 429. The bound is deliberately just under the old
+    // number rather than tight against the new one: the point is to catch the
+    // hop coming back, not to freeze the retry arithmetic, which ADR-0015 owns
+    // and which legitimately changes.
+    let calls = server.call_count();
+    assert!(
+        calls < 21,
+        "turns must not each pay for a hop onto a known-limited account; \
+         {calls} requests for 3 turns (21 was the pre-fix cost)"
+    );
+
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// Returning no rotation candidates must not turn a recoverable rate limit into
+/// a hard failure.
+///
+/// This is the property ADR-0015 exists to protect, and the one that the old
+/// "keep cooling accounts as a last resort" rule was written to guarantee. That
+/// rule was removed (a known-limited account is no longer offered), so the
+/// guarantee has to be re-established by a different route: the empty candidate
+/// list reaches `switch_to_next_claude_account`'s `None` branch, which sets
+/// `rotation_exhausted` and falls through to the rate-limit *wait*.
+///
+/// Asserted as the presence of the waiting status lines. If a future change ever
+/// makes an empty candidate list fail the turn outright, this fails, and the
+/// user gets an instant error instead of a turn that would have succeeded once
+/// the burst cleared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_candidates_still_waits_out_a_burst_rather_than_failing() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // Both accounts already known-limited, so the candidate list is empty from
+    // the very first rotation attempt: the exact state the removed last-resort
+    // rule used to paper over.
+    jcode_base::provider::note_account_rate_limited(
+        jcode_provider_core::ActiveProvider::Claude,
+        "claude-1",
+    );
+    jcode_base::provider::note_account_rate_limited(
+        jcode_provider_core::ActiveProvider::Claude,
+        "claude-2",
+    );
+    assert!(
+        jcode_base::provider::account_failover_candidates(
+            jcode_provider_core::ActiveProvider::Claude
+        )
+        .is_empty(),
+        "precondition: no rotation candidates remain"
+    );
+
+    let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+    set_test_api_url_override(Some(server.url()));
+
+    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+    let model_state = Arc::new(std::sync::RwLock::new(
+        "claude-3-5-haiku-20241022".to_string(),
+    ));
+
+    // Force the burst verdict: nothing is out of quota, so waiting is the
+    // correct response and the turn is genuinely recoverable.
+    jcode_base::provider::with_quota_exhausted_override(Some(false), || {
+        futures::executor::block_on(run_stream_with_retries(
+            Client::new(),
+            "fixture-access-claude-1".to_string(),
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+        ));
+    });
+
+    set_test_api_url_override(None);
+
+    let mut waits = 0usize;
+    while let Some(event) = rx.recv().await {
+        if let Ok(StreamEvent::StatusDetail { detail }) = event
+            && detail.contains("Every account rate limited; waiting")
+        {
+            waits += 1;
+        }
+    }
+
+    assert!(
+        waits > 0,
+        "with no candidates left the turn must wait out the burst, not fail \
+         immediately; saw {waits} waits"
     );
 
     jcode_base::provider::clear_all_account_cooldowns();

@@ -41,3 +41,24 @@ That holds for a burst limit, which clears in seconds. It is false for a 5-hour 
 The two cases were indistinguishable when this ADR was written. They are not any more: [ADR-0016](0016-exhaustion-is-any-window-not-every-window.md) makes exhaustion correct and carries the blocking window's reset time. So `should_restore_account` now returns `false` when the original account's quota is known-spent and not yet reset. An unknown verdict, an unreachable probe, or a merely burst-limited account all keep the original rule.
 
 Worth noting how it was missed for so long: every test of this path drove a *single* turn, and with two accounts a single turn cannot show the bug, because `tried_accounts` already excludes the spent account within a request. The rotation looks correct right up to the moment the request ends. `a_later_turn_does_not_return_to_the_quota_blocked_account` drives two turns and asserts which account the second one *starts* on. Negative control: forcing the old `rotation_exhausted && ours != original` fails it with "the second turn must not start on the quota-blocked account".
+
+## Amendment 2 (2026-08-14): the gate is the cooldown, not the quota
+
+The amendment above gated the restore on the original account's *quota* being known-spent. Too narrow, and the user hit the gap the same day.
+
+Their accounts had headroom, 0% and 34% of their 5-hour windows, so nothing was quota-spent and the gate never fired. What they were hitting was the short-window **burst** limit, and the loop ran exactly as before, one switch and one restore per turn, indefinitely:
+
+```
+switched claude-2 -> claude-1
+Every Anthropic account is rate limited; restored claude-1
+switched claude-1 -> claude-2
+Every Anthropic account is rate limited; restored claude-1
+```
+
+The correct signal is the **rotation cooldown**, because every 429 records one, sized to the real reset when known and to a short burst window otherwise. So rule 1 now reads: never restore onto an account that is cooling down. Quota and burst are both covered, and an account that is *not* limited is still restored, which keeps this ADR's actual purpose of undoing an exploratory hop that led nowhere.
+
+A second change was needed for the loop to stop, in the candidate list rather than here: `demote_cooling_down_accounts` used to return the cooling accounts when none were ready, so rotation kept hopping onto an equally-limited account. It now returns nothing, and the resulting dead end falls through to ADR-0015's wait. That property is pinned by `no_candidates_still_waits_out_a_burst_rather_than_failing`; without it, removing the last-resort rule would trade flapping for an instant failure on a recoverable limit, which would be worse.
+
+Measured over three turns: 3 rotations and 21 requests before, 1 rotation and 19 requests after.
+
+The lesson worth keeping: the first fix was correct about *what* to gate and wrong about *which signal* proved it. A gate that can only fire in the case you happened to reproduce is not a fix, it is a coincidence.

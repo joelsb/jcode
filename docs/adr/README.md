@@ -18,7 +18,7 @@ Format: Michael Nygard's ADR template, trimmed to the sections this codebase act
 |---|---|---|
 | [0001](0001-prefer-account-failover-over-model-downgrade.md) | On a rate limit, prefer another account over a smaller model | Accepted, partially superseded by 0002 |
 | [0002](0002-rotate-accounts-inside-the-streaming-retry-loop.md) | Rotate OAuth accounts inside the Anthropic streaming retry loop | Accepted |
-| [0003](0003-restore-the-account-override-only-on-a-dead-end.md) | Restore the account override only when rotation runs dry, and never blindly | Accepted, amended 2026-08-12 (never restore onto a spent quota) |
+| [0003](0003-restore-the-account-override-only-on-a-dead-end.md) | Restore the account override only when rotation runs dry, and never blindly | Accepted, amended twice (2026-08-14: never restore onto a *cooling* account) |
 | [0004](0004-each-rotation-earns-its-own-attempt.md) | Each rotation grants itself an attempt; transport retries counted separately | Accepted |
 | [0005](0005-rotate-after-partial-output-using-retry-rollback.md) | Rotate after partial output, rolling the partial attempt back | Accepted |
 | [0006](0006-test-only-url-seam-instead-of-an-env-override.md) | Drive the retry loop in tests through a `cfg(test)` URL seam | Accepted |
