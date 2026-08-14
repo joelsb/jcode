@@ -125,3 +125,13 @@ Two things this cost, both worth remembering:
 
 - **The single live turn cited as verification proved less than claimed.** It ran one turn, succeeded, and would very likely have succeeded on the old binary too. It was reported as confirmation and was not; the negative controls were the real evidence throughout.
 - **Testing the mechanism is not testing the symptom.** Every unit test here was correct and passing while the user-visible behaviour was still broken, because they all shared an assumption (one turn) that the bug lived outside of.
+
+### Running the same lens back over the earlier fixes
+
+The multi-turn lens was invented only after the fixes above were written, so it had never been applied to them. Run retrospectively, it exposed a second blind spot in the *opposite* direction: every test for these fixes sets up a blocked account and ends while the block is still in force, so none of them could show whether the exclusion ever **lifts**.
+
+That is not a theoretical gap. If recovery did not work, these fixes would have traded the reported flapping for something strictly worse: an account sidelined for the rest of the process even after its window rolled over. The fixes make exhaustion stickier in three independent places (a cached verdict, a cooldown sized from a reset, and a synthetic 429 entry), and any one of them failing to expire would strand the account.
+
+Two tests now cover it, and the negative control shows the dependency is real rather than incidental: removing the reset-passed rule from `UsageData::is_stale` fails `an_account_becomes_usable_again_once_its_window_resets` with "a verdict whose reset has passed must be stale, or the account stays excluded for the rest of the cache TTL". `a_429_evidence_entry_expires_when_its_reset_passes` covers the same property on the write path.
+
+The general point, which is the reason this section exists at all: when a fix is *found* by a new kind of test, that test is evidence the old lens was too narrow, and the new one should be run back over everything the old one signed off. Doing so here found no further production bug, which is itself worth recording, but it did find untested behaviour whose failure mode would have been worse than the original complaint.
