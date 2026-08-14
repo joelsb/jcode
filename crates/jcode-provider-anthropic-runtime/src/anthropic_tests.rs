@@ -3361,3 +3361,90 @@ async fn a_burst_limit_does_not_rotate_on_every_turn() {
     jcode_base::usage::clear_anthropic_account_usage_for_tests();
     jcode_base::provider::clear_all_account_cooldowns();
 }
+
+/// Returning no rotation candidates must not turn a recoverable rate limit into
+/// a hard failure.
+///
+/// This is the property ADR-0015 exists to protect, and the one that the old
+/// "keep cooling accounts as a last resort" rule was written to guarantee. That
+/// rule was removed (a known-limited account is no longer offered), so the
+/// guarantee has to be re-established by a different route: the empty candidate
+/// list reaches `switch_to_next_claude_account`'s `None` branch, which sets
+/// `rotation_exhausted` and falls through to the rate-limit *wait*.
+///
+/// Asserted as the presence of the waiting status lines. If a future change ever
+/// makes an empty candidate list fail the turn outright, this fails, and the
+/// user gets an instant error instead of a turn that would have succeeded once
+/// the burst cleared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_candidates_still_waits_out_a_burst_rather_than_failing() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // Both accounts already known-limited, so the candidate list is empty from
+    // the very first rotation attempt: the exact state the removed last-resort
+    // rule used to paper over.
+    jcode_base::provider::note_account_rate_limited(
+        jcode_provider_core::ActiveProvider::Claude,
+        "claude-1",
+    );
+    jcode_base::provider::note_account_rate_limited(
+        jcode_provider_core::ActiveProvider::Claude,
+        "claude-2",
+    );
+    assert!(
+        jcode_base::provider::account_failover_candidates(
+            jcode_provider_core::ActiveProvider::Claude
+        )
+        .is_empty(),
+        "precondition: no rotation candidates remain"
+    );
+
+    let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+    set_test_api_url_override(Some(server.url()));
+
+    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+    let model_state = Arc::new(std::sync::RwLock::new(
+        "claude-3-5-haiku-20241022".to_string(),
+    ));
+
+    // Force the burst verdict: nothing is out of quota, so waiting is the
+    // correct response and the turn is genuinely recoverable.
+    jcode_base::provider::with_quota_exhausted_override(Some(false), || {
+        futures::executor::block_on(run_stream_with_retries(
+            Client::new(),
+            "fixture-access-claude-1".to_string(),
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+        ));
+    });
+
+    set_test_api_url_override(None);
+
+    let mut waits = 0usize;
+    while let Some(event) = rx.recv().await {
+        if let Ok(StreamEvent::StatusDetail { detail }) = event
+            && detail.contains("Every account rate limited; waiting")
+        {
+            waits += 1;
+        }
+    }
+
+    assert!(
+        waits > 0,
+        "with no candidates left the turn must wait out the burst, not fail \
+         immediately; saw {waits} waits"
+    );
+
+    jcode_base::provider::clear_all_account_cooldowns();
+}

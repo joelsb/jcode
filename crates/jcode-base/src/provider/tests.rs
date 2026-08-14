@@ -1178,12 +1178,15 @@ fn a_rate_limited_account_is_remembered_across_requests() {
     clear_all_account_cooldowns();
 }
 
-/// A cooling-down account must be *skipped while an alternative exists*, and
-/// still offered when it is the only thing left: dropping it outright would turn
-/// a recoverable rate limit into a hard failure (ADR-0015), while merely sorting
-/// it last let a spent account be picked whenever every candidate was cooling.
+/// A cooling-down account is never offered as a rotation target.
+///
+/// Rotation exists to find an account that is *not* limited; once every
+/// alternative is known-limited there is nothing to find. ADR-0015's "never turn
+/// a recoverable limit into a hard failure" is preserved by the caller waiting
+/// on the account it already holds, not by handing it a candidate that will
+/// refuse it too.
 #[test]
-fn cooling_down_accounts_are_skipped_but_remain_a_last_resort() {
+fn cooling_down_accounts_are_skipped_and_not_offered_when_all_are_limited() {
     let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
     use crate::provider::account_failover::same_provider_account_candidates_for_tests;
     use crate::provider::{clear_all_account_cooldowns, note_account_rate_limited};
@@ -1212,16 +1215,31 @@ fn cooling_down_accounts_are_skipped_but_remain_a_last_resort() {
         "the account that just refused must not be offered while a healthy one exists"
     );
 
-    // Now every account is limited, so the cooling ones are all that is left.
+    // Every account limited: offer none at all.
+    //
+    // This assertion previously required the opposite ("keep them as a last
+    // resort"), on the reasoning that a limited account beats no candidate. That
+    // is wrong for a *shared* limit and is what produced the reported flapping:
+    // with two accounts both burst-limited, every turn hopped onto the other,
+    // paid a second 429, announced a switch, and was restored. One switch plus
+    // one restore per turn, indefinitely.
+    //
+    // Returning nothing does not fail the turn: the caller's `None` branch is
+    // the dead end, which is exactly where ADR-0015's rate-limit wait lives, so
+    // the turn backs off on the account it already holds. That property is
+    // pinned end-to-end by
+    // `no_candidates_still_waits_out_a_burst_rather_than_failing` in
+    // jcode-provider-anthropic-runtime, which is the test that makes removing
+    // this last-resort rule safe.
     note_account_rate_limited(ActiveProvider::Claude, "claude-2");
     let ordered = same_provider_account_candidates_for_tests(
         ActiveProvider::Claude,
         vec!["claude-1".to_string(), "claude-2".to_string()],
     );
-    assert_eq!(
-        ordered.len(),
-        2,
-        "when everything is limited every account must stay a candidate: {:?}",
+    assert!(
+        ordered.is_empty(),
+        "when everything is limited, rotation has nothing to find and must offer \
+         no candidate rather than hop onto another limited account: {:?}",
         ordered
     );
 
@@ -1336,23 +1354,25 @@ fn an_account_becomes_usable_again_once_its_window_resets() {
         "claude-resettest",
         crate::usage::parse_reset_at(&past),
     );
-    let cooldown_is_bounded = {
-        // 60s fallback, not the 3h horizon the original block would have implied.
-        let candidates =
-            crate::provider::account_failover::same_provider_account_candidates_for_tests(
-                jcode_provider_core::ActiveProvider::Claude,
-                vec!["claude-resettest".to_string()],
-            );
-        // Sole candidate: must never be dropped entirely, whatever its state.
-        candidates == vec!["claude-resettest".to_string()]
-    };
+    // The cooldown must be BOUNDED, i.e. sized to the short burst fallback rather
+    // than to the multi-hour horizon the original block would have implied. A
+    // reset already in the past carries no information about the future.
+    //
+    // Checked as "the cooldown exists but expires within the burst window", not
+    // as "the account is still a candidate": a cooling account is deliberately no
+    // longer offered as a rotation target at all (see
+    // `cooling_down_accounts_are_skipped_and_not_offered_when_all_are_limited`),
+    // so candidacy no longer distinguishes a bounded cooldown from an unbounded
+    // one. What matters for recovery is that the cooldown lapses on its own.
     assert!(
-        cooldown_is_bounded,
-        "the only account must remain a candidate even while cooling; dropping it \
-         turns a recoverable limit into a hard failure"
+        crate::provider::account_is_cooling_down(
+            jcode_provider_core::ActiveProvider::Claude,
+            "claude-resettest"
+        ),
+        "a past reset must still produce the short burst cooldown, not none"
     );
 
-    crate::provider::clear_all_account_cooldowns();
+    clear_all_account_cooldowns();
     crate::usage::clear_anthropic_account_usage_for_tests();
 }
 
