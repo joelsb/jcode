@@ -216,7 +216,11 @@ fn test_init_provider_jcode_delegates_runtime_profile_to_wrapper() {
         .block_on(init_provider(&ProviderChoice::Jcode, None))
         .expect("init jcode provider");
 
-    assert_eq!(provider.name(), "Jcode Hosted Models");
+    // "Jcode Subscription" is the display name everywhere else in the tree
+    // (provider metadata catalog, auth lifecycle, protocol events). This
+    // assertion was the last reference to the older "Jcode Hosted Models"
+    // wording and was simply missed when the provider was renamed.
+    assert_eq!(provider.name(), "Jcode Subscription");
     assert!(crate::subscription_catalog::is_runtime_mode_enabled());
     assert_eq!(
         std::env::var("JCODE_OPENROUTER_MODEL").ok().as_deref(),

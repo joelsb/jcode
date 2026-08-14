@@ -307,7 +307,14 @@ fn run_auto_poke_followup_targets_below_threshold_todos() {
         }) => {
             assert_eq!(total_todos, 2);
             assert!(message.starts_with(crate::todo::TODO_COMPLETION_CONTINUATION_MESSAGE));
-            assert!(message.contains("completion confidence"));
+            // The follow-up is deliberately neutral: upstream's "Make todo
+            // follow-ups neutral and targeted" stopped naming *why* the private
+            // evaluator selected these items, so the old "completion confidence"
+            // wording is gone. What must still hold is that the message targets
+            // the specific todos to validate rather than being generic.
+            assert!(message.contains("Validate further:"));
+            assert!(message.contains("todo a"), "{message}");
+            assert!(message.contains("todo b"), "{message}");
             assert!(!message.to_ascii_lowercase().contains("threshold"));
         }
         _ => panic!("expected confidence-summary follow-up"),
