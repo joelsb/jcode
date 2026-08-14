@@ -1,7 +1,8 @@
 # TASK 1: Burst-limit account ping-pong (switch once, then stay)
 
-**Status:** fix works, 2 tests still need reconciling. **Work is UNCOMMITTED in the working tree.**
-**Branch:** `mine`  **Last commit:** `82b98f34e`
+**Status:** fix works, 2 tests still need reconciling.
+**Work is COMMITTED on branch `wip/burst-pingpong` (commit `40a63c27f`).** `mine` is clean.
+Recover with: `git checkout wip/burst-pingpong`, or `git cherry-pick 40a63c27f` onto `mine`.
 **Owner:** whoever picks this up next. Self-contained; read this file only.
 
 ---

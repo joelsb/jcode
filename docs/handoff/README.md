@@ -5,7 +5,7 @@ Each task file is **self-contained**. Read only the one you are picking up.
 
 | # | Task | File | Status |
 |---|---|---|---|
-| 1 | Account ping-pong: switch once, then stay | `TASK-1-burst-account-pingpong.md` | fix works; **2 tests to reconcile**; **UNCOMMITTED** |
+| 1 | Account ping-pong: switch once, then stay | `TASK-1-burst-account-pingpong.md` | fix works; **2 tests to reconcile**; on branch `wip/burst-pingpong` |
 | 2 | Same prompt resubmitted 335 times | `TASK-2-prompt-resubmit-loop.md` | delegated to a child session; **verify, assume unfixed** |
 
 **Do TASK 2 first if you only do one.** It burned 72.8M tokens on a single session. TASK 1 is noisy but costs far less.
@@ -15,10 +15,8 @@ Each task file is **self-contained**. Read only the one you are picking up.
 ## Immediate state of the repo
 
 - Branch `mine`, last commit **`82b98f34e`**.
-- **TASK 1 has uncommitted changes** in the working tree:
-  - `crates/jcode-base/src/provider/account_failover.rs`
-  - `crates/jcode-provider-anthropic-runtime/src/lib.rs`
-  - `crates/jcode-provider-anthropic-runtime/src/anthropic_tests.rs`
+- `mine` is **clean**. TASK 1's work is committed on branch **`wip/burst-pingpong`** (`40a63c27f`), not on `mine`, because it still fails 2 tests.
+  Recover with `git checkout wip/burst-pingpong` or `git cherry-pick 40a63c27f`.
 - `cargo test -p jcode-provider-anthropic-runtime --lib` → **73 pass, 0 fail**
 - `cargo test -p jcode-base --lib provider::` → **2 fail**, both asserting the old rule TASK 1 deliberately changed. TASK 1's file explains what to check before touching them.
 
