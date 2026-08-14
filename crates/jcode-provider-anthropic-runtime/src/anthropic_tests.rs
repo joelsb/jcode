@@ -3125,6 +3125,7 @@ async fn a_later_turn_does_not_return_to_the_quota_blocked_account() {
             "claude-3-5-haiku-20241022".to_string(),
             "test-session".to_string(),
             model_state,
+            DirectTransportConfig::from_env(),
         )
         .await;
 
@@ -3325,6 +3326,7 @@ async fn a_burst_limit_does_not_rotate_on_every_turn() {
             "claude-3-5-haiku-20241022".to_string(),
             "test-session".to_string(),
             model_state,
+            DirectTransportConfig::from_env(),
         )
         .await;
 
@@ -3431,6 +3433,7 @@ async fn no_candidates_still_waits_out_a_burst_rather_than_failing() {
             "claude-3-5-haiku-20241022".to_string(),
             "test-session".to_string(),
             model_state,
+            DirectTransportConfig::from_env(),
         ));
     });
 
