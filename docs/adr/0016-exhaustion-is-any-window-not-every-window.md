@@ -111,4 +111,17 @@ Both were pre-existing hazards that this change made load-bearing, and both prod
 
 2. **Three tests shared process-global state and failed each other roughly one run in three or four.** `RATE_LIMITED_ACCOUNTS` and the per-account usage cache are both process-wide while tests run in one process. Fixed with `lock_account_cooldown_tests()`, by having burst-sensitive tests state their premise through `with_quota_exhausted_override` instead of depending on ambient cache contents, and by defaulting the new post-rotation refresh off under `cfg(test)` (see ADR-0017) since a detached task outlived its own test and rewrote a later test's inputs.
 
-The general lesson, worth more than either fix: a test that sets up its condition through a *rich* helper may be satisfied by a side effect of that helper rather than by the behaviour under test. The negative control is what caught it, and it caught it only because it was run.
+The general lesson from both, worth more than either fix: a test that sets up its condition through a *rich* helper may be satisfied by a side effect of that helper rather than by the behaviour under test. The negative control is what caught it, and it caught it only because it was run.
+
+### A third defect, found only by testing the reported symptom
+
+After all of the above was committed, tested, and verified against a live account, a further test written specifically to check *the property the user described* rather than the property the code made convenient to check found a bug none of the others could see.
+
+Every existing test drives a **single turn**. With two accounts, a single turn cannot expose it: `tried_accounts` already excludes the spent account within a request, so even the unfixed code rotates away exactly once and looks correct. The failure is *between* turns, and it was the dead-end restore from ADR-0003 handing the session back to the quota-blocked account it started on. The next turn then began there again, which is precisely the `claude-2 → claude-1 → claude-2` sequence in the report.
+
+`a_later_turn_does_not_return_to_the_quota_blocked_account` drives two turns and asserts which account the second one *starts* on. Fix and amendment recorded in ADR-0003.
+
+Two things this cost, both worth remembering:
+
+- **The single live turn cited as verification proved less than claimed.** It ran one turn, succeeded, and would very likely have succeeded on the old binary too. It was reported as confirmation and was not; the negative controls were the real evidence throughout.
+- **Testing the mechanism is not testing the symptom.** Every unit test here was correct and passing while the user-visible behaviour was still broken, because they all shared an assumption (one turn) that the bug lived outside of.

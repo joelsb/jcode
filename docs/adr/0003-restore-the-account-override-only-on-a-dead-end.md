@@ -31,3 +31,13 @@ Three rules:
 - The compare-and-swap narrows but does not close the shared-state race: another session can still change the override *between* the check and the write. Closing it properly requires per-session account identity, see [ADR-0009](0009-defer-per-session-account-identity.md).
 - `should_restore_account` is a pure function precisely so the policy is unit-testable without touching global auth state.
 - Because the restore is now announced to clients ([ADR-0007](0007-announce-rotation-to-clients-over-the-bus.md)), rule 1 also decides *when the user is told the rotation gave up*. It is announced as its own outcome rather than as a switch, see [ADR-0012](0012-announce-a-dead-end-restore-as-its-own-outcome.md). Rule 2 has a corollary there: when the compare-and-swap declines to write, no event is published, so a client whose account was changed by another session is not notified.
+
+## Amendment (2026-08-12): rule 1 does not apply to a spent quota
+
+Rule 1 rests on a premise that is only sometimes true: that on a dead end, where every account is limited, the account the request started on is as good as any other, so returning there is neutral.
+
+That holds for a burst limit, which clears in seconds. It is false for a 5-hour quota with hours left to run. A user hit exactly this: their session started on a quota-blocked account, rotation correctly moved to the account with headroom, the healthy account then also answered 429 (a burst), rotation reported a dead end, and rule 1 handed the session **back to the blocked account**. The next turn began there and rediscovered the wall, which is the cross-turn half of the account flapping in that report.
+
+The two cases were indistinguishable when this ADR was written. They are not any more: [ADR-0016](0016-exhaustion-is-any-window-not-every-window.md) makes exhaustion correct and carries the blocking window's reset time. So `should_restore_account` now returns `false` when the original account's quota is known-spent and not yet reset. An unknown verdict, an unreachable probe, or a merely burst-limited account all keep the original rule.
+
+Worth noting how it was missed for so long: every test of this path drove a *single* turn, and with two accounts a single turn cannot show the bug, because `tried_accounts` already excludes the spent account within a request. The rotation looks correct right up to the moment the request ends. `a_later_turn_does_not_return_to_the_quota_blocked_account` drives two turns and asserts which account the second one *starts* on. Negative control: forcing the old `rotation_exhausted && ours != original` fails it with "the second turn must not start on the quota-blocked account".
