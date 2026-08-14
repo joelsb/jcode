@@ -1,48 +1,54 @@
-# START HERE: open work on `mine`
+# START HERE: state of the rate-limit work on `mine`
 
-Written 2026-08-14, before the user ended all running sessions.
-Each task file is **self-contained**. Read only the one you are picking up.
+Updated 2026-08-14 after both tasks were completed and installed.
 
-| # | Task | File | Status |
+## Both bugs are fixed, committed, and installed
+
+| # | Bug | Commit | Status |
 |---|---|---|---|
-| 1 | Account ping-pong: switch once, then stay | `TASK-1-burst-account-pingpong.md` | fix works; **2 tests to reconcile**; on branch `wip/burst-pingpong` |
-| 2 | Same prompt resubmitted 335 times | `TASK-2-prompt-resubmit-loop.md` | delegated to a child session; **verify, assume unfixed** |
+| 1 | Account ping-pong: switch once, then stay | `aa92245d3` | fixed, merged |
+| 2 | Same prompt resubmitted 335 times (72.8M tokens) | `3fba700b1` | fixed, merged |
 
-**Do TASK 2 first if you only do one.** It burned 72.8M tokens on a single session. TASK 1 is noisy but costs far less.
+Installed binary: `~/.jcode/builds/versions/3fba700b1-dirty/jcode`, verified by `strings` to contain the new code, and a live turn succeeds.
+
+Task detail files are kept for the reasoning and the reproduction steps:
+`TASK-1-burst-account-pingpong.md`, `TASK-2-prompt-resubmit-loop.md`.
 
 ---
 
-## Immediate state of the repo
+## TASK 1: account ping-pong
 
-- Branch `mine`, last commit **`82b98f34e`**.
-- `mine` is **clean**. TASK 1's work is committed on branch **`wip/burst-pingpong`** (`40a63c27f`), not on `mine`, because it still fails 2 tests.
-  Recover with `git checkout wip/burst-pingpong` or `git cherry-pick 40a63c27f`.
-- `cargo test -p jcode-provider-anthropic-runtime --lib` → **73 pass, 0 fail**
-- `cargo test -p jcode-base --lib provider::` → **2 fail**, both asserting the old rule TASK 1 deliberately changed. TASK 1's file explains what to check before touching them.
+Two compounding causes on the dead-end path (when every account answers 429):
 
-## Pre-existing failures, NOT caused by this work
+1. `should_restore_account` handed the session back to the account it began on. An earlier fix gated that on *quota* being spent, which never fires on a **burst** limit; the user's accounts had headroom (0% and 34% of their 5-hour windows). The gate is now the **cooldown**, which every 429 records, so quota and burst are both covered.
+2. `demote_cooling_down_accounts` returned cooling accounts when none were ready. Each turn then hopped onto an equally-limited account and bought a second 429. It now returns nothing.
 
-Present on base commit `34635f40f` too. Verify that yourself rather than trusting this file:
+Returning nothing does **not** fail the turn, and that is the load-bearing part: the caller's `None` branch is the dead end, which is where ADR-0015's rate-limit wait lives. Pinned by `no_candidates_still_waits_out_a_burst_rather_than_failing`.
 
-```
-platform::platform_tests::spawn_detached_creates_new_session
-session::tests::cases::streaming_guard_creates_visible_macos_sleep_assertion
-```
+Measured over 3 turns: **3 rotations / 21 requests → 1 rotation / 19 requests.**
 
-## Two things the user still has to decide (do not do these for them)
+## TASK 2: the resubmit loop
 
-1. **`jcode server reload`** - their daemon is still on the pre-fix binary `34635f40f`, so none of the committed rate-limit work is live for them. Reloading hands over live sessions.
-2. **Stopping the runaway session(s)** - at diagnosis time there were ~25 processes and 9 sessions on 2 accounts, producing 450 rate limits/hour with **0 successful calls**.
+A prompt the server rejected as busy re-adopted the running turn by setting `remote_resume_activity` with `current_message_id == None`. A blanket reset cleared that marker on *almost every* server event, including plain progress events (`ToolStart`, `TextDelta`, `TokenUsage`, ...). Once cleared mid-turn, `process_remote_followups` mistook the state for idle-restored-startup, flipped `is_processing` back to false, and redispatched the same prompt. The server rejected it as busy again, and the next progress event repeated it. **One resubmit per progress event, for as long as the turn kept streaming.**
 
-## What was already shipped and is committed
+## Test state
 
-Commits `9dfe8d2ac` → `82b98f34e`. The **quota** side of the rate-limit problem: exhaustion is now "any window spent" not "every window", the per-account usage cache the rotation decision reads can now be invalidated, cooldowns are sized to the real reset, and a spent quota fails fast with a countdown instead of ~4 minutes of silence. See ADRs `0016`, `0017`, `0018`, plus amendments to `0003` and `0015`, and `docs/DAIN_ACCOUNT_FIRST_FAILOVER.md` Part 3.
+- `cargo test -p jcode-provider-anthropic-runtime --lib` → 74 pass, 0 fail
+- `cargo test -p jcode-base --lib provider::` → 175 pass, 0 fail
+- `cargo test -p jcode-base --lib` → 2 failures that are **pre-existing** and also fail on base commit `34635f40f`:
+  - `platform::platform_tests::spawn_detached_creates_new_session`
+  - `session::tests::cases::streaming_guard_creates_visible_macos_sleep_assertion`
 
-## Honest warning about the tests in this area
+## The one thing still outstanding, and it is yours
 
-I wrote **two false-passing tests** during this work, and both were caught by challenges rather than by my own checks:
+**`jcode server reload`.** Interactive sessions are served by the long-lived daemon, which still runs the pre-fix binary `34635f40f`. Until it is reloaded, neither fix is live for your running sessions. It was left undone deliberately: reloading hands over live sessions, which is your call, not mine.
 
-- one asserted `switches <= 1`, which is satisfied by **0 switches** - and 0 switches is the broken state;
-- one seeded its condition through a helper with a side effect that satisfied the assertion, so the behaviour under test was never exercised.
+## Warning for anyone editing these tests
 
-**If a test here passes on the first run, revert the fix and confirm it fails.** Global state (`RATE_LIMITED_ACCOUNTS`, the per-account usage cache) is process-wide and leaks between tests even when `JCODE_HOME` is swapped.
+Global state (`RATE_LIMITED_ACCOUNTS`, the per-account usage cache) is process-wide and leaks between tests even when `JCODE_HOME` is swapped. Use `lock_account_cooldown_tests()` plus the `clear_*` helpers.
+
+Three tests written during this work initially **passed against the bug they were meant to catch**. If a test here passes on its first run, revert the fix and confirm it fails. Assert on the thing that distinguishes working from broken (count of rotations, count of dispatches), not on a proxy.
+
+## ADRs
+
+`0016` (exhaustion = any window), `0017` (invalidate the cache the decision reads), `0018` (shared override, a no-op with only 2 accounts), plus amendments to `0003` (twice: quota, then cooldown) and `0015`.

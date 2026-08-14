@@ -1,8 +1,7 @@
 # TASK 1: Burst-limit account ping-pong (switch once, then stay)
 
-**Status:** fix works, 2 tests still need reconciling.
-**Work is COMMITTED on branch `wip/burst-pingpong` (commit `40a63c27f`).** `mine` is clean.
-Recover with: `git checkout wip/burst-pingpong`, or `git cherry-pick 40a63c27f` onto `mine`.
+**Status: DONE.** Fixed, tested, merged to `mine` (`aa92245d3`), built and installed.
+Kept for the reasoning and the reproduction steps.
 **Owner:** whoever picks this up next. Self-contained; read this file only.
 
 ---
