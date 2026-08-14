@@ -3039,3 +3039,107 @@ async fn a_rotation_refreshes_the_new_accounts_usage_in_the_background() {
     jcode_base::usage::clear_anthropic_account_usage_for_tests();
     jcode_base::provider::clear_all_account_cooldowns();
 }
+
+/// The cross-turn property the user actually reported: after a rotation away
+/// from a quota-blocked account, the *next* turn must not go back to it.
+///
+/// Every other test here drives a single turn, and a single turn cannot show
+/// this bug. With two accounts, `tried_accounts` already excludes the spent one
+/// within a turn, so even the old code rotates away exactly once and looks fine.
+/// The failure is *between* turns: `tried_accounts` is per-request, the cooldown
+/// expired after 60s, and the cached verdict still claimed headroom, so the next
+/// turn started on the blocked account again. That is the
+/// `claude-2 -> claude-1 -> claude-2` flapping in the report, and it is why a
+/// single live turn is not evidence that this is fixed.
+///
+/// Both accounts answer 429 here, so neither can "win" by serving; what is
+/// measured is purely *which account each request targets*.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_turn_does_not_return_to_the_quota_blocked_account() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // claude-2 is quota-blocked for hours; claude-1 has headroom. The session
+    // starts on the blocked account, as the user's did.
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(
+        "claude-2",
+        1.0,
+        0.49,
+        Some((chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339()),
+    );
+    jcode_base::usage::seed_anthropic_account_usage_for_tests("claude-1", 0.41, 0.24, None);
+    jcode_base::auth::claude::set_active_account("claude-2").unwrap();
+
+    let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+    set_test_api_url_override(Some(server.url()));
+
+    // Two turns, each its own request with its own fresh `tried_accounts`.
+    // `first_call_of_turn` records where each turn began, because the property
+    // under test is which account a turn *starts* on.
+    let mut first_call_of_turn = Vec::new();
+    for _ in 0..2 {
+        first_call_of_turn.push(server.call_count());
+
+        let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+        let model_state = Arc::new(std::sync::RwLock::new(
+            "claude-3-5-haiku-20241022".to_string(),
+        ));
+        let token = jcode_base::auth::claude::active_account_label()
+            .map(|label| format!("fixture-access-{label}"))
+            .unwrap_or_else(|| "fixture-access-claude-2".to_string());
+
+        run_stream_with_retries(
+            Client::new(),
+            token,
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+        )
+        .await;
+
+        while rx.recv().await.is_some() {}
+    }
+
+    set_test_api_url_override(None);
+
+    // Turn 1 starts on the blocked account by construction. Turn 2 must not:
+    // that is the whole complaint, and it is what the old code got wrong, since
+    // `tried_accounts` is per-request, the 60s cooldown had expired, and the
+    // cached verdict still claimed headroom.
+    let second_turn_start = first_call_of_turn[1];
+    assert!(
+        !server.authorization_contains(second_turn_start, "fixture-access-claude-2"),
+        "the second turn must not start on the quota-blocked account"
+    );
+    assert!(
+        server.authorization_contains(second_turn_start, "fixture-access-claude-1"),
+        "the second turn must start on the account with headroom"
+    );
+
+    // The session override must also have been left pointing at the healthy
+    // account, rather than rolled back onto the quota wall by the dead-end
+    // restore. This is the state the *third* turn would inherit.
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label().as_deref(),
+        Some("claude-1"),
+        "a dead end must not restore the session onto an account whose quota is spent"
+    );
+
+    // Note what is deliberately *not* asserted: that the blocked account is
+    // never contacted again at all. Once the healthy account also 429s, the
+    // blocked one is the only candidate left, and ADR-0015 keeps a limited
+    // account as a last resort rather than turning a recoverable state into a
+    // hard failure. Trying it once per turn is correct; *starting* there is not.
+
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+}
