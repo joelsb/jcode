@@ -187,6 +187,32 @@ def defect_errors_with_zero_attempts(home: pathlib.Path) -> str:
     return "EXTRACTION"
 
 
+def defect_decay_without_a_verdict(home: pathlib.Path) -> str:
+    """The ADR-0021 signature in the logs: decay recorded with verified: 0.
+
+    Observed live on 2026-08-16T18:18:30 under `cadence_carry`:
+    maintenance_started {rejected: 6, verified: 0} then
+    maintenance_confidence {boosted: 0, decayed: 6}. Nothing judged those six,
+    yet all six lost confidence. Over the 7-day window, cadence_carry alone
+    accounted for 45 of 90 decays - more than the judge outage did.
+    """
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = home / "logs" / f"memory-events-{day}.jsonl"
+    lines = path.read_text().splitlines()
+    for _ in range(6):
+        lines += [
+            json.dumps({"timestamp": _iso(0), "event": "judge_decision", "detail": {
+                "decision": "cadence_carry", "no_llm": True, "degradation": False,
+                "candidate_count": 6}}),
+            json.dumps({"timestamp": _iso(0), "event": "maintenance_started",
+                        "detail": {"rejected": 6, "verified": 0}}),
+            json.dumps({"timestamp": _iso(0), "event": "maintenance_confidence",
+                        "detail": {"boosted": 0, "decayed": 6}}),
+        ]
+    path.write_text("\n".join(lines) + "\n")
+    return "DECAY_WITHOUT_VERDICT"
+
+
 DEFECTS = [
     defect_all_periodic_extractions_404,
     defect_blended_rate_hides_outage,
@@ -196,6 +222,7 @@ DEFECTS = [
     defect_memories_vanished_vs_backup,
     defect_project_graph_decayed,
     defect_errors_with_zero_attempts,
+    defect_decay_without_a_verdict,
 ]
 
 

@@ -232,12 +232,112 @@ def check_backup_delta(res: Result, _days: int) -> None:
     )
 
 
+def check_decay_without_verdict(res: Result, days: int) -> None:
+    """Detect the ADR-0021 signature directly in the event log.
+
+    `maintenance_confidence {decayed: N}` immediately after a
+    `judge_decision` whose decision is NOT `judge_ran` means memories lost
+    confidence with no verdict behind it. This is the check that would have
+    caught the 9-day wipe on day one.
+
+    Note this fires on `cadence_carry` too, not just outright failures: a
+    cadence-gated turn surfaces the carried set and marks everything else
+    rejected. On this machine cadence_carry produced 45 of 90 observed decays.
+    """
+    last_decision: str | None = None
+    offenders: Counter = Counter()
+    total_bad = 0
+    for ev in _events(days):
+        kind = ev.get("event")
+        if kind == "judge_decision":
+            last_decision = ev.get("detail", {}).get("decision")
+        elif kind == "maintenance_confidence":
+            decayed = ev.get("detail", {}).get("decayed", 0) or 0
+            if decayed and last_decision and last_decision != "judge_ran":
+                offenders[last_decision] += decayed
+                total_bad += decayed
+
+    ok = total_bad == 0
+    detail = (
+        f"{total_bad} memories decayed with no judge verdict over {days}d"
+        + (" | " + ", ".join(f"{k}:{v}" for k, v in offenders.most_common(3)) if offenders else "")
+        if total_bad
+        else f"no verdict-less decay in {days}d"
+    )
+    res.add(
+        "DECAY_WITHOUT_VERDICT",
+        ok,
+        detail,
+        "ADR-0021 regression, or a build predating the fix is still running "
+        "(see RUNNING_BINARY)."
+        if not ok
+        else "",
+    )
+
+
+def check_running_binary(res: Result, _days: int) -> None:
+    """Long-lived processes keep the inode they started with.
+
+    Repointing a channel symlink does NOT upgrade a running `jcode ... serve`
+    or an open session; they hold the old binary until restarted. A memory fix
+    can therefore be committed, built, installed AND still not be in effect,
+    which reads exactly like "fixed" if you only inspect the symlinks.
+    """
+    try:
+        ps = subprocess.run(
+            ["ps", "-Ao", "pid=,command="], capture_output=True, text=True, timeout=30
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        res.add("RUNNING_BINARY", True, "could not enumerate processes")
+        return
+
+    want = (BUILDS / "current" / "jcode").resolve() if (BUILDS / "current" / "jcode").exists() else None
+    if want is None:
+        res.add("RUNNING_BINARY", True, "no current channel to compare against")
+        return
+
+    stale = []
+    for line in ps.splitlines():
+        line = line.strip()
+        if "jcode" not in line:
+            continue
+        pid, _, cmd = line.partition(" ")
+        if not pid.isdigit() or "memory_health" in cmd:
+            continue
+        try:
+            lsof = subprocess.run(
+                ["lsof", "-p", pid], capture_output=True, text=True, timeout=30
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for l in lsof.splitlines():
+            parts = l.split()
+            if len(parts) > 4 and parts[3] == "txt" and "/builds/versions/" in l:
+                running = pathlib.Path(parts[-1])
+                if running != want:
+                    stale.append(f"pid {pid} on {running.parent.name}")
+                break
+
+    ok = not stale
+    res.add(
+        "RUNNING_BINARY",
+        ok,
+        f"current={want.parent.name}; "
+        + (f"{len(stale)} stale: {', '.join(stale[:3])}" if stale else "all live processes match"),
+        "Restart these to pick up memory fixes; a symlink swap does not affect them."
+        if not ok
+        else "",
+    )
+
+
 CHECKS = (
     check_extraction,
     check_writes,
     check_decay,
     check_stale_binary,
     check_backup_delta,
+    check_decay_without_verdict,
+    check_running_binary,
 )
 
 
