@@ -705,15 +705,17 @@ IMPORTANT - Do NOT extract:
 
 Quality bar: Only extract information that would ACTUALLY BE USEFUL if recalled in a future session on a different topic. Ask: "Would a developer benefit from knowing this weeks from now?"
 
+Be selective. Most conversations are worth 0-3 memories. A long or productive session does NOT mean more memories - it usually means a few better ones. Never pad the list to seem thorough; outputting nothing is a valid and common answer.
+
 For each memory, output in this format (one per line):
 CATEGORY|CONTENT|TRUST
 
 Where:
 - CATEGORY is one of: fact, preference, correction, entity
-- CONTENT is a concise statement (1-2 sentences max, under 200 characters preferred)
+- CONTENT is ONE self-contained statement (1-2 sentences, hard limit 300 characters). Never bundle several facts into one line with semicolons or "also" - split them into separate lines so each can be reinforced or corrected on its own.
 - TRUST is one of: high (user stated), medium (observed), low (inferred)
 
-Output ONLY the formatted lines, no other text. If no NEW memories worth extracting, output nothing."#,
+Output AT MOST 5 lines, the most valuable ones. Output ONLY the formatted lines, no other text. If no NEW memories worth extracting, output nothing."#,
         );
 
         if !existing.is_empty() {
@@ -727,25 +729,96 @@ Output ONLY the formatted lines, no other text. If no NEW memories worth extract
 
         let response = self.complete(&system, transcript).await?;
 
-        let memories = response
-            .lines()
-            .filter(|line| line.contains('|'))
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.split('|').collect();
-                if parts.len() >= 3 {
-                    Some(ExtractedMemory {
-                        category: parts[0].trim().to_lowercase(),
-                        content: parts[1].trim().to_string(),
-                        trust: parts[2].trim().to_lowercase(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let memories = parse_extracted_memories(&response);
 
         Ok(memories)
     }
+}
+
+/// Hard cap on memories accepted from a single extraction.
+///
+/// The prompt asks for at most this many, but a prompt enforces nothing: one
+/// real session-end extraction returned 13 in a single burst, which at ~8 per
+/// session works out to roughly 1,200 memories a month. Truncation keeps the
+/// worst case bounded even if a future model ignores the instruction.
+pub(crate) const MAX_MEMORIES_PER_EXTRACTION: usize = 5;
+
+/// Shortest content worth storing.
+///
+/// A real extraction produced the memory `grep -i class` (13 characters), which
+/// meets no quality bar and is not recognisable weeks later. Nothing validated
+/// content before storage.
+pub(crate) const MIN_MEMORY_CONTENT_CHARS: usize = 40;
+
+/// Longest content accepted as a single memory.
+///
+/// Matches the hard limit in the prompt. One stored entry was 1,035 characters
+/// fusing about five separate facts, so it could never be reinforced,
+/// superseded or decayed per-fact. Oversized lines are rejected rather than
+/// truncated: cutting mid-sentence produces a confident fragment, which is
+/// worse than no memory at all.
+pub(crate) const MAX_MEMORY_CONTENT_CHARS: usize = 300;
+
+/// Parse and validate the extractor's response.
+///
+/// Enforces in code what the prompt only asks for: a per-extraction cap
+/// (option B), a minimum content bar (option D) and atomic, single-fact
+/// entries (option E). Invalid lines are dropped, not repaired, and the cap is
+/// applied last so the model's own ordering decides which survive.
+pub(crate) fn parse_extracted_memories(response: &str) -> Vec<ExtractedMemory> {
+    response
+        .lines()
+        .filter(|line| line.contains('|'))
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split('|').collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            let content = parts[1].trim().to_string();
+            if !is_storable_memory_content(&content) {
+                crate::logging::info(&format!(
+                    "Rejected extracted memory ({} chars): {}",
+                    content.chars().count(),
+                    crate::util::truncate_str(&content, 80)
+                ));
+                return None;
+            }
+            Some(ExtractedMemory {
+                category: parts[0].trim().to_lowercase(),
+                content,
+                trust: parts[2].trim().to_lowercase(),
+            })
+        })
+        .take(MAX_MEMORIES_PER_EXTRACTION)
+        .collect()
+}
+
+/// Whether a candidate memory is worth storing at all.
+///
+/// Deliberately cheap and mechanical - this is a floor against junk, not a
+/// judgement of usefulness. It must stay independent of the prompt so it keeps
+/// holding when the prompt or the model changes.
+pub(crate) fn is_storable_memory_content(content: &str) -> bool {
+    let trimmed = content.trim();
+    let char_count = trimmed.chars().count();
+
+    if char_count < MIN_MEMORY_CONTENT_CHARS || char_count > MAX_MEMORY_CONTENT_CHARS {
+        return false;
+    }
+
+    // Require a few words: a bare command or identifier is not a memory.
+    if trimmed.split_whitespace().count() < 5 {
+        return false;
+    }
+
+    // Require some prose. A line that is nearly all punctuation or symbols is
+    // a fragment of output, not a statement.
+    let alpha = trimmed.chars().filter(|c| c.is_alphabetic()).count();
+    if (alpha as f32) < (char_count as f32) * 0.5 {
+        return false;
+    }
+
+    true
 }
 
 impl Default for Sidecar {
@@ -1087,6 +1160,150 @@ mod tests {
     use super::*;
     use crate::auth::codex;
     use std::ffi::OsString;
+
+    // ---- extraction validation (options B, D, E) -------------------------
+    //
+    // The prompt asks for at most 5 atomic memories of reasonable length, but
+    // a prompt enforces nothing. Every case below is taken from what the live
+    // store actually accumulated.
+
+    fn line(content: &str) -> String {
+        format!("fact|{content}|medium")
+    }
+
+    /// Content that should always be accepted, used to build valid fixtures.
+    const GOOD: &str = "Production frontend logs to /var/log/nginx/clients_error.log, not clientes_error.log as previously assumed.";
+
+    #[test]
+    fn accepts_a_normal_memory() {
+        let out = parse_extracted_memories(&line(GOOD));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].category, "fact");
+        assert_eq!(out[0].trust, "medium");
+    }
+
+    #[test]
+    fn caps_the_number_of_memories_per_extraction() {
+        // Real session-end extractions returned 13 in one burst.
+        let response = (0..13)
+            .map(|i| line(&format!("{GOOD} Variant number {i} of this observation.")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = parse_extracted_memories(&response);
+        assert_eq!(
+            out.len(),
+            MAX_MEMORIES_PER_EXTRACTION,
+            "a model ignoring the prompt must still be capped in code"
+        );
+    }
+
+    #[test]
+    fn cap_keeps_the_models_own_ordering() {
+        let response = (0..8)
+            .map(|i| line(&format!("Observation {i}: {GOOD}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = parse_extracted_memories(&response);
+        assert!(out[0].content.starts_with("Observation 0"));
+        assert!(out[4].content.starts_with("Observation 4"));
+    }
+
+    #[test]
+    fn rejects_the_grep_i_class_case() {
+        // Literally what got stored: a 13-character shell fragment.
+        let out = parse_extracted_memories(&line("grep -i class"));
+        assert!(out.is_empty(), "a bare command is not a memory");
+    }
+
+    #[test]
+    fn rejects_content_below_the_minimum_length() {
+        let out = parse_extracted_memories(&line("short but wordy enough here"));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_multi_fact_blob() {
+        // The 1,035-char entry that fused ~5 facts and could never be
+        // reinforced or superseded per-fact.
+        let blob = "a".repeat(20) + &" and also something else entirely".repeat(40);
+        assert!(blob.chars().count() > MAX_MEMORY_CONTENT_CHARS);
+        let out = parse_extracted_memories(&line(&blob));
+        assert!(
+            out.is_empty(),
+            "oversized entries are rejected, not truncated"
+        );
+    }
+
+    #[test]
+    fn accepts_content_exactly_at_the_boundaries() {
+        // Lengths are measured AFTER trimming, so build fixtures that do not
+        // end on whitespace (an earlier version of this test tripped on
+        // exactly that and looked like a code bug).
+        let exactly = |n: usize| -> String {
+            let s: String = std::iter::repeat_n("word ", n)
+                .collect::<String>()
+                .chars()
+                .take(n)
+                .collect();
+            let s = s.trim_end().to_string();
+            format!("{s}{}", "x".repeat(n - s.chars().count()))
+        };
+
+        let min_len = exactly(MIN_MEMORY_CONTENT_CHARS);
+        assert_eq!(min_len.trim().chars().count(), MIN_MEMORY_CONTENT_CHARS);
+        assert!(
+            is_storable_memory_content(&min_len),
+            "the floor itself is allowed"
+        );
+
+        let max_len = exactly(MAX_MEMORY_CONTENT_CHARS);
+        assert_eq!(max_len.trim().chars().count(), MAX_MEMORY_CONTENT_CHARS);
+        assert!(
+            is_storable_memory_content(&max_len),
+            "the ceiling itself is allowed"
+        );
+
+        // One character either side must fail.
+        let too_short = exactly(MIN_MEMORY_CONTENT_CHARS - 1);
+        assert!(!is_storable_memory_content(&too_short));
+        let too_long = exactly(MAX_MEMORY_CONTENT_CHARS + 1);
+        assert!(!is_storable_memory_content(&too_long));
+    }
+
+    #[test]
+    fn rejects_symbol_soup_but_keeps_real_technical_prose() {
+        // Guard against the prose rule being too aggressive. This is the
+        // lowest alphabetic ratio (0.61) among the 35 memories actually
+        // stored on this machine - it must pass.
+        let real = "feebbo has 13,764 bounces from 1 IP (199.15.226.175) over 30d with reason 5.7.606, silently dropped before the fix.";
+        assert!(
+            is_storable_memory_content(real),
+            "IP- and number-heavy domain facts are exactly what we want to keep"
+        );
+
+        let soup =
+            "{{ 1234 ::: >>> ||| ### $$$ %%% 5678 @@@ *** === ++ -- // \\\\ ??? !!! ~~~ 999 }}";
+        assert!(
+            !is_storable_memory_content(soup),
+            "output fragments are not memories"
+        );
+    }
+
+    #[test]
+    fn ignores_malformed_lines() {
+        let response = format!(
+            "some preamble the model added\n{}\nfact|missing trust field\n\n",
+            line(GOOD)
+        );
+        let out = parse_extracted_memories(&response);
+        assert_eq!(out.len(), 1, "only the well-formed line survives");
+    }
+
+    #[test]
+    fn empty_response_yields_nothing() {
+        assert!(parse_extracted_memories("").is_empty());
+        assert!(parse_extracted_memories("No new memories worth extracting.").is_empty());
+    }
 
     struct EnvVarGuard {
         key: &'static str,

@@ -10,7 +10,7 @@
 //! - Surfaces relevant memories to main agent via PENDING_MEMORY
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -200,31 +200,20 @@ async fn run_final_extraction(transcript: String, session_id: String, working_di
 
     match result {
         Ok(extracted) if !extracted.is_empty() => {
-            let mut stored_count = 0;
+            // Same gate as the incremental path: dedup, reinforce, supersede.
+            // This used to write straight through with no checks at all, which
+            // put the weakest validation on the highest-volume producer.
+            let outcome =
+                ingest_extracted_memories(&manager, &sidecar, &extracted, &session_id).await;
 
-            for mem in &extracted {
-                let category = crate::memory::MemoryCategory::from_extracted(&mem.category);
-
-                let trust = match mem.trust.as_str() {
-                    "high" => crate::memory::TrustLevel::High,
-                    "low" => crate::memory::TrustLevel::Low,
-                    _ => crate::memory::TrustLevel::Medium,
-                };
-
-                let entry = crate::memory::MemoryEntry::new(category, &mem.content)
-                    .with_source(&session_id)
-                    .with_trust(trust);
-
-                if manager.remember_project(entry).is_ok() {
-                    stored_count += 1;
-                }
-            }
-
-            if stored_count > 0 {
+            if outcome.stored > 0 || outcome.reinforced > 0 {
                 crate::logging::info(&format!(
-                    "Final extraction for session {}: stored {} memories",
-                    session_id, stored_count
+                    "Final extraction for session {}: {} stored, {} reinforced, {} superseded",
+                    session_id, outcome.stored, outcome.reinforced, outcome.superseded
                 ));
+                crate::memory::add_event(MemoryEventKind::ExtractionComplete {
+                    count: outcome.stored + outcome.reinforced,
+                });
             }
         }
         Ok(_) => {
@@ -994,9 +983,6 @@ impl MemoryAgent {
             }
         };
 
-        // Similarity threshold for duplicate detection
-        const DUPLICATE_THRESHOLD: f32 = 0.90;
-
         // Run extraction in background - don't block the main flow
         tokio::spawn(async move {
             match sidecar
@@ -1010,142 +996,18 @@ impl MemoryAgent {
                     let mut reinforced_count = 0;
                     let mut superseded_count = 0;
 
-                    for mem in extracted {
-                        let category = match mem.category.as_str() {
-                            "fact" => memory::MemoryCategory::Fact,
-                            "preference" => memory::MemoryCategory::Preference,
-                            "correction" => memory::MemoryCategory::Correction,
-                            _ => memory::MemoryCategory::Fact,
-                        };
-
-                        let trust = match mem.trust.as_str() {
-                            "high" => memory::TrustLevel::High,
-                            "low" => memory::TrustLevel::Low,
-                            _ => memory::TrustLevel::Medium,
-                        };
-
-                        // Check for duplicate: find semantically similar existing memories
-                        let similar =
-                            memory_manager.find_similar(&mem.content, DUPLICATE_THRESHOLD, 1);
-
-                        if let Ok(matches) = similar
-                            && let Some((existing, _sim)) = matches.first()
-                        {
-                            let existing_id = existing.id.clone();
-                            let mut did_reinforce = false;
-
-                            if let Ok(mut graph) = memory_manager.load_project_graph()
-                                && graph.get_memory(&existing_id).is_some()
-                            {
-                                let strength = if let Some(entry) =
-                                    graph.get_memory_mut(&existing_id)
-                                {
-                                    entry.reinforce("incremental", 0);
-                                    entry.strength
-                                } else {
-                                    crate::logging::warn(&format!(
-                                        "Expected project memory {} during reinforcement, but it disappeared before update",
-                                        existing_id
-                                    ));
-                                    continue;
-                                };
-                                if memory_manager.save_project_graph(&graph).is_ok() {
-                                    did_reinforce = true;
-                                    crate::logging::info(&format!(
-                                        "Reinforced existing memory {} (strength={})",
-                                        existing_id, strength
-                                    ));
-                                }
-                            }
-
-                            if !did_reinforce
-                                && let Ok(mut graph) = memory_manager.load_global_graph()
-                                && graph.get_memory(&existing_id).is_some()
-                            {
-                                if let Some(entry) = graph.get_memory_mut(&existing_id) {
-                                    entry.reinforce("incremental", 0);
-                                    let _ = memory_manager.save_global_graph(&graph);
-                                    did_reinforce = true;
-                                } else {
-                                    crate::logging::warn(&format!(
-                                        "Expected global memory {} during reinforcement, but it disappeared before update",
-                                        existing_id
-                                    ));
-                                }
-                            }
-
-                            if did_reinforce {
-                                reinforced_count += 1;
-                                known_ids.push(existing_id.clone());
-                            }
-                            continue;
-                        }
-
-                        // No duplicate - check for contradiction in same category
-                        let contradiction_found =
-                            match memory_manager.find_similar(&mem.content, 0.5, 5) {
-                                Ok(candidates) => {
-                                    let mut found = None;
-                                    for (candidate, _) in &candidates {
-                                        if candidate.category == category {
-                                            match sidecar
-                                                .check_contradiction(
-                                                    &mem.content,
-                                                    &candidate.content,
-                                                )
-                                                .await
-                                            {
-                                                Ok(true) => {
-                                                    found = Some(candidate.id.clone());
-                                                    break;
-                                                }
-                                                Ok(false) => {}
-                                                Err(e) => {
-                                                    crate::logging::info(&format!(
-                                                        "Contradiction check failed: {}",
-                                                        e
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    found
-                                }
-                                Err(_) => None,
-                            };
-
-                        // Create the new memory
-                        let entry = memory::MemoryEntry::new(category, &mem.content)
-                            .with_source("incremental")
-                            .with_trust(trust);
-
-                        match memory_manager.remember_project(entry) {
-                            Ok(new_id) => {
-                                stored_count += 1;
-                                stored_ids.push(new_id.clone());
-
-                                // If contradiction found, supersede the old memory and add Contradicts edge
-                                if let Some(old_id) = contradiction_found
-                                    && let Ok(mut graph) = memory_manager.load_project_graph()
-                                {
-                                    graph.mark_contradiction(&new_id, &old_id);
-                                    if let Some(old_entry) = graph.get_memory_mut(&old_id) {
-                                        old_entry.supersede(&new_id);
-                                    }
-                                    if memory_manager.save_project_graph(&graph).is_ok() {
-                                        superseded_count += 1;
-                                        crate::logging::info(&format!(
-                                            "Superseded memory {} with {} (Contradicts edge added)",
-                                            old_id, new_id
-                                        ));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                crate::logging::info(&format!("Failed to store memory: {}", e));
-                            }
-                        }
-                    }
+                    let outcome = ingest_extracted_memories(
+                        &memory_manager,
+                        &sidecar,
+                        &extracted,
+                        "incremental",
+                    )
+                    .await;
+                    stored_count += outcome.stored;
+                    reinforced_count += outcome.reinforced;
+                    superseded_count += outcome.superseded;
+                    stored_ids.extend(outcome.stored_ids.iter().cloned());
+                    known_ids.extend(outcome.reinforced_ids.iter().cloned());
 
                     // Create DerivedFrom edges between co-extracted memories
                     if stored_ids.len() >= 2
@@ -1306,11 +1168,20 @@ impl MemoryAgent {
                 }
             }
 
-            // 7. Periodic garbage collection: prune low-confidence memories
+            // 7. Periodic garbage collection: retire aged-out memories, then
+            // delete ones that stayed retired through the grace window.
             let mut pruned = 0usize;
             if tick.is_multiple_of(CLUSTER_REFINEMENT_INTERVAL * 5) {
                 match prune_low_confidence(&memory_manager) {
-                    Ok(count) => pruned = count,
+                    Ok((retired, deleted)) => {
+                        pruned = retired + deleted;
+                        if retired > 0 || deleted > 0 {
+                            memory::add_event(MemoryEventKind::MaintenanceGarbageCollected {
+                                retired,
+                                deleted,
+                            });
+                        }
+                    }
                     Err(e) => {
                         crate::logging::info(&format!("Memory pruning failed: {}", e));
                     }
@@ -1496,11 +1367,246 @@ fn apply_cluster_assignment(
     }
 }
 
-fn prune_low_confidence(manager: &MemoryManager) -> Result<usize> {
-    let min_confidence = 0.15;
-    let min_age_hours = 24;
+/// Similarity above which an extracted memory is treated as a duplicate of an
+/// existing one and reinforces it instead of being stored again.
+const DUPLICATE_THRESHOLD: f32 = 0.90;
+
+/// What one batch of extracted memories did to the store.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct IngestOutcome {
+    pub stored: usize,
+    pub reinforced: usize,
+    pub superseded: usize,
+    pub stored_ids: Vec<String>,
+    pub reinforced_ids: Vec<String>,
+}
+
+/// Write a batch of extracted memories, deduplicating against what is already
+/// stored.
+///
+/// THE SINGLE WRITE PATH for extracted memories. Both callers - the mid-session
+/// incremental extraction and the session-end final extraction - go through
+/// here.
+///
+/// They did not always. Final extraction used to build entries and call
+/// `remember_project` directly: no similarity check, no reinforcement, no
+/// contradiction check. That was the higher-volume path (one real session ended
+/// with a 13-memory burst), so the weakest checks sat on the biggest producer,
+/// and repeat work on one topic duplicated memories instead of strengthening
+/// them. Dedup relied entirely on the model honouring an "Already known" list
+/// in the prompt, which nothing enforced.
+///
+/// Order matters: reinforce an existing near-duplicate BEFORE considering a
+/// contradiction, otherwise a restatement of a known fact looks like a conflict
+/// with itself.
+pub(crate) async fn ingest_extracted_memories(
+    manager: &MemoryManager,
+    sidecar: &crate::sidecar::Sidecar,
+    extracted: &[crate::sidecar::ExtractedMemory],
+    source: &str,
+) -> IngestOutcome {
+    let mut outcome = IngestOutcome::default();
+
+    for mem in extracted {
+        let category = memory::MemoryCategory::from_extracted(&mem.category);
+        let trust = match mem.trust.as_str() {
+            "high" => memory::TrustLevel::High,
+            "low" => memory::TrustLevel::Low,
+            _ => memory::TrustLevel::Medium,
+        };
+
+        // 1. Near-duplicate? Reinforce what we already have and move on.
+        if let Ok(matches) = manager.find_similar(&mem.content, DUPLICATE_THRESHOLD, 1)
+            && let Some((existing, _sim)) = matches.first()
+        {
+            let existing_id = existing.id.clone();
+            if reinforce_existing(manager, &existing_id, source) {
+                outcome.reinforced += 1;
+                outcome.reinforced_ids.push(existing_id);
+            }
+            continue;
+        }
+
+        // 2. Not a duplicate: does it contradict something in the same category?
+        let contradiction_found = match manager.find_similar(&mem.content, 0.5, 5) {
+            Ok(candidates) => {
+                let mut found = None;
+                for (candidate, _) in &candidates {
+                    if candidate.category != category {
+                        continue;
+                    }
+                    match sidecar
+                        .check_contradiction(&mem.content, &candidate.content)
+                        .await
+                    {
+                        Ok(true) => {
+                            found = Some(candidate.id.clone());
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            crate::logging::info(&format!("Contradiction check failed: {}", e));
+                        }
+                    }
+                }
+                found
+            }
+            Err(_) => None,
+        };
+
+        // 3. Store it.
+        let entry = memory::MemoryEntry::new(category, &mem.content)
+            .with_source(source)
+            .with_trust(trust);
+
+        match manager.remember_project(entry) {
+            Ok(new_id) => {
+                outcome.stored += 1;
+                outcome.stored_ids.push(new_id.clone());
+
+                if let Some(old_id) = contradiction_found
+                    && let Ok(mut graph) = manager.load_project_graph()
+                {
+                    graph.mark_contradiction(&new_id, &old_id);
+                    if let Some(old_entry) = graph.get_memory_mut(&old_id) {
+                        old_entry.supersede(&new_id);
+                    }
+                    if manager.save_project_graph(&graph).is_ok() {
+                        outcome.superseded += 1;
+                        crate::logging::info(&format!(
+                            "Superseded memory {} with {} (Contradicts edge added)",
+                            old_id, new_id
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                crate::logging::info(&format!("Failed to store memory: {}", e));
+            }
+        }
+    }
+
+    outcome
+}
+
+/// Reinforce an existing memory in whichever graph holds it.
+///
+/// Returns whether anything was actually reinforced.
+fn reinforce_existing(manager: &MemoryManager, existing_id: &str, source: &str) -> bool {
+    if let Ok(mut graph) = manager.load_project_graph()
+        && graph.get_memory(existing_id).is_some()
+    {
+        let strength = match graph.get_memory_mut(existing_id) {
+            Some(entry) => {
+                entry.reinforce(source, 0);
+                entry.strength
+            }
+            None => {
+                crate::logging::warn(&format!(
+                    "Expected project memory {} during reinforcement, but it disappeared before update",
+                    existing_id
+                ));
+                return false;
+            }
+        };
+        if manager.save_project_graph(&graph).is_ok() {
+            crate::logging::info(&format!(
+                "Reinforced existing memory {} (strength={})",
+                existing_id, strength
+            ));
+            return true;
+        }
+    }
+
+    if let Ok(mut graph) = manager.load_global_graph()
+        && graph.get_memory(existing_id).is_some()
+    {
+        if let Some(entry) = graph.get_memory_mut(existing_id) {
+            entry.reinforce(source, 0);
+            return manager.save_global_graph(&graph).is_ok();
+        }
+        crate::logging::warn(&format!(
+            "Expected global memory {} during reinforcement, but it disappeared before update",
+            existing_id
+        ));
+    }
+
+    false
+}
+
+/// Confidence below which a memory is no longer worth surfacing.
+pub(crate) const PRUNE_CONFIDENCE_FLOOR: f32 = 0.15;
+
+/// A memory must be at least this old before garbage collection considers it,
+/// so a burst of fresh extractions is never eaten before it can be used.
+const PRUNE_MIN_AGE_HOURS: i64 = 24;
+
+/// How long a retired memory is kept before it is actually deleted.
+///
+/// Retirement is reversible (the entry stays on disk with `active = false` and
+/// is simply not surfaced); deletion is not. Anything that is re-reinforced
+/// during this window comes back with its history intact.
+const RETIRED_GRACE_DAYS: i64 = 30;
+
+/// Decide what garbage collection should do with one memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GcAction {
+    /// Still useful: leave it alone.
+    Keep,
+    /// Age-decayed below the floor: stop surfacing it, but keep it on disk.
+    Retire,
+    /// Retired long ago and never came back: safe to delete.
+    Delete,
+}
+
+/// Garbage-collection decision for a single memory.
+///
+/// Runs on `retention_score_at()`, which decays from `updated_at` using the
+/// per-category half-life (corrections 365d, preferences 90d, entities 60d,
+/// facts 30d). The half-life logic already existed in `effective_confidence()`
+/// but was wired to nothing; raw confidence only ever moved via judge verdicts,
+/// so after the ADR-0021 fix a memory needed 43 consecutive rejections to be
+/// removed and the store became append-only in practice.
+///
+/// Retention decays from LAST USE, not from creation. Decaying from
+/// `created_at` would expire a memory reinforced every single day on its
+/// birthday, and the access-count boost cannot save it: that term is
+/// logarithmic (max ~2.1x) while age decay is exponential (0.03x at 150 days
+/// for a fact). Recency has to be the thing that keeps a memory alive.
+///
+/// Two-stage on purpose. Retention is a function of wall-clock time, so an
+/// entry crosses the floor on a schedule with no human in the loop. Retiring
+/// first makes the common case reversible and leaves evidence on disk; only an
+/// entry that has been retired for `RETIRED_GRACE_DAYS` and was never touched
+/// again is actually deleted.
+pub(crate) fn gc_action(entry: &MemoryEntry, now: DateTime<Utc>) -> GcAction {
+    // Never touch anything younger than the age floor, active or not.
+    if (now - entry.created_at).num_hours() < PRUNE_MIN_AGE_HOURS {
+        return GcAction::Keep;
+    }
+
+    if entry.active {
+        if entry.retention_score_at(now) < PRUNE_CONFIDENCE_FLOOR {
+            return GcAction::Retire;
+        }
+        return GcAction::Keep;
+    }
+
+    // Already retired. Delete only after the grace window, measured from the
+    // last time anything touched it, so reinforcement resets the clock.
+    if (now - entry.updated_at).num_days() >= RETIRED_GRACE_DAYS {
+        return GcAction::Delete;
+    }
+    GcAction::Keep
+}
+
+/// Periodic garbage collection over both graphs.
+///
+/// Returns (retired, deleted).
+fn prune_low_confidence(manager: &MemoryManager) -> Result<(usize, usize)> {
     let now = Utc::now();
-    let mut pruned = 0usize;
+    let mut retired_total = 0usize;
+    let mut deleted_total = 0usize;
 
     for scope in &["project", "global"] {
         let mut graph = if *scope == "project" {
@@ -1509,23 +1615,28 @@ fn prune_low_confidence(manager: &MemoryManager) -> Result<usize> {
             manager.load_global_graph()?
         };
 
-        let ids_to_prune: Vec<String> = graph
-            .memories
-            .iter()
-            .filter(|(_, entry)| {
-                let age_hours = (now - entry.created_at).num_hours();
-                age_hours >= min_age_hours && entry.confidence < min_confidence
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        let mut to_retire: Vec<String> = Vec::new();
+        let mut to_delete: Vec<String> = Vec::new();
+        for (id, entry) in graph.memories.iter() {
+            match gc_action(entry, now) {
+                GcAction::Keep => {}
+                GcAction::Retire => to_retire.push(id.clone()),
+                GcAction::Delete => to_delete.push(id.clone()),
+            }
+        }
 
-        if ids_to_prune.is_empty() {
+        if to_retire.is_empty() && to_delete.is_empty() {
             continue;
         }
 
-        for id in &ids_to_prune {
+        for id in &to_retire {
+            if let Some(entry) = graph.get_memory_mut(id) {
+                entry.active = false;
+                entry.updated_at = now;
+            }
+        }
+        for id in &to_delete {
             graph.remove_memory(id);
-            pruned += 1;
         }
 
         if *scope == "project" {
@@ -1534,18 +1645,28 @@ fn prune_low_confidence(manager: &MemoryManager) -> Result<usize> {
             manager.save_global_graph(&graph)?;
         }
 
-        if !ids_to_prune.is_empty() {
+        if !to_retire.is_empty() {
             crate::logging::info(&format!(
-                "Pruned {} low-confidence {} memories (conf < {}, age >= {}h)",
-                ids_to_prune.len(),
+                "Retired {} aged-out {} memories (effective confidence < {})",
+                to_retire.len(),
                 scope,
-                min_confidence,
-                min_age_hours
+                PRUNE_CONFIDENCE_FLOOR
             ));
         }
+        if !to_delete.is_empty() {
+            crate::logging::info(&format!(
+                "Deleted {} {} memories retired for over {} days",
+                to_delete.len(),
+                scope,
+                RETIRED_GRACE_DAYS
+            ));
+        }
+
+        retired_total += to_retire.len();
+        deleted_total += to_delete.len();
     }
 
-    Ok(pruned)
+    Ok((retired_total, deleted_total))
 }
 
 fn stable_hash(values: &[String]) -> u64 {

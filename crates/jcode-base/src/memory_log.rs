@@ -201,6 +201,11 @@ pub fn log_event(kind: &MemoryEventKind) {
             Some(serde_json::json!({ "candidates": candidates })),
         ),
 
+        MemoryEventKind::MaintenanceGarbageCollected { retired, deleted } => (
+            "maintenance_gc",
+            Some(serde_json::json!({ "retired": retired, "deleted": deleted })),
+        ),
+
         MemoryEventKind::MaintenanceComplete { latency_ms } => (
             "maintenance_complete",
             Some(serde_json::json!({ "latency_ms": latency_ms })),

@@ -275,6 +275,42 @@ def check_decay_without_verdict(res: Result, days: int) -> None:
     )
 
 
+def check_gc_sanity(res: Result, days: int) -> None:
+    """Garbage collection must retire before it deletes, and stay proportionate.
+
+    GC (ADR-0022) is the only mechanism that removes a memory nobody asked to
+    remove, and it fires on a wall-clock timer. Two failure shapes matter:
+    deletions with no retirements before them (the two-stage guarantee broken),
+    and a sweep eating a large share of the store at once.
+    """
+    retired = deleted = 0
+    for ev in _events(days):
+        if ev.get("event") == "maintenance_gc":
+            d = ev.get("detail", {})
+            retired += d.get("retired", 0) or 0
+            deleted += d.get("deleted", 0) or 0
+
+    total = sum(len(g.get("memories", {})) for _, g in _graphs())
+
+    problems = []
+    if deleted and not retired:
+        problems.append(f"{deleted} deleted with 0 retired (two-stage GC bypassed)")
+    if total and deleted > max(5, total // 2):
+        problems.append(f"{deleted} deleted vs {total} stored (sweep too aggressive)")
+
+    ok = not problems
+    res.add(
+        "GC_SANITY",
+        ok,
+        "; ".join(problems)
+        if problems
+        else f"{retired} retired, {deleted} deleted over {days}d ({total} stored)",
+        "Check gc_action(): retirement must precede deletion by RETIRED_GRACE_DAYS."
+        if not ok
+        else "",
+    )
+
+
 def check_running_binary(res: Result, _days: int) -> None:
     """Long-lived processes keep the inode they started with.
 
@@ -337,6 +373,7 @@ CHECKS = (
     check_stale_binary,
     check_backup_delta,
     check_decay_without_verdict,
+    check_gc_sanity,
     check_running_binary,
 )
 

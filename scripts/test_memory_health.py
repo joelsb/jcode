@@ -213,6 +213,34 @@ def defect_decay_without_a_verdict(home: pathlib.Path) -> str:
     return "DECAY_WITHOUT_VERDICT"
 
 
+def defect_gc_deletes_without_retiring(home: pathlib.Path) -> str:
+    """Two-stage GC bypassed: memories deleted with no retirement first.
+
+    ADR-0022 requires retire -> 30 day grace -> delete. A sweep that deletes
+    with zero retirements means gc_action() is returning Delete straight from
+    the active branch, which is how a timer-driven mechanism quietly turns into
+    data loss.
+    """
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = home / "logs" / f"memory-events-{day}.jsonl"
+    lines = path.read_text().splitlines()
+    lines.append(json.dumps({"timestamp": _iso(0), "event": "maintenance_gc",
+                             "detail": {"retired": 0, "deleted": 7}}))
+    path.write_text("\n".join(lines) + "\n")
+    return "GC_SANITY"
+
+
+def defect_gc_eats_the_store(home: pathlib.Path) -> str:
+    """A single sweep removing most of the store."""
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = home / "logs" / f"memory-events-{day}.jsonl"
+    lines = path.read_text().splitlines()
+    lines.append(json.dumps({"timestamp": _iso(0), "event": "maintenance_gc",
+                             "detail": {"retired": 3, "deleted": 400}}))
+    path.write_text("\n".join(lines) + "\n")
+    return "GC_SANITY"
+
+
 DEFECTS = [
     defect_all_periodic_extractions_404,
     defect_blended_rate_hides_outage,
@@ -223,6 +251,8 @@ DEFECTS = [
     defect_project_graph_decayed,
     defect_errors_with_zero_attempts,
     defect_decay_without_a_verdict,
+    defect_gc_deletes_without_retiring,
+    defect_gc_eats_the_store,
 ]
 
 

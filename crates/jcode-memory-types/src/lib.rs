@@ -176,6 +176,13 @@ pub enum MemoryEventKind {
     MaintenanceTagInferred { tag: String, applied: usize },
     /// Background maintenance detected a gap.
     MaintenanceGap { candidates: usize },
+    /// Background garbage collection retired aged-out memories and/or deleted
+    /// ones that stayed retired through the grace window.
+    ///
+    /// Emitted whenever either count is non-zero so that deletion is never
+    /// silent: this is the only path that removes a memory the user did not
+    /// ask to remove.
+    MaintenanceGarbageCollected { retired: usize, deleted: usize },
     /// Background maintenance completed.
     MaintenanceComplete { latency_ms: u64 },
     /// Extraction started.
@@ -343,6 +350,50 @@ impl MemoryEntry {
         }
     }
 
+    /// Retention score used by garbage collection.
+    ///
+    /// Deliberately NOT the same as [`effective_confidence`](Self::effective_confidence),
+    /// which decays from `created_at`. That is the right shape for "how much do
+    /// I trust this claim" (an old fact about a codebase really is more likely
+    /// to be stale) but the wrong shape for "should I delete this": it means a
+    /// memory reinforced every single day still expires on its birthday.
+    ///
+    /// Retention therefore decays from `updated_at` - the last time anything
+    /// reinforced, boosted or touched the entry - so the clock restarts on
+    /// every use. An entry nobody has touched in four half-lives is genuinely
+    /// cold; one used yesterday scores near its raw confidence no matter how
+    /// old it is.
+    ///
+    /// The access-count term is kept but is not load-bearing: it is
+    /// logarithmic (max ~2.1x) and cannot offset exponential decay (a 150-day
+    /// untouched fact sits at 0.03x), which is exactly why recency, not the
+    /// access count, has to be the thing that keeps a memory alive.
+    pub fn retention_score_at(&self, now: DateTime<Utc>) -> f32 {
+        let idle_days = (now - self.updated_at).num_days().max(0) as f32;
+        let half_life = self.category_half_life_days();
+
+        let decay = (-idle_days / half_life * 0.693).exp();
+        let access_boost = 1.0 + 0.1 * (self.access_count as f32 + 1.0).ln();
+
+        (self.confidence * decay * access_boost).min(1.0)
+    }
+
+    /// Per-category half-life in days, shared by confidence decay and retention.
+    ///
+    /// - Correction: 365 days (user corrections are high value)
+    /// - Preference: 90 days (preferences may evolve)
+    /// - Entity: 60 days (entities change moderately)
+    /// - Fact: 30 days (codebase facts can become stale)
+    pub fn category_half_life_days(&self) -> f32 {
+        match self.category {
+            MemoryCategory::Correction => 365.0,
+            MemoryCategory::Preference => 90.0,
+            MemoryCategory::Fact => 30.0,
+            MemoryCategory::Entity => 60.0,
+            MemoryCategory::Custom(_) => 45.0, // Default for custom categories
+        }
+    }
+
     /// Get effective confidence after time-based decay
     /// Half-life varies by category:
     /// - Correction: 365 days (user corrections are high value)
@@ -350,14 +401,19 @@ impl MemoryEntry {
     /// - Fact: 30 days (codebase facts can become stale)
     /// - Entity: 60 days (entities change moderately)
     pub fn effective_confidence(&self) -> f32 {
-        let age_days = (Utc::now() - self.created_at).num_days() as f32;
-        let half_life = match self.category {
-            MemoryCategory::Correction => 365.0,
-            MemoryCategory::Preference => 90.0,
-            MemoryCategory::Fact => 30.0,
-            MemoryCategory::Entity => 60.0,
-            MemoryCategory::Custom(_) => 45.0, // Default for custom categories
-        };
+        self.effective_confidence_at(Utc::now())
+    }
+
+    /// Same as [`effective_confidence`](Self::effective_confidence) but with an
+    /// injected clock.
+    ///
+    /// Garbage collection deletes on a related value, so it has to be testable
+    /// without waiting real days and without every call site re-reading the
+    /// wall clock (a sweep must classify every entry against ONE instant, or a
+    /// long sweep could judge two entries by different "now"s).
+    pub fn effective_confidence_at(&self, now: DateTime<Utc>) -> f32 {
+        let age_days = (now - self.created_at).num_days() as f32;
+        let half_life = self.category_half_life_days();
 
         // Exponential decay: confidence * e^(-age/half_life * ln(2))
         // Also boost slightly for access count
