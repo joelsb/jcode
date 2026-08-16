@@ -184,3 +184,98 @@ fn dynamic_gate_empty_input_returns_empty() {
     let out = dynamic_gate_select(Vec::new(), 5);
     assert!(out.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Regression: an unreachable judge must never destroy memory.
+//
+// 2026-08-04..15 the sidecar was pinned to a model id that no longer existed
+// (`claude-haiku-4-5-20241022`), so every rerank 404'd. The rerank surfaced
+// nothing, which put EVERY candidate into `rejected_ids`, which decayed them,
+// which walked confidence under the 0.15 prune floor. The global graph went
+// 2 -> 0 memories at 2026-08-10T09:35:34 with no error visible to the user.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decay_targets_empty_when_judge_did_not_run() {
+    let rejected = vec!["mem_a".to_string(), "mem_b".to_string()];
+    assert!(
+        decay_targets(false, &rejected).is_empty(),
+        "judge failure must not be read as rejection"
+    );
+}
+
+#[test]
+fn decay_targets_pass_through_on_real_verdict() {
+    let rejected = vec!["mem_a".to_string()];
+    assert_eq!(
+        decay_targets(true, &rejected),
+        rejected.as_slice(),
+        "a real verdict still decays what it rejected"
+    );
+}
+
+#[test]
+fn repeated_judge_failures_never_prune_the_store() {
+    let _guard = crate::storage::lock_test_env();
+    let old = std::env::var("JCODE_HOME").ok();
+    let dir = std::env::temp_dir().join(format!(
+        "jcode-judge-outage-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::env::set_var("JCODE_HOME", &dir);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let manager =
+            crate::memory::MemoryManager::new().with_project_dir("/tmp/jcode-judge-outage");
+
+        // A memory old enough for the pruner to consider (age >= 24h).
+        let mut entry = MemoryEntry::new(MemoryCategory::Fact, "load-bearing fact")
+            .with_embedding(vec![1.0, 0.0]);
+        entry.created_at = Utc::now() - chrono::Duration::hours(72);
+        entry.confidence = 0.5;
+        let id = manager.remember_project(entry).unwrap();
+
+        // Replay the real outage: 67 consecutive turns where the judge never
+        // answered, so the candidate lands in rejected_ids every time.
+        let rejected = vec![id.clone()];
+        for _ in 0..67 {
+            let targets = decay_targets(false, &rejected);
+            apply_confidence_updates(&manager, &[], targets);
+        }
+
+        let after = manager
+            .load_project_graph()
+            .unwrap()
+            .get_memory(&id)
+            .map(|e| e.confidence);
+        assert_eq!(
+            after,
+            Some(0.5),
+            "confidence must be untouched by 67 judge failures"
+        );
+
+        let pruned = prune_low_confidence(&manager).unwrap();
+        assert_eq!(pruned, 0, "nothing may be pruned after a judge outage");
+        assert!(
+            manager
+                .load_project_graph()
+                .unwrap()
+                .get_memory(&id)
+                .is_some(),
+            "the memory must survive the outage"
+        );
+    }));
+
+    match old {
+        Some(v) => crate::env::set_var("JCODE_HOME", v),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(p) = result {
+        std::panic::resume_unwind(p);
+    }
+}

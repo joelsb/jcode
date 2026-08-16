@@ -33,6 +33,17 @@ struct RetrievalContext {
     rejected_ids: Vec<String>,
     /// Brief snippet of the context for gap logging
     context_snippet: String,
+    /// Whether an LLM judge actually returned a verdict this turn.
+    ///
+    /// CRITICAL: only a real verdict may decay confidence. When the judge is
+    /// unreachable (transport error, 404 on a stale model id, logged out) the
+    /// rerank surfaces nothing, so EVERY candidate lands in `rejected_ids` even
+    /// though nothing judged them irrelevant. Decaying on that path turns "we
+    /// could not check" into evidence against the memory, and repeated failures
+    /// walk confidence below the prune floor until the store silently empties.
+    /// Observed 2026-08-04..15: a stale sidecar model id produced 67 judge 404s
+    /// and wiped the global graph. See docs/adr/0021-memory-decay-requires-a-verdict.md.
+    judge_ran: bool,
 }
 
 /// Channel capacity for context updates
@@ -722,6 +733,7 @@ impl MemoryAgent {
             should_run_rerank(ss.turn_count, ss.last_rerank_turn, cadence, topic_changed)
         };
 
+        let mut judge_ran = false;
         let relevant = if let Some(sidecar) = self.live_sidecar() {
             if should_rerank {
                 let agents = &crate::config::config().agents;
@@ -752,7 +764,9 @@ impl MemoryAgent {
                 );
                 if outcome == crate::memory_rerank::RerankOutcome::Judged {
                     // Real judge verdict: surface it and remember it as the new
-                    // verified set for future cadence/failure carries.
+                    // verified set for future cadence/failure carries. This is
+                    // the ONLY path allowed to decay confidence downstream.
+                    judge_ran = true;
                     let result: Vec<_> = reranked.into_iter().take(MAX_MEMORIES_PER_TURN).collect();
                     {
                         let ss = self.session_state(session_id);
@@ -823,6 +837,7 @@ impl MemoryAgent {
             verified_ids: verified_ids.clone(),
             rejected_ids,
             context_snippet: jcode_core::util::truncate_str(&context, 200).to_string(),
+            judge_ran,
         };
 
         // Step 4: Format and store for main agent
@@ -1237,8 +1252,13 @@ impl MemoryAgent {
             // Each graph is loaded and saved ONCE for the whole turn instead of
             // once per id (graphs are multi-MB JSON; per-id round trips rewrote
             // megabytes 5-10x per turn).
+            //
+            // Decay ONLY when a judge actually returned a verdict. Without this
+            // gate an unreachable judge marks every candidate "rejected" and
+            // silently decays the whole store to nothing (see RetrievalContext::judge_ran).
+            let rejected_for_decay: &[String] = decay_targets(ctx.judge_ran, &ctx.rejected_ids);
             let (boosted, decayed) =
-                apply_confidence_updates(&memory_manager, &ctx.verified_ids, &ctx.rejected_ids);
+                apply_confidence_updates(&memory_manager, &ctx.verified_ids, rejected_for_decay);
             if boosted > 0 || decayed > 0 {
                 memory::add_event(MemoryEventKind::MaintenanceConfidence { boosted, decayed });
             }
@@ -1702,6 +1722,17 @@ async fn discover_links(manager: &MemoryManager, memory_ids: &[String]) -> Resul
     }
 
     Ok(linked)
+}
+
+/// Which retrieved-but-unsurfaced memories may have their confidence decayed.
+///
+/// A memory loses confidence only when a judge looked at it and said "not
+/// relevant". If no judge returned a verdict this turn, `rejected_ids` merely
+/// means "we could not check", and decaying on it destroys the store: repeated
+/// judge failures walk every memory below the 0.15 prune floor. Returns an
+/// empty slice unless a verdict actually happened.
+fn decay_targets(judge_ran: bool, rejected_ids: &[String]) -> &[String] {
+    if judge_ran { rejected_ids } else { &[] }
 }
 
 /// Apply confidence boosts (verified) and decays (rejected) in a single pass
