@@ -3,7 +3,8 @@
 use super::socket::sibling_socket_path;
 #[cfg(unix)]
 use super::socket::{
-    daemon_lock_path, server_start_matches_existing_server, try_acquire_daemon_lock,
+    daemon_lock_path, daemon_lock_path_for, server_start_matches_existing_server,
+    try_acquire_daemon_lock,
 };
 use super::{
     ReloadPhase, ReloadState, ReloadWaitStatus, await_reload_handoff, cleanup_socket_pair,
@@ -74,6 +75,53 @@ async fn connect_socket_preserves_refused_socket_path() {
         socket_path.exists(),
         "connect_socket should not unlink the socket path on connection refusal"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_lock_is_keyed_per_socket_not_per_runtime_dir() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+    crate::env::set_var("JCODE_RUNTIME_DIR", temp.path());
+
+    // The default socket keeps the historical lock filename.
+    let default_socket = temp.path().join("jcode.sock");
+    assert_eq!(
+        daemon_lock_path_for(&default_socket),
+        temp.path().join("jcode-daemon.lock")
+    );
+    assert_eq!(daemon_lock_path(), temp.path().join("jcode-daemon.lock"));
+
+    // A `--socket` daemon in the same runtime dir gets its own lock, so holding
+    // the default lock must not block it.
+    let alt_socket = temp.path().join("jcode-or-opus5.sock");
+    let alt_lock = daemon_lock_path_for(&alt_socket);
+    assert_eq!(alt_lock, temp.path().join("jcode-or-opus5-daemon.lock"));
+
+    let default_lock = try_acquire_daemon_lock(&daemon_lock_path_for(&default_socket))
+        .expect("acquire default lock")
+        .expect("default lock should be free");
+    let alt = try_acquire_daemon_lock(&alt_lock)
+        .expect("acquire alt lock")
+        .expect("a distinct socket must get its own daemon lock");
+
+    // Same socket twice is still mutually exclusive.
+    assert!(
+        try_acquire_daemon_lock(&alt_lock)
+            .expect("second alt lock attempt")
+            .is_none(),
+        "two daemons must not share one socket"
+    );
+
+    drop(alt);
+    drop(default_lock);
+
+    if let Some(prev_runtime) = prev_runtime {
+        crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
+    } else {
+        crate::env::remove_var("JCODE_RUNTIME_DIR");
+    }
 }
 
 #[cfg(unix)]
