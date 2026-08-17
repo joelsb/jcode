@@ -66,8 +66,12 @@ impl App {
     }
 
     fn configured_remote_provider_hint(&self) -> Option<String> {
-        std::env::var("JCODE_PROVIDER")
+        // `--provider-profile` from this process wins over config defaults: the
+        // header must describe the session being launched, not the global
+        // `[provider] default_provider`.
+        std::env::var(crate::CLI_PROVIDER_HINT_ENV)
             .ok()
+            .or_else(|| std::env::var("JCODE_PROVIDER").ok())
             .or_else(|| crate::config::config().provider.default_provider.clone())
             .map(|provider| provider.trim().to_string())
             .filter(|provider| !provider.is_empty())
@@ -75,8 +79,10 @@ impl App {
 
     fn configured_remote_model_hint(&self) -> Option<String> {
         Self::sanitize_remote_model_hint(
-            std::env::var("JCODE_MODEL")
+            // Same precedence as above for `-m/--model`.
+            std::env::var(crate::CLI_MODEL_HINT_ENV)
                 .ok()
+                .or_else(|| std::env::var("JCODE_MODEL").ok())
                 .or_else(|| crate::config::config().provider.default_model.clone()),
         )
     }

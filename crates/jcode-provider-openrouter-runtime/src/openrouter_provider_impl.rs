@@ -386,6 +386,30 @@ impl Provider for OpenRouterProvider {
         // untouched so cross-provider switches from a saved session still work.
         let trimmed = self.strip_session_profile_prefix(trimmed);
 
+        // A built-in routing prefix (`claude-oauth:`, `openai-api:`, ...) names a
+        // provider this runtime is not. `strip_session_profile_prefix`
+        // deliberately leaves those intact, and everything downstream then treats
+        // the whole string as a model id, so a `/model` pick of an OAuth Claude
+        // route on a profile-bound session used to POST
+        // `model: "claude-oauth:claude-sonnet-5"` at the profile's endpoint and
+        // come back as a confusing upstream 404 model_not_found. Fail here with a
+        // message that names the actual problem instead.
+        //
+        // `openrouter:` is exempt: this runtime *is* the OpenRouter/
+        // OpenAI-compatible slot, so that prefix is self-referential.
+        if let Some(profile_id) = self.profile_id.as_deref()
+            && let Some((_, prefix, bare)) =
+                jcode_provider_core::explicit_model_provider_prefix(trimmed)
+            && prefix != "openrouter:"
+        {
+            anyhow::bail!(
+                "Model '{trimmed}' routes through a different provider than the active \
+                 `{profile_id}` profile, which cannot serve it. Pick a `{profile_id}` model \
+                 from `/model` (e.g. '{bare}'), or start a session without \
+                 `--provider-profile {profile_id}` to use that route."
+            );
+        }
+
         let (model_id, provider) = if self.supports_provider_features {
             let (model_id, provider) = parse_model_spec(trimmed);
             let model_id = if provider.is_some() {

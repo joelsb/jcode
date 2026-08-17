@@ -1577,6 +1577,58 @@ mod tests {
         }
     }
 
+    /// The header must describe the session this process launched, not the
+    /// global config defaults.
+    ///
+    /// Observed 2026-08-17: `jcode --provider-profile omniroute -m claude-sonnet-5`
+    /// rendered "oauth:claude · Claude 5 Opus" (the `[provider]` defaults in
+    /// config.toml) for the whole pre-History window, so a correctly routed
+    /// session looked like its flags had been ignored. The daemon and the saved
+    /// session were right the whole time; only this surface lied.
+    #[test]
+    fn build_persistent_header_prefers_cli_launch_hints_over_config_defaults() {
+        let _guard = crate::storage::lock_test_env();
+        let prev_model = std::env::var_os("JCODE_MODEL");
+        let prev_provider = std::env::var_os("JCODE_PROVIDER");
+        let prev_model_hint = std::env::var_os(crate::CLI_MODEL_HINT_ENV);
+        let prev_provider_hint = std::env::var_os(crate::CLI_PROVIDER_HINT_ENV);
+
+        // Stand in for the config defaults a shared machine carries.
+        crate::env::set_var("JCODE_MODEL", "claude-opus-5");
+        crate::env::set_var("JCODE_PROVIDER", "claude");
+        // What this process was actually launched with.
+        crate::env::set_var(crate::CLI_MODEL_HINT_ENV, "claude-sonnet-5");
+        crate::env::set_var(crate::CLI_PROVIDER_HINT_ENV, "omniroute");
+
+        let app = crate::tui::app::App::new_for_remote(None);
+        let rendered = build_persistent_header(&app, 100)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        let restore = |key: &str, value: Option<std::ffi::OsString>| {
+            if let Some(value) = value {
+                crate::env::set_var(key, value);
+            } else {
+                crate::env::remove_var(key);
+            }
+        };
+        restore("JCODE_MODEL", prev_model);
+        restore("JCODE_PROVIDER", prev_provider);
+        restore(crate::CLI_MODEL_HINT_ENV, prev_model_hint);
+        restore(crate::CLI_PROVIDER_HINT_ENV, prev_provider_hint);
+
+        assert!(
+            rendered.to_ascii_lowercase().contains("sonnet"),
+            "header should show the launched model, got: {rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("opus"),
+            "header must not advertise the config default model, got: {rendered}"
+        );
+    }
+
     #[test]
     fn build_header_lines_omits_placeholder_provider_label_when_unknown() {
         // Reads model/provider env-derived state: without the env lock, the

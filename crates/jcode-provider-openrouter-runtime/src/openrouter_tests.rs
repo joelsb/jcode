@@ -3207,3 +3207,65 @@ fn named_openai_compatible_provider_keeps_stable_name_and_profile_display_name()
     assert_eq!(provider.runtime_display_name(), "example-compat");
     assert_eq!(Provider::display_name(&provider), "example-compat");
 }
+
+/// A `/model` pick that names another provider's route must fail locally with a
+/// message about routing, not be sent verbatim as a model id.
+///
+/// Observed 2026-08-17: in a session started with `--provider-profile omniroute`,
+/// picking the OAuth Claude route made jcode POST
+/// `model: "claude-oauth:claude-sonnet-5"` to the profile's
+/// `/v1/chat/completions`, which answered `404 model_not_found`. The
+/// user-visible error blamed the endpoint and the model name, so nothing pointed
+/// at the actual cause: that route cannot be served by this profile at all.
+#[test]
+fn named_profile_rejects_cross_provider_route_prefix_instead_of_sending_it_upstream() {
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+
+    let profile = jcode_base::config::NamedProviderConfig {
+        base_url: "http://localhost:20128/v1".to_string(),
+        auth: jcode_base::config::NamedProviderAuth::None,
+        default_model: Some("claude-opus-5".to_string()),
+        models: vec![
+            jcode_base::config::NamedProviderModelConfig {
+                id: "claude-opus-5".to_string(),
+                ..Default::default()
+            },
+            jcode_base::config::NamedProviderModelConfig {
+                id: "claude-sonnet-5".to_string(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let provider = OpenRouterProvider::new_named_openai_compatible("omniroute", &profile)
+        .expect("named profile should initialize");
+
+    for spec in [
+        "claude-oauth:claude-sonnet-5",
+        "claude-api:claude-sonnet-5",
+        "openai-api:gpt-5.5",
+        "copilot:gpt-5.5",
+    ] {
+        let err = provider
+            .set_model(spec)
+            .expect_err("a foreign provider route must not be accepted as a model id");
+        let message = err.to_string();
+        assert!(
+            message.contains("omniroute"),
+            "error should name the active profile, got: {message}"
+        );
+        assert_eq!(
+            provider.model(),
+            "claude-opus-5",
+            "a rejected switch must leave the active model untouched"
+        );
+    }
+
+    // The bare model id and this runtime's own `openrouter:` prefix still work.
+    provider
+        .set_model("claude-sonnet-5")
+        .expect("a profile model must still be selectable");
+    assert_eq!(provider.model(), "claude-sonnet-5");
+}

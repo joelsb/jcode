@@ -93,6 +93,20 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         crate::env::set_var("JCODE_PROVIDER_PROFILE_NAME", profile_name);
         crate::env::set_var("JCODE_PROVIDER_PROFILE_ACTIVE", "1");
         args.provider = ProviderChoice::OpenaiCompatible;
+        // Display-only hint for the TUI header. Deliberately NOT `JCODE_PROVIDER`,
+        // which `Config::apply_env_overrides` turns into `default_provider` and
+        // would change real provider resolution in both client and daemon.
+        crate::env::set_var(crate::CLI_PROVIDER_HINT_ENV, profile_name);
+    }
+    if let Some(model) = args
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        // Same reasoning as above: `JCODE_MODEL` would override
+        // `[provider] default_model` for every consumer, not just the header.
+        crate::env::set_var(crate::CLI_MODEL_HINT_ENV, model);
     }
 
     if let Some(tool_profile) = args.tool_profile.as_deref() {

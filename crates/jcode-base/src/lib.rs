@@ -17,6 +17,18 @@
     clippy::useless_conversion
 )]
 
+/// Display-only hint carrying the `--provider-profile` this process launched
+/// with, for header/status surfaces in the thin TUI client.
+///
+/// Deliberately separate from `JCODE_PROVIDER`, which `Config::apply_env_overrides`
+/// promotes into `[provider] default_provider` and therefore changes real
+/// provider resolution. These hints must never influence routing.
+pub const CLI_PROVIDER_HINT_ENV: &str = "JCODE_CLI_PROVIDER_HINT";
+
+/// Display-only hint carrying the `-m/--model` this process launched with.
+/// See [`CLI_PROVIDER_HINT_ENV`] for why this is not `JCODE_MODEL`.
+pub const CLI_MODEL_HINT_ENV: &str = "JCODE_CLI_MODEL_HINT";
+
 pub mod auth;
 pub mod background;
 pub mod browser;
