@@ -125,6 +125,73 @@ pub(super) async fn remove_session_entry<T>(
     removed
 }
 
+/// Prune `~/.jcode/active_pids` markers that no longer describe a live session.
+///
+/// Server-owned sessions all record the *daemon's* PID, not the PID of the
+/// terminal the user closed. Liveness is `kill(pid, 0)`, so every marker this
+/// daemon ever wrote answers "alive" for as long as the daemon runs, and the
+/// only path that clears one is a clean socket close reaching
+/// `remove_session_entry`. Windows that die without that handshake (SIGKILL,
+/// terminal closed, crash) leak a marker forever and presence UIs keep counting
+/// them: observed 16 markers against 8 live clients, 11 of them naming one
+/// 1d17h-old daemon.
+///
+/// Two classes are evicted:
+///   1. markers holding *our* PID with no resident agent in `sessions` - the
+///      daemon is authoritative about its own sessions, so absence is proof;
+///   2. markers naming a process that is simply gone.
+///
+/// A marker whose PID belongs to some other live process is left alone: another
+/// daemon or a local (non-daemon) session owns it and is responsible for it.
+///
+/// The `sessions` membership check happens under the read lock at eviction
+/// time so a session created between the scan and the decision is not
+/// clobbered.
+/// Generic over the map value: the reconciler only ever asks whether a session
+/// id is resident, never what the agent is. That keeps the unit test free of a
+/// full `Agent` (which needs a live provider and registry) and mirrors
+/// [`remove_session_entry`].
+async fn reconcile_owned_active_pids<T>(
+    sessions: &Arc<RwLock<HashMap<String, T>>>,
+) -> usize {
+    let own_pid = std::process::id();
+    let mut evicted = 0usize;
+
+    for session_id in crate::storage::active_session_ids() {
+        let Some(pid) = crate::storage::active_pid_for_session(&session_id) else {
+            // Unparseable/empty marker: nothing can own this, drop it.
+            crate::storage::unregister_active_pid(&session_id);
+            evicted += 1;
+            continue;
+        };
+
+        let ours = pid == own_pid;
+        if !ours && crate::storage::process_is_running(pid) {
+            // Someone else's live session. Not our business.
+            continue;
+        }
+
+        if ours {
+            // Re-check membership under the lock: a session registered since
+            // the scan started must survive.
+            if sessions.read().await.contains_key(&session_id) {
+                continue;
+            }
+        }
+
+        crate::storage::unregister_active_pid(&session_id);
+        evicted += 1;
+        crate::logging::info(&format!(
+            "active_pids: evicted stale marker for {} (pid {}, {})",
+            session_id,
+            pid,
+            if ours { "ours, no live agent" } else { "dead process" },
+        ));
+    }
+
+    evicted
+}
+
 const SERVER_NAME_ENV: &str = "JCODE_SERVER_NAME";
 const SERVER_DISPLAY_NAME_ENV: &str = "JCODE_SERVER_DISPLAY_NAME";
 const MAX_CONFIGURED_SERVER_NAME_LEN: usize = 64;
@@ -1407,6 +1474,21 @@ impl Server {
         // This watches the same "running" member signal Waybar surfaces as
         // "N streaming" and toggles a best-effort OS power inhibitor accordingly.
         Self::spawn_power_inhibitor(Arc::clone(&self.swarm_state.members));
+
+        // Prune leaked active-pid markers. `remove_session_entry` only fires on a
+        // clean socket close, so any window that dies without one leaves a marker
+        // naming this daemon's PID, which `kill(pid, 0)` reports alive forever.
+        // Without this loop the presence count only ever grows.
+        let reconcile_sessions = Arc::clone(&self.sessions);
+        tokio::spawn(async move {
+            const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+            let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                reconcile_owned_active_pids(&reconcile_sessions).await;
+            }
+        });
 
         // Initialize the memory agent early so it's ready for all sessions
         if crate::config::config().features.memory {

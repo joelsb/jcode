@@ -118,6 +118,16 @@ pub fn find_active_session_id_by_pid(pid: u32) -> Option<String> {
     None
 }
 
+/// Read the PID recorded for `session_id`, if a marker exists and parses.
+pub fn active_pid_for_session(session_id: &str) -> Option<u32> {
+    let dir = active_pids_dir()?;
+    std::fs::read_to_string(dir.join(session_id))
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
 /// List active session IDs currently tracked in `~/.jcode/active_pids`.
 pub fn active_session_ids() -> Vec<String> {
     let Some(dir) = active_pids_dir() else {
@@ -134,7 +144,7 @@ pub fn active_session_ids() -> Vec<String> {
 }
 
 #[cfg(unix)]
-fn process_is_running(pid: u32) -> bool {
+pub fn process_is_running(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -143,7 +153,7 @@ fn process_is_running(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_is_running(pid: u32) -> bool {
+pub fn process_is_running(pid: u32) -> bool {
     // Best-effort fallback for platforms where this low-level storage crate does
     // not have a process API. The active PID file is still useful, and stale
     // entries are cleaned up by higher-level session lifecycle code.

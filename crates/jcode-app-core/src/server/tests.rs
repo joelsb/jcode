@@ -101,6 +101,79 @@ async fn removing_server_session_clears_active_pid_marker() {
     );
 }
 
+/// The reconciler must evict exactly the leaked markers and nothing else.
+///
+/// Each planted marker is a distinct real failure mode, so a regression that
+/// over-prunes (killing a live session's presence) or under-prunes (the original
+/// bug) fails a named assertion rather than a count.
+#[tokio::test]
+async fn reconciler_evicts_only_leaked_active_pid_markers() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("create temporary JCODE_HOME");
+    let _home_guard = ScopedEnvVar::set("JCODE_HOME", home.path());
+
+    let own = std::process::id();
+    // Almost certainly not a live process.
+    let dead = 999_999u32;
+    // A live PID that is not us: PID 1 always exists and we never own it.
+    let other_live = 1u32;
+
+    // Ours, with a resident agent: must survive.
+    crate::storage::register_active_pid("session_live", own);
+    // Ours, no resident agent: the leak this fix targets.
+    crate::storage::register_active_pid("session_leaked", own);
+    // Dead owner: evict regardless of ownership.
+    crate::storage::register_active_pid("session_dead", dead);
+    // Live but owned by another process: not ours to touch.
+    crate::storage::register_active_pid("session_foreign", other_live);
+    // Garbage payload: nothing can own it.
+    if let Some(dir) = crate::storage::active_pids_dir() {
+        let _ = std::fs::write(dir.join("session_garbage"), "not-a-pid");
+    }
+
+    // Only `session_live` is resident in the daemon. The reconciler is generic
+    // over the map value and only tests key residency, so a marker value is
+    // enough; a real `Agent` needs a live provider and registry.
+    let sessions = Arc::new(RwLock::new(HashMap::from([(
+        "session_live".to_string(),
+        "agent",
+    )])));
+
+    let evicted = super::reconcile_owned_active_pids(&sessions).await;
+
+    let remaining = crate::storage::active_session_ids();
+    let has = |id: &str| remaining.iter().any(|entry| entry == id);
+
+    assert!(
+        has("session_live"),
+        "a marker for a resident session must never be evicted"
+    );
+    assert!(
+        has("session_foreign"),
+        "a live marker owned by another process is not ours to prune"
+    );
+    assert!(
+        !has("session_leaked"),
+        "our own marker with no resident agent is the leak and must be evicted"
+    );
+    assert!(
+        !has("session_dead"),
+        "a marker naming a dead process must be evicted"
+    );
+    assert!(
+        !has("session_garbage"),
+        "an unparseable marker must be evicted"
+    );
+    assert_eq!(evicted, 3, "exactly the three bad markers were evicted");
+
+    // Idempotent: a second pass finds nothing new to do.
+    assert_eq!(
+        super::reconcile_owned_active_pids(&sessions).await,
+        0,
+        "reconciling a clean registry must be a no-op"
+    );
+}
+
 #[test]
 fn configured_server_name_normalizes_operator_labels() {
     assert_eq!(

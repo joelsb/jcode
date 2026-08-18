@@ -71,12 +71,24 @@ fn create_visible_spawn_session(
     route_api_method_override: Option<&str>,
     effort_override: Option<&str>,
     selfdev_requested: bool,
+    parent_session_id: Option<&str>,
 ) -> anyhow::Result<(String, PathBuf)> {
     let cwd = working_dir
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let mut session = Session::create(None, None);
+    // Record the spawning coordinator as the parent. This is what marks the
+    // worker as an internal session, which keeps it out of user-facing presence
+    // UIs like the menu bar count (issue #508). The headless spawn path always
+    // passed a parent; the headed path did not, so headed swarm workers were
+    // born orphaned and were counted as top-level sessions the user opened.
+    let mut session = Session::create(
+        parent_session_id
+            .map(str::trim)
+            .filter(|parent| !parent.is_empty())
+            .map(str::to_string),
+        None,
+    );
     session.working_dir = Some(cwd.display().to_string());
     if let Some(model) = model_override {
         session.model = Some(model.to_string());
@@ -434,6 +446,7 @@ fn prepare_visible_spawn_session<F>(
     effort_override: Option<&str>,
     selfdev_requested: bool,
     startup_message: Option<&str>,
+    parent_session_id: Option<&str>,
     launch_visible: F,
 ) -> anyhow::Result<(String, bool)>
 where
@@ -447,6 +460,7 @@ where
         route_api_method_override,
         effort_override,
         selfdev_requested,
+        parent_session_id,
     )?;
 
     if let Some(message) = startup_message {
@@ -633,6 +647,7 @@ pub(super) async fn spawn_swarm_agent(
             spawn_effort.as_deref(),
             coordinator_is_canary,
             startup_message.as_deref(),
+            Some(req_session_id),
             |session_id, cwd, selfdev_requested, provider_key| {
                 // Tag the headed window as a swarm-agent spawn so spawn hooks
                 // and terminals can identify and reroute it (JCODE_SPAWN_*).
