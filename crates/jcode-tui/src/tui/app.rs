@@ -1529,6 +1529,9 @@ pub struct App {
     // After an interrupt, wait one redraw before auto-dispatching queued followups so
     // the queued preview can render in the interrupted state first.
     pending_queued_dispatch: bool,
+    // Drain queued follow-ups one user message per turn (default) instead of
+    // flushing the whole backlog into a single request. Toggled with `/queue`.
+    serialize_queued_messages: bool,
     // Tab completion state: (base_input, suggestion_index)
     // base_input is the original input before cycling, suggestion_index is current position
     tab_completion_state: Option<(String, usize)>,

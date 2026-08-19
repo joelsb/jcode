@@ -131,6 +131,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::hidden("/clear-view", "Alias for /cls"),
     RegisteredCommand::public("/rewind", "Rewind conversation to previous message"),
     RegisteredCommand::public("/poke", "Poke model to resume with incomplete todos"),
+    RegisteredCommand::public("/queue", "Send queued messages one per turn (on|off|status)"),
     RegisteredCommand::public("/plan", "Create a plan-only response as a plan card"),
     RegisteredCommand::public("/improve", "Autonomously improve the repository"),
     RegisteredCommand::public("/refactor", "Run a safe refactor loop"),
@@ -1653,6 +1654,7 @@ impl App {
                 | "/usage"
                 | "/subscription"
                 | "/poke"
+                | "/queue"
                 | "/memory"
                 | "/test"
                 | "/initiatives"

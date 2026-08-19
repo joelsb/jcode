@@ -195,7 +195,16 @@ pub(super) fn launch_client_executable() -> PathBuf {
 ///
 /// Everything after that stays queued and is dispatched at the next idle
 /// boundary. Order is preserved.
-pub(super) fn split_next_queued_dispatch(messages: Vec<String>) -> (Vec<String>, Vec<String>) {
+///
+/// With `serialize` false (`/queue off`) the caller gets the whole backlog in
+/// one batch, which is the pre-serialization behavior.
+pub(super) fn split_next_queued_dispatch(
+    messages: Vec<String>,
+    serialize: bool,
+) -> (Vec<String>, Vec<String>) {
+    if !serialize {
+        return (messages, Vec::new());
+    }
     let mut batch: Vec<String> = Vec::new();
     let mut remaining: Vec<String> = Vec::new();
     let mut took_user = false;
@@ -1566,6 +1575,10 @@ fn gather_git_info_inner() -> Option<GitInfo> {
 mod queued_dispatch_tests {
     use super::split_next_queued_dispatch;
 
+    fn split_next_queued_dispatch_serialized(messages: Vec<String>) -> (Vec<String>, Vec<String>) {
+        split_next_queued_dispatch(messages, true)
+    }
+
     fn poke() -> String {
         "You have 3 incomplete todos. Continue working on them and update the todo tool."
             .to_string()
@@ -1573,7 +1586,7 @@ mod queued_dispatch_tests {
 
     #[test]
     fn one_user_message_per_turn() {
-        let (batch, rest) = split_next_queued_dispatch(vec![
+        let (batch, rest) = split_next_queued_dispatch_serialized(vec![
             "first".to_string(),
             "second".to_string(),
             "third".to_string(),
@@ -1584,21 +1597,21 @@ mod queued_dispatch_tests {
 
     #[test]
     fn single_message_leaves_queue_empty() {
-        let (batch, rest) = split_next_queued_dispatch(vec!["only".to_string()]);
+        let (batch, rest) = split_next_queued_dispatch_serialized(vec!["only".to_string()]);
         assert_eq!(batch, vec!["only".to_string()]);
         assert!(rest.is_empty());
     }
 
     #[test]
     fn empty_queue_stays_empty() {
-        let (batch, rest) = split_next_queued_dispatch(Vec::new());
+        let (batch, rest) = split_next_queued_dispatch_serialized(Vec::new());
         assert!(batch.is_empty());
         assert!(rest.is_empty());
     }
 
     #[test]
     fn leading_system_reminders_ride_with_the_first_user_message() {
-        let (batch, rest) = split_next_queued_dispatch(vec![
+        let (batch, rest) = split_next_queued_dispatch_serialized(vec![
             "[SYSTEM: resumed]".to_string(),
             "first".to_string(),
             "second".to_string(),
@@ -1613,7 +1626,7 @@ mod queued_dispatch_tests {
 
     #[test]
     fn system_reminder_after_the_user_message_waits_for_the_next_turn() {
-        let (batch, rest) = split_next_queued_dispatch(vec![
+        let (batch, rest) = split_next_queued_dispatch_serialized(vec![
             "first".to_string(),
             "[SYSTEM: later]".to_string(),
         ]);
@@ -1623,7 +1636,7 @@ mod queued_dispatch_tests {
 
     #[test]
     fn reminder_only_queue_dispatches_in_one_batch() {
-        let (batch, rest) = split_next_queued_dispatch(vec![
+        let (batch, rest) = split_next_queued_dispatch_serialized(vec![
             "[SYSTEM: a]".to_string(),
             "[SYSTEM: b]".to_string(),
         ]);
@@ -1637,7 +1650,7 @@ mod queued_dispatch_tests {
 
     #[test]
     fn consecutive_pokes_collapse_into_one_turn() {
-        let (batch, rest) = split_next_queued_dispatch(vec![poke(), poke(), poke()]);
+        let (batch, rest) = split_next_queued_dispatch_serialized(vec![poke(), poke(), poke()]);
         assert_eq!(
             batch.len(),
             3,
@@ -1648,9 +1661,23 @@ mod queued_dispatch_tests {
 
     #[test]
     fn a_poke_does_not_join_a_real_user_message_turn() {
-        let (batch, rest) = split_next_queued_dispatch(vec!["real work".to_string(), poke()]);
+        let (batch, rest) = split_next_queued_dispatch_serialized(vec!["real work".to_string(), poke()]);
         assert_eq!(batch, vec!["real work".to_string()]);
         assert_eq!(rest, vec![poke()]);
+    }
+
+    #[test]
+    fn disabling_serialization_flushes_the_whole_queue() {
+        let (batch, rest) = split_next_queued_dispatch(
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            false,
+        );
+        assert_eq!(
+            batch,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "/queue off must restore the single-batch behavior"
+        );
+        assert!(rest.is_empty());
     }
 
     #[test]
@@ -1658,7 +1685,7 @@ mod queued_dispatch_tests {
         let mut queue = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let mut turns = Vec::new();
         while !queue.is_empty() {
-            let (batch, rest) = split_next_queued_dispatch(queue);
+            let (batch, rest) = split_next_queued_dispatch_serialized(queue);
             turns.push(batch);
             queue = rest;
         }

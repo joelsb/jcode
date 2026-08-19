@@ -79,9 +79,20 @@ fn test_remote_error_without_retry_recovers_pending_followups() {
 
     assert!(app.pending_soft_interrupts.is_empty());
     assert!(app.pending_soft_interrupt_requests.is_empty());
-    assert!(app.queued_messages().is_empty());
+    // One user message per turn: the rest wait for later boundaries.
+    assert_eq!(
+        app.queued_messages(),
+        &["unsent interleave", "queued later"]
+    );
     assert!(app.is_processing);
     assert!(matches!(app.status, ProcessingStatus::Sending));
+
+    for expected_remaining in [vec!["queued later"], Vec::<&str>::new()] {
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+        rt.block_on(remote::process_remote_followups(&mut app, &mut remote));
+        assert_eq!(app.queued_messages(), expected_remaining.as_slice());
+    }
 
     let last = app
         .display_messages()

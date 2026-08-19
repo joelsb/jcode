@@ -33,9 +33,21 @@ fn test_handle_remote_disconnect_preserves_pending_interleaves_for_reconnect() {
 
     assert!(app.pending_soft_interrupts.is_empty());
     assert!(app.pending_soft_interrupt_requests.is_empty());
-    assert!(app.queued_messages().is_empty());
+    // Queued follow-ups drain one user message per turn, so the recovered
+    // interleaves and the follow-up take three turns instead of one batch.
+    assert_eq!(
+        app.queued_messages(),
+        &["unsent interleave", "queued later"]
+    );
     assert!(app.is_processing);
     assert!(matches!(app.status, ProcessingStatus::Sending));
+
+    for expected_remaining in [vec!["queued later"], Vec::<&str>::new()] {
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+        rt.block_on(remote::process_remote_followups(&mut app, &mut remote));
+        assert_eq!(app.queued_messages(), expected_remaining.as_slice());
+    }
 
     let user_messages: Vec<&str> = app
         .display_messages()

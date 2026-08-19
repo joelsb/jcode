@@ -3875,6 +3875,7 @@ impl App {
             // the rest at the following turn boundary.
             let (queued_messages, still_queued) = super::helpers::split_next_queued_dispatch(
                 std::mem::take(&mut self.queued_messages),
+                self.serialize_queued_messages,
             );
             self.queued_messages = still_queued;
             let hidden_reminders = std::mem::take(&mut self.hidden_queued_system_messages);

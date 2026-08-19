@@ -2868,3 +2868,57 @@ fn test_overnight_start_queues_remote_turn_without_stuck_sending() {
         assert!(app.queued_messages[0].contains("visible Overnight Coordinator"));
     });
 }
+
+#[test]
+fn queue_command_toggles_serialization_and_reports_state() {
+    let mut app = create_test_app();
+    assert!(
+        app.serialize_queued_messages,
+        "one-message-per-turn is the default"
+    );
+
+    assert!(super::commands::handle_queue_command(&mut app, "/queue off"));
+    assert!(!app.serialize_queued_messages);
+
+    assert!(super::commands::handle_queue_command(&mut app, "/queue"));
+    assert!(
+        app.serialize_queued_messages,
+        "bare /queue must toggle back on"
+    );
+
+    assert!(super::commands::handle_queue_command(
+        &mut app,
+        "/queue status"
+    ));
+    assert!(
+        app.serialize_queued_messages,
+        "status must not change the setting"
+    );
+
+    assert!(
+        !super::commands::handle_queue_command(&mut app, "/queueue"),
+        "an unrelated command must not be swallowed"
+    );
+}
+
+#[test]
+fn queue_off_makes_the_queue_drain_in_a_single_turn_again() {
+    let mut app = create_test_app();
+    app.queued_messages.push("one".to_string());
+    app.queued_messages.push("two".to_string());
+
+    let (batch, rest) = super::helpers::split_next_queued_dispatch(
+        app.queued_messages.clone(),
+        app.serialize_queued_messages,
+    );
+    assert_eq!(batch, vec!["one".to_string()]);
+    assert_eq!(rest, vec!["two".to_string()]);
+
+    super::commands::handle_queue_command(&mut app, "/queue off");
+    let (batch, rest) = super::helpers::split_next_queued_dispatch(
+        app.queued_messages.clone(),
+        app.serialize_queued_messages,
+    );
+    assert_eq!(batch, vec!["one".to_string(), "two".to_string()]);
+    assert!(rest.is_empty());
+}

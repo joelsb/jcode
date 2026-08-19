@@ -85,8 +85,18 @@ fn test_new_for_remote_does_not_requeue_acked_pending_soft_interrupts() {
             &mut remote,
         ));
 
-        assert!(restored.queued_messages().is_empty());
+        // Queued follow-ups drain one user message per turn, so "queued later"
+        // waits for the next idle boundary instead of riding this turn.
+        assert_eq!(restored.queued_messages(), &["queued later"]);
         assert!(restored.is_processing);
+
+        restored.is_processing = false;
+        restored.pending_queued_dispatch = false;
+        rt.block_on(super::remote::process_remote_followups(
+            &mut restored,
+            &mut remote,
+        ));
+        assert!(restored.queued_messages().is_empty());
         assert!(
             restored
                 .display_messages()

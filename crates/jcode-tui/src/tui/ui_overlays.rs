@@ -281,6 +281,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "Poke model to resume with incomplete todos (on/off/status)",
     ));
     lines.push(help_entry(
+        "/queue",
+        "Send queued messages one per turn, not all at once (on/off/status)",
+    ));
+    lines.push(help_entry(
         "/plan [goal]",
         "Draft a plan-only proposal as a plan card (no edits)",
     ));

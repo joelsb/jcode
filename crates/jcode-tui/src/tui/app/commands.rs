@@ -1648,8 +1648,54 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
     }
 }
 
+/// `/queue [on|off|status]` - control whether queued follow-ups drain one user
+/// message per turn (on, the default) or are flushed into a single request
+/// (off, the pre-serialization behavior).
+pub(super) fn handle_queue_command(app: &mut App, trimmed: &str) -> bool {
+    let enable = match trimmed {
+        "/queue" => !app.serialize_queued_messages,
+        "/queue on" => true,
+        "/queue off" => false,
+        "/queue status" => app.serialize_queued_messages,
+        _ if trimmed.starts_with("/queue ") => {
+            app.push_display_message(DisplayMessage::error(
+                "Usage: /queue [on|off|status]".to_string(),
+            ));
+            return true;
+        }
+        _ => return false,
+    };
+
+    app.serialize_queued_messages = enable;
+    let label = if enable { "ON" } else { "OFF" };
+    app.set_status_notice(format!("Queue serialization: {}", label));
+    app.push_display_message(DisplayMessage::system(if enable {
+        format!(
+            "Queue serialization {}: queued messages are sent one per turn ({} waiting).",
+            if trimmed == "/queue status" {
+                "is ON"
+            } else {
+                "ON"
+            },
+            app.queued_messages.len()
+        )
+    } else {
+        format!(
+            "Queue serialization {}: the whole queue is sent in a single turn ({} waiting).",
+            if trimmed == "/queue status" {
+                "is OFF"
+            } else {
+                "OFF"
+            },
+            app.queued_messages.len()
+        )
+    }));
+    true
+}
+
 pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
-    if handle_subagent_model_command(app, trimmed)
+    if handle_queue_command(app, trimmed)
+        || handle_subagent_model_command(app, trimmed)
         || app.handle_hotkeys_command(trimmed)
         || app.handle_terminal_setup_command(trimmed)
         || handle_subagent_command(app, trimmed)
