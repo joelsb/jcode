@@ -1559,9 +1559,22 @@ fn test_remote_interrupted_recovers_pending_interleaves_in_order() {
 
     assert!(app.pending_soft_interrupts.is_empty());
     assert!(app.pending_soft_interrupt_requests.is_empty());
-    assert!(app.queued_messages().is_empty());
+    // Queued messages drain one user turn at a time, so the recovered
+    // interleaves and the follow-up take three turns rather than one batch.
+    assert_eq!(
+        app.queued_messages(),
+        &["unsent interleave", "queued later"],
+        "only the first queued message may go out on this turn"
+    );
     assert!(app.is_processing);
     assert!(matches!(app.status, ProcessingStatus::Sending));
+
+    for expected_remaining in [vec!["queued later"], Vec::<&str>::new()] {
+        app.is_processing = false;
+        app.pending_queued_dispatch = false;
+        rt.block_on(remote::process_remote_followups(&mut app, &mut remote));
+        assert_eq!(app.queued_messages(), expected_remaining.as_slice());
+    }
 
     let user_messages: Vec<&str> = app
         .display_messages()
@@ -1604,10 +1617,17 @@ fn test_remote_done_recovers_stranded_soft_interrupt_as_queued_followup() {
 
     assert!(app.pending_soft_interrupts.is_empty());
     assert!(app.pending_soft_interrupt_requests.is_empty());
-    assert!(app.queued_messages().is_empty());
+    // One user message per turn: the recovered interleave goes out now and
+    // "queued later" waits for the next idle boundary.
+    assert_eq!(app.queued_messages(), &["queued later"]);
     assert!(app.is_processing);
     assert!(matches!(app.status, ProcessingStatus::Sending));
     assert!(app.current_message_id.is_some());
+
+    app.is_processing = false;
+    app.pending_queued_dispatch = false;
+    rt.block_on(remote::process_remote_followups(&mut app, &mut remote));
+    assert!(app.queued_messages().is_empty());
 
     let user_messages: Vec<&str> = app
         .display_messages()

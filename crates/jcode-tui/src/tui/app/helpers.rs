@@ -183,6 +183,54 @@ pub(super) fn launch_client_executable() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("jcode"))
 }
 
+/// Split the queue into the batch that may be dispatched in the *next* turn and
+/// the remainder that must wait for a later turn.
+///
+/// Queued messages drain one user turn at a time (like a todo queue) instead of
+/// being flushed into a single request. The batch is:
+/// - any leading `[SYSTEM: ...]` continuations, which are reminders and never
+///   deserve a turn of their own, plus
+/// - exactly one real user message, OR a run of consecutive auto-poke messages
+///   (pokes collapse: N identical nudges are one logical prod, not N turns).
+///
+/// Everything after that stays queued and is dispatched at the next idle
+/// boundary. Order is preserved.
+pub(super) fn split_next_queued_dispatch(messages: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut batch: Vec<String> = Vec::new();
+    let mut remaining: Vec<String> = Vec::new();
+    let mut took_user = false;
+    let mut only_pokes = true;
+
+    let mut iter = messages.into_iter();
+    for message in iter.by_ref() {
+        let is_system = extract_bracketed_system_message(&message).is_some();
+        let is_poke = crate::todo::is_auto_poke_message(&message);
+
+        if is_system {
+            if took_user {
+                remaining.push(message);
+                break;
+            }
+            batch.push(message);
+            continue;
+        }
+
+        if took_user && !(is_poke && only_pokes) {
+            remaining.push(message);
+            break;
+        }
+
+        if !is_poke {
+            only_pokes = false;
+        }
+        took_user = true;
+        batch.push(message);
+    }
+    remaining.extend(iter);
+
+    (batch, remaining)
+}
+
 pub(super) fn partition_queued_messages(
     messages: Vec<String>,
     reminders: Vec<String>,
@@ -1512,4 +1560,116 @@ fn gather_git_info_inner() -> Option<GitInfo> {
         behind,
         dirty_files,
     })
+}
+
+#[cfg(test)]
+mod queued_dispatch_tests {
+    use super::split_next_queued_dispatch;
+
+    fn poke() -> String {
+        "You have 3 incomplete todos. Continue working on them and update the todo tool."
+            .to_string()
+    }
+
+    #[test]
+    fn one_user_message_per_turn() {
+        let (batch, rest) = split_next_queued_dispatch(vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ]);
+        assert_eq!(batch, vec!["first".to_string()]);
+        assert_eq!(rest, vec!["second".to_string(), "third".to_string()]);
+    }
+
+    #[test]
+    fn single_message_leaves_queue_empty() {
+        let (batch, rest) = split_next_queued_dispatch(vec!["only".to_string()]);
+        assert_eq!(batch, vec!["only".to_string()]);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn empty_queue_stays_empty() {
+        let (batch, rest) = split_next_queued_dispatch(Vec::new());
+        assert!(batch.is_empty());
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn leading_system_reminders_ride_with_the_first_user_message() {
+        let (batch, rest) = split_next_queued_dispatch(vec![
+            "[SYSTEM: resumed]".to_string(),
+            "first".to_string(),
+            "second".to_string(),
+        ]);
+        assert_eq!(
+            batch,
+            vec!["[SYSTEM: resumed]".to_string(), "first".to_string()],
+            "a hidden reminder must not consume a turn of its own"
+        );
+        assert_eq!(rest, vec!["second".to_string()]);
+    }
+
+    #[test]
+    fn system_reminder_after_the_user_message_waits_for_the_next_turn() {
+        let (batch, rest) = split_next_queued_dispatch(vec![
+            "first".to_string(),
+            "[SYSTEM: later]".to_string(),
+        ]);
+        assert_eq!(batch, vec!["first".to_string()]);
+        assert_eq!(rest, vec!["[SYSTEM: later]".to_string()]);
+    }
+
+    #[test]
+    fn reminder_only_queue_dispatches_in_one_batch() {
+        let (batch, rest) = split_next_queued_dispatch(vec![
+            "[SYSTEM: a]".to_string(),
+            "[SYSTEM: b]".to_string(),
+        ]);
+        assert_eq!(
+            batch,
+            vec!["[SYSTEM: a]".to_string(), "[SYSTEM: b]".to_string()],
+            "reminders with no user message must not be serialized one per turn"
+        );
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn consecutive_pokes_collapse_into_one_turn() {
+        let (batch, rest) = split_next_queued_dispatch(vec![poke(), poke(), poke()]);
+        assert_eq!(
+            batch.len(),
+            3,
+            "repeated auto-pokes are one logical prod, not three turns"
+        );
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn a_poke_does_not_join_a_real_user_message_turn() {
+        let (batch, rest) = split_next_queued_dispatch(vec!["real work".to_string(), poke()]);
+        assert_eq!(batch, vec!["real work".to_string()]);
+        assert_eq!(rest, vec![poke()]);
+    }
+
+    #[test]
+    fn draining_repeatedly_preserves_order_and_loses_nothing() {
+        let mut queue = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut turns = Vec::new();
+        while !queue.is_empty() {
+            let (batch, rest) = split_next_queued_dispatch(queue);
+            turns.push(batch);
+            queue = rest;
+        }
+        assert_eq!(turns.len(), 3, "three queued messages must take three turns");
+        assert_eq!(
+            turns,
+            vec![
+                vec!["a".to_string()],
+                vec!["b".to_string()],
+                vec!["c".to_string()]
+            ]
+        );
+    }
 }

@@ -3869,9 +3869,14 @@ impl App {
         event_stream: &mut EventStream,
     ) {
         while !self.queued_messages.is_empty() || !self.hidden_queued_system_messages.is_empty() {
-            // Combine all currently queued messages into one, treating [SYSTEM: ...]
-            // startup continuations as system reminders rather than user turns.
-            let queued_messages = std::mem::take(&mut self.queued_messages);
+            // Drain ONE user message per turn (plus any reminders that ride
+            // with it), treating [SYSTEM: ...] startup continuations as system
+            // reminders rather than user turns. The surrounding loop dispatches
+            // the rest at the following turn boundary.
+            let (queued_messages, still_queued) = super::helpers::split_next_queued_dispatch(
+                std::mem::take(&mut self.queued_messages),
+            );
+            self.queued_messages = still_queued;
             let hidden_reminders = std::mem::take(&mut self.hidden_queued_system_messages);
             let (messages, reminder, display_system_messages) =
                 super::helpers::partition_queued_messages(queued_messages, hidden_reminders);

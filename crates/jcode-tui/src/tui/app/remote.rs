@@ -243,7 +243,11 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     }
 
     if !app.is_processing && !app.queued_messages.is_empty() {
-        let queued_messages = std::mem::take(&mut app.queued_messages);
+        // One user message per turn; the rest stay queued for the next idle
+        // boundary (`pending_queued_dispatch` re-arms the dispatch).
+        let (queued_messages, still_queued) =
+            super::helpers::split_next_queued_dispatch(std::mem::take(&mut app.queued_messages));
+        app.queued_messages = still_queued;
         let hidden_reminders = std::mem::take(&mut app.hidden_queued_system_messages);
         let (messages, reminder, display_system_messages) =
             super::helpers::partition_queued_messages(queued_messages, hidden_reminders);
@@ -1488,7 +1492,10 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
             }
         }
     } else if !app.queued_messages.is_empty() {
-        let queued_messages = std::mem::take(&mut app.queued_messages);
+        // One user message per turn; see `split_next_queued_dispatch`.
+        let (queued_messages, still_queued) =
+            super::helpers::split_next_queued_dispatch(std::mem::take(&mut app.queued_messages));
+        app.queued_messages = still_queued;
         let hidden_reminders = std::mem::take(&mut app.hidden_queued_system_messages);
         let (messages, reminder, display_system_messages) =
             super::helpers::partition_queued_messages(queued_messages, hidden_reminders);
