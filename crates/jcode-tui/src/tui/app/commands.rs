@@ -1648,15 +1648,23 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
     }
 }
 
-/// `/queue [on|off|status]` - control whether queued follow-ups drain one user
-/// message per turn (on, the default) or are flushed into a single request
-/// (off, the pre-serialization behavior).
+/// `/queue [on|off|status]` - control what happens to a message typed while the
+/// model is still working.
+///
+/// Two flags decide that, and a user asking for "queue on" means both:
+/// `queue_mode` decides whether Enter mid-turn parks the message in
+/// `queued_messages` (on) or injects it into the running turn as an interleave
+/// (off), and `serialize_queued_messages` decides whether the parked backlog
+/// then drains one user message per turn. `/queue` used to set only the second,
+/// so `/queue on` followed by Enter still interleaved and `/queue status` still
+/// reported "0 waiting" - the message never reached the queue at all.
 pub(super) fn handle_queue_command(app: &mut App, trimmed: &str) -> bool {
+    let queueing_now = app.queue_mode && app.serialize_queued_messages;
     let enable = match trimmed {
-        "/queue" => !app.serialize_queued_messages,
+        "/queue" => !queueing_now,
         "/queue on" => true,
         "/queue off" => false,
-        "/queue status" => app.serialize_queued_messages,
+        "/queue status" => queueing_now,
         _ if trimmed.starts_with("/queue ") => {
             app.push_display_message(DisplayMessage::error(
                 "Usage: /queue [on|off|status]".to_string(),
@@ -1666,12 +1674,15 @@ pub(super) fn handle_queue_command(app: &mut App, trimmed: &str) -> bool {
         _ => return false,
     };
 
-    app.serialize_queued_messages = enable;
+    if trimmed != "/queue status" {
+        app.queue_mode = enable;
+        app.serialize_queued_messages = enable;
+    }
     let label = if enable { "ON" } else { "OFF" };
-    app.set_status_notice(format!("Queue serialization: {}", label));
+    app.set_status_notice(format!("Queue: {}", label));
     app.push_display_message(DisplayMessage::system(if enable {
         format!(
-            "Queue serialization {}: queued messages are sent one per turn ({} waiting).",
+            "Queue {}: messages typed while the model works wait their turn, one per turn ({} waiting).",
             if trimmed == "/queue status" {
                 "is ON"
             } else {
@@ -1681,7 +1692,7 @@ pub(super) fn handle_queue_command(app: &mut App, trimmed: &str) -> bool {
         )
     } else {
         format!(
-            "Queue serialization {}: the whole queue is sent in a single turn ({} waiting).",
+            "Queue {}: messages are injected into the running turn instead of waiting ({} waiting).",
             if trimmed == "/queue status" {
                 "is OFF"
             } else {

@@ -1661,7 +1661,8 @@ mod queued_dispatch_tests {
 
     #[test]
     fn a_poke_does_not_join_a_real_user_message_turn() {
-        let (batch, rest) = split_next_queued_dispatch_serialized(vec!["real work".to_string(), poke()]);
+        let (batch, rest) =
+            split_next_queued_dispatch_serialized(vec!["real work".to_string(), poke()]);
         assert_eq!(batch, vec!["real work".to_string()]);
         assert_eq!(rest, vec![poke()]);
     }
@@ -1689,7 +1690,11 @@ mod queued_dispatch_tests {
             turns.push(batch);
             queue = rest;
         }
-        assert_eq!(turns.len(), 3, "three queued messages must take three turns");
+        assert_eq!(
+            turns.len(),
+            3,
+            "three queued messages must take three turns"
+        );
         assert_eq!(
             turns,
             vec![

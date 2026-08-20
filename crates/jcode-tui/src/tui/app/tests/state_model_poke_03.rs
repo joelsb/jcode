@@ -2870,20 +2870,28 @@ fn test_overnight_start_queues_remote_turn_without_stuck_sending() {
 }
 
 #[test]
-fn queue_command_toggles_serialization_and_reports_state() {
+fn queue_command_toggles_both_queue_flags_and_reports_state() {
     let mut app = create_test_app();
     assert!(
         app.serialize_queued_messages,
         "one-message-per-turn is the default"
     );
 
+    assert!(super::commands::handle_queue_command(&mut app, "/queue on"));
+    assert!(
+        app.queue_mode,
+        "/queue on must park mid-turn messages, not interleave them"
+    );
+    assert!(app.serialize_queued_messages);
+
     assert!(super::commands::handle_queue_command(&mut app, "/queue off"));
+    assert!(!app.queue_mode);
     assert!(!app.serialize_queued_messages);
 
     assert!(super::commands::handle_queue_command(&mut app, "/queue"));
     assert!(
-        app.serialize_queued_messages,
-        "bare /queue must toggle back on"
+        app.queue_mode && app.serialize_queued_messages,
+        "bare /queue must toggle both flags back on"
     );
 
     assert!(super::commands::handle_queue_command(
@@ -2891,7 +2899,7 @@ fn queue_command_toggles_serialization_and_reports_state() {
         "/queue status"
     ));
     assert!(
-        app.serialize_queued_messages,
+        app.queue_mode && app.serialize_queued_messages,
         "status must not change the setting"
     );
 
@@ -2899,6 +2907,29 @@ fn queue_command_toggles_serialization_and_reports_state() {
         !super::commands::handle_queue_command(&mut app, "/queueue"),
         "an unrelated command must not be swallowed"
     );
+}
+
+/// The reported bug: `/queue on`, then Enter mid-turn, then `/queue status`
+/// showing "0 waiting" because the message had been interleaved into the live
+/// turn instead of queued. Enter mid-turn must resolve to `Queue` after
+/// `/queue on` and to `Interleave` after `/queue off`.
+#[test]
+fn queue_on_makes_a_mid_turn_message_wait_instead_of_interleaving() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+    app.input = "typed while the model works".to_string();
+
+    super::commands::handle_queue_command(&mut app, "/queue on");
+    assert!(matches!(
+        super::input::send_action(&app, false),
+        crate::tui::app::SendAction::Queue
+    ));
+
+    super::commands::handle_queue_command(&mut app, "/queue off");
+    assert!(matches!(
+        super::input::send_action(&app, false),
+        crate::tui::app::SendAction::Interleave
+    ));
 }
 
 #[test]
