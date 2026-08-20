@@ -465,7 +465,11 @@ fn test_foreign_api_key_vendor_allows_openai_keys() {
         "sk-svcacct-abc123",
         "sess-abc123",
     ] {
-        assert_eq!(foreign_api_key_vendor(key), None, "rejected OpenAI key {key}");
+        assert_eq!(
+            foreign_api_key_vendor(key),
+            None,
+            "rejected OpenAI key {key}"
+        );
     }
 }
 
