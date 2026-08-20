@@ -7,6 +7,48 @@ use std::path::PathBuf;
 const ALLOW_LEGACY_AUTH_ENV: &str = "JCODE_ALLOW_CODEX_LEGACY_AUTH";
 pub const LEGACY_CODEX_AUTH_SOURCE_ID: &str = "openai_codex_auth_json";
 
+/// Key prefixes that unambiguously belong to a *different* vendor and can never
+/// authenticate against OpenAI.
+///
+/// A real case that cost a week of silent memory loss: `~/.codex/auth.json`
+/// held an Anthropic key (`sk-ant-...`) under the `OPENAI_API_KEY` field. That
+/// made `load_credentials()` succeed, so `Sidecar::llm_backend_available()`
+/// reported OpenAI as usable and every memory extraction POSTed an `sk-ant-`
+/// token to the OpenAI Responses API, earning a 401 each time. Memory never
+/// wrote anything and nothing surfaced the reason. Treating a foreign key as
+/// "no OpenAI key" lets the sidecar fall through to the Claude/provider
+/// backend, which actually works.
+const FOREIGN_API_KEY_PREFIXES: &[(&str, &str)] = &[
+    ("sk-ant-", "Anthropic"),
+    ("AIza", "Google"),
+    ("gsk_", "Groq"),
+    ("sk-or-", "OpenRouter"),
+];
+
+/// Whether `key` is a credential for some other vendor rather than OpenAI.
+pub(crate) fn foreign_api_key_vendor(key: &str) -> Option<&'static str> {
+    let key = key.trim();
+    FOREIGN_API_KEY_PREFIXES
+        .iter()
+        .find(|(prefix, _)| key.starts_with(prefix))
+        .map(|(_, vendor)| *vendor)
+}
+
+/// Drop a key that belongs to another vendor, logging once so the user can see
+/// why their OpenAI-backed features went quiet.
+fn reject_foreign_api_key(key: String, source: &str) -> Option<String> {
+    match foreign_api_key_vendor(&key) {
+        Some(vendor) => {
+            crate::logging::warn(&format!(
+                "Ignoring {} API key found in {} under an OpenAI key field; it cannot authenticate against OpenAI",
+                vendor, source
+            ));
+            None
+        }
+        None => Some(key),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CodexCredentials {
     pub access_token: String,
@@ -466,6 +508,7 @@ fn load_legacy_api_key_credentials() -> Result<CodexCredentials> {
         .api_key
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .and_then(|key| reject_foreign_api_key(key, "the Codex auth file (~/.codex/auth.json)"))
         .context("No API key found in legacy Codex auth file")?;
     Ok(CodexCredentials {
         access_token: api_key,
@@ -533,8 +576,10 @@ fn load_env_api_key() -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .and_then(|key| reject_foreign_api_key(key, "the OPENAI_API_KEY environment variable"))
         .or_else(|| {
             crate::provider_catalog::load_api_key_from_env_or_config("OPENAI_API_KEY", "openai.env")
+                .and_then(|key| reject_foreign_api_key(key, "the jcode OpenAI provider config"))
         })
 }
 

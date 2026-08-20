@@ -433,3 +433,62 @@ fn load_auth_file_renames_existing_labels_to_numbered_scheme() {
     );
     assert_eq!(auth.active_openai_account.as_deref(), Some("openai-2"));
 }
+
+/// A foreign vendor key stored under an OpenAI key field must be rejected.
+///
+/// Regression: `~/.codex/auth.json` carried `"OPENAI_API_KEY": "sk-ant-..."`,
+/// so OpenAI looked logged in and the memory sidecar POSTed an Anthropic token
+/// to the OpenAI Responses API, getting a 401 on every extraction. Memory
+/// silently stopped saving for days.
+#[test]
+fn test_foreign_api_key_vendor_detects_other_vendors() {
+    assert_eq!(
+        foreign_api_key_vendor("sk-ant-api03-abc123"),
+        Some("Anthropic")
+    );
+    assert_eq!(
+        foreign_api_key_vendor("  sk-ant-oat01-abc  "),
+        Some("Anthropic")
+    );
+    assert_eq!(foreign_api_key_vendor("AIzaSyAbc123"), Some("Google"));
+    assert_eq!(foreign_api_key_vendor("gsk_abc123"), Some("Groq"));
+    assert_eq!(foreign_api_key_vendor("sk-or-v1-abc"), Some("OpenRouter"));
+}
+
+/// Genuine OpenAI keys must pass through untouched. Guards against a filter so
+/// broad it silently disables working OpenAI auth (the opposite failure).
+#[test]
+fn test_foreign_api_key_vendor_allows_openai_keys() {
+    for key in [
+        "sk-proj-abc123",
+        "sk-abc123",
+        "sk-svcacct-abc123",
+        "sess-abc123",
+    ] {
+        assert_eq!(foreign_api_key_vendor(key), None, "rejected OpenAI key {key}");
+    }
+}
+
+/// End-to-end: an Anthropic key in `OPENAI_API_KEY` must make OpenAI creds
+/// UNAVAILABLE, not available-but-broken. This is the check that would have
+/// caught the silent memory outage: before the fix `load_credentials()`
+/// returned Ok with an `sk-ant-` access token, so the memory sidecar believed
+/// OpenAI was usable and 401'd on every extraction.
+#[test]
+fn load_credentials_rejects_anthropic_key_in_openai_env_var() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _api_key = EnvVarGuard::set(
+        "OPENAI_API_KEY",
+        "sk-ant-api03-planted-anthropic-key-in-wrong-slot",
+    );
+    set_active_account_override(None);
+
+    let result = load_credentials();
+    assert!(
+        result.is_err(),
+        "Anthropic key was accepted as OpenAI credentials: {:?}",
+        result.map(|creds| creds.access_token)
+    );
+}
