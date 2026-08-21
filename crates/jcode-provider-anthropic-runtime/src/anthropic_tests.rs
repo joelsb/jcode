@@ -3541,8 +3541,7 @@ async fn concurrent_sessions_rotate_the_shared_pool_only_once() {
 
     // And they must all end up on the same account. Splitting the pool is how
     // the alternating claude-1/claude-2 pattern appears in the log.
-    let settled: std::collections::BTreeSet<&str> =
-        labels.iter().map(String::as_str).collect();
+    let settled: std::collections::BTreeSet<&str> = labels.iter().map(String::as_str).collect();
     assert_eq!(
         settled.len(),
         1,
@@ -3555,4 +3554,223 @@ async fn concurrent_sessions_rotate_the_shared_pool_only_once() {
 
     jcode_base::provider::clear_all_account_cooldowns();
     jcode_base::auth::claude::set_active_account_override(None);
+}
+
+/// A success that started before a sibling's 429 must not erase that 429.
+///
+/// This is the defect behind the flapping that survived ADR-0018 and ADR-0020.
+/// One daemon serves many sessions, so at any moment there is usually a long
+/// stream in flight *and* other requests being refused. The success path used to
+/// call `clear_account_rate_limit` unconditionally, which deletes both the
+/// cooldown and the cached limit verdict, i.e. exactly the two pieces of state
+/// every rotation decision reads. A stream that was accepted before the pool
+/// tipped over therefore wiped the evidence its siblings had just paid a 429 to
+/// collect, and the next request rotated straight back onto the limited account.
+///
+/// The ordering here is the whole test, and it is the ordering the daemon
+/// produces many times a minute:
+///
+/// 1. a request is accepted on `claude-1` (time T0);
+/// 2. at T1 > T0, another session's request to `claude-1` is refused, which
+///    records the cooldown;
+/// 3. at T2 > T1, the first request finishes successfully.
+///
+/// The success is real, but it is evidence about T0, not about T2. Deleting the
+/// T1 cooldown with it is how `claude-1 → claude-2 → claude-1 → claude-2`
+/// appears in the log with no "restored" line anywhere near it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_success_does_not_erase_a_newer_rate_limit_from_a_concurrent_session() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // T0: our long-running request set out and was accepted.
+    let request_started = std::time::Instant::now();
+
+    // T1: a sibling session's request to the same account is refused. Sleep
+    // first so the recorded `noted_at` is strictly after `request_started`,
+    // which is the ordering the guard reads. `Instant` has nanosecond
+    // resolution, so this is about making the intent explicit rather than about
+    // clock granularity.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    jcode_base::provider::note_account_rate_limited(
+        jcode_provider_core::ActiveProvider::Claude,
+        "claude-1",
+    );
+    assert!(
+        jcode_base::provider::account_is_cooling_down(
+            jcode_provider_core::ActiveProvider::Claude,
+            "claude-1",
+        ),
+        "precondition: the sibling's 429 must have put claude-1 on cooldown"
+    );
+
+    // T2: our request completes successfully and reports it.
+    let cleared = jcode_base::provider::clear_account_rate_limit_if_newer(
+        jcode_provider_core::ActiveProvider::Claude,
+        "claude-1",
+        request_started,
+    );
+
+    assert!(
+        !cleared,
+        "a success that began before the refusal must not report clearing it"
+    );
+    assert!(
+        jcode_base::provider::account_is_cooling_down(
+            jcode_provider_core::ActiveProvider::Claude,
+            "claude-1",
+        ),
+        "the cooldown recorded while this request was in flight is newer evidence and must \
+         survive: erasing it is what sends the next request back onto the limited account, \
+         producing the claude-1 -> claude-2 -> claude-1 ladder"
+    );
+
+    // The usage verdict is the state rotation actually reads (ADR-0017), so it
+    // must not be cleared either. Checked separately: clearing one and keeping
+    // the other is the failure mode ADR-0017 exists to prevent, and it is
+    // invisible if the test only looks at the cooldown.
+    assert!(
+        jcode_base::usage::cached_anthropic_account_usage_any_age("claude-1").is_none()
+            || jcode_base::usage::cached_anthropic_account_usage_any_age("claude-1")
+                .is_some_and(|usage| !usage.exhausted()),
+        "sanity: an unexplained 429 only forgets the verdict, it does not assert exhaustion"
+    );
+
+    // The other half of the rule: a genuinely newer success *does* clear, or an
+    // account would stay excluded for the full window after it started serving
+    // again. Without this assertion the guard above could be implemented as
+    // "never clear", which would be a different bug.
+    let later_request = std::time::Instant::now();
+    let cleared_later = jcode_base::provider::clear_account_rate_limit_if_newer(
+        jcode_provider_core::ActiveProvider::Claude,
+        "claude-1",
+        later_request,
+    );
+    assert!(
+        cleared_later,
+        "a request that started after the refusal proves the account is serving again"
+    );
+    assert!(
+        !jcode_base::provider::account_is_cooling_down(
+            jcode_provider_core::ActiveProvider::Claude,
+            "claude-1",
+        ),
+        "a newer success must release the cooldown, or a recovered account stays excluded"
+    );
+
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// When every account is cooling, the wait must be sized to the pool's own
+/// deadline rather than a blind backoff.
+///
+/// The old wait fired five times, ~15s apart, and each attempt was a real
+/// request that earned a real 429 and re-extended the very cooldown it had just
+/// re-proved. Multiplied by the number of open sessions, that is the wall of
+/// rate-limit lines the user sees. This asserts the process consults what it
+/// already knows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pool_wait_is_sized_to_the_cooldown_not_a_blind_backoff() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // Nothing limited: there is an account to rotate to, so there is nothing to
+    // wait for. Reporting a wait here would stall a turn that could be served
+    // immediately, which is worse than the bug being fixed.
+    assert_eq!(
+        jcode_base::provider::time_until_any_account_is_eligible(
+            jcode_provider_core::ActiveProvider::Claude
+        ),
+        None,
+        "with a healthy account available the caller must rotate, not wait"
+    );
+
+    // One limited, one healthy: still nothing to wait for.
+    jcode_base::provider::note_account_rate_limited(
+        jcode_provider_core::ActiveProvider::Claude,
+        "claude-1",
+    );
+    assert_eq!(
+        jcode_base::provider::time_until_any_account_is_eligible(
+            jcode_provider_core::ActiveProvider::Claude
+        ),
+        None,
+        "one limited account does not make the pool unavailable"
+    );
+
+    // Both limited, with claude-2 recovering much sooner. The wait must be the
+    // *soonest* deadline: waiting for the last one would sit through a reset
+    // that has nothing to do with the account about to come back.
+    jcode_base::provider::note_account_rate_limited_until(
+        jcode_provider_core::ActiveProvider::Claude,
+        "claude-1",
+        Some(chrono::Utc::now() + chrono::Duration::hours(3)),
+    );
+    jcode_base::provider::note_account_rate_limited(
+        jcode_provider_core::ActiveProvider::Claude,
+        "claude-2",
+    );
+
+    let wait = jcode_base::provider::time_until_any_account_is_eligible(
+        jcode_provider_core::ActiveProvider::Claude,
+    )
+    .expect("with every account cooling there is a real deadline to wait for");
+
+    // claude-2 is on the 60s burst-shaped fallback window; claude-1 is hours
+    // out. Anything near the latter means the soonest-first rule is broken.
+    assert!(
+        wait <= std::time::Duration::from_secs(60),
+        "the wait must track the soonest account to recover (claude-2, ~60s), got {wait:?}"
+    );
+    assert!(
+        wait > std::time::Duration::from_secs(30),
+        "the wait must be the real remaining cooldown, not a token delay: {wait:?}"
+    );
+
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// Concurrent waiters must not wake in lockstep.
+///
+/// Every session derives the same deadline from the same shared cooldown, so
+/// without a spread they all fire the instant it expires, at an account that can
+/// serve maybe one of them. The rest are refused, the cooldown is re-extended,
+/// and the pattern repeats: a thundering herd wearing the costume of a fix.
+#[test]
+fn concurrent_waiters_do_not_wake_in_lockstep() {
+    let spreads: std::collections::BTreeSet<u128> = (0..16)
+        .map(|salt| pool_recovery_spread(salt).as_millis())
+        .collect();
+
+    assert!(
+        spreads.len() >= 12,
+        "16 concurrent waiters must land in distinct wake-up slots, got {} distinct: {spreads:?}",
+        spreads.len()
+    );
+
+    for salt in 0..64u64 {
+        let spread = pool_recovery_spread(salt);
+        assert!(
+            spread < std::time::Duration::from_millis(MAX_POOL_RECOVERY_SPREAD_MS),
+            "the spread must stay inside its bound, salt {salt} gave {spread:?}"
+        );
+    }
+
+    // Stable within a request: a retry must keep its slot rather than re-roll
+    // into a sibling's.
+    assert_eq!(
+        pool_recovery_spread(7),
+        pool_recovery_spread(7),
+        "one request's slot must not move between its own attempts"
+    );
 }

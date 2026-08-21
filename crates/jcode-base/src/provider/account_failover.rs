@@ -10,7 +10,7 @@ use super::ActiveProvider;
 /// instead, because a 60s memory of a 3-hour quota wall is useless.
 const RATE_LIMIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Accounts observed rate-limited recently, as `(provider, label) -> until`.
+/// Accounts observed rate-limited recently, as `(provider, label) -> note`.
 ///
 /// `tried_accounts` inside the retry loop lives for one request. Nothing carried
 /// a 429 across requests, so every new request would rotate straight back into
@@ -22,11 +22,25 @@ const RATE_LIMIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(
 /// quota limit's expiry comes from the provider's reset time and can be hours
 /// out, while a burst limit's is seconds. Storing the start forced a single
 /// fixed window on both. See ADR-0016.
+///
+/// `noted_at` is kept as well, and is not redundant with `until`: clearing a
+/// cooldown because a request succeeded is only sound when that request started
+/// *after* the refusal it is supposed to disprove. See
+/// [`clear_account_rate_limit_if_noted_before`] and ADR-0023.
 /// Keyed by `(provider name, label)` rather than the enum, so this does not
 /// force `Hash`/`Eq` onto a type shared across the whole provider layer.
 static RATE_LIMITED_ACCOUNTS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<(&'static str, String), std::time::Instant>>,
+    std::sync::Mutex<std::collections::HashMap<(&'static str, String), RateLimitNote>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// One account's recorded rate limit.
+#[derive(Clone, Copy, Debug)]
+struct RateLimitNote {
+    /// When the cooldown expires.
+    until: std::time::Instant,
+    /// When the refusal that created (or last extended) this note was observed.
+    noted_at: std::time::Instant,
+}
 
 /// Stable key for a provider.
 fn cooldown_provider_key(provider: ActiveProvider) -> &'static str {
@@ -89,16 +103,24 @@ fn note_account_rate_limited_for(
     cooldown: std::time::Duration,
 ) {
     if let Ok(mut seen) = RATE_LIMITED_ACCOUNTS.lock() {
-        let until = std::time::Instant::now() + cooldown;
+        let now = std::time::Instant::now();
+        let until = now + cooldown;
         seen.entry((cooldown_provider_key(provider), label.to_string()))
             // Keep the later deadline: a burst-shaped 60s note arriving after a
             // known 3-hour reset must not shorten it back to a minute.
             .and_modify(|existing| {
-                if until > *existing {
-                    *existing = until;
+                // `noted_at` always advances: this is a fresh refusal, whatever
+                // it does to the deadline, and it is what tells a concurrent
+                // request whether its own success predates this evidence.
+                existing.noted_at = now;
+                if until > existing.until {
+                    existing.until = until;
                 }
             })
-            .or_insert(until);
+            .or_insert(RateLimitNote {
+                until,
+                noted_at: now,
+            });
     }
 }
 
@@ -109,7 +131,7 @@ pub fn account_is_cooling_down(provider: ActiveProvider, label: &str) -> bool {
     };
     let key = (cooldown_provider_key(provider), label.to_string());
     match seen.get(&key) {
-        Some(until) if *until > std::time::Instant::now() => true,
+        Some(note) if note.until > std::time::Instant::now() => true,
         Some(_) => {
             // Expired: drop it so the map cannot grow without bound and the
             // account is immediately eligible again.
@@ -167,6 +189,62 @@ pub fn clear_account_rate_limit(provider: ActiveProvider, label: &str) {
     }
 }
 
+/// Clear a cooldown only when this success is newer than the refusal it claims
+/// to disprove, and report whether it actually cleared.
+///
+/// This is the fix for the flapping that survived ADR-0018 and ADR-0020. One
+/// daemon runs many concurrent requests against a shared pool, and a successful
+/// response is evidence about the moment its *own* request was accepted, not
+/// about now. The sequence, all inside a couple of seconds and all real:
+///
+/// 1. session A's request is accepted on `claude-1` and starts streaming;
+/// 2. the pool tips over; sessions B..E get 429 on `claude-1` and record a
+///    cooldown, so rotation correctly moves them to `claude-2`;
+/// 3. A's stream finishes successfully and unconditionally *deletes* that
+///    cooldown, plus the cached limit verdict behind it;
+/// 4. the next request sees a clean `claude-1`, rotates back onto it, gets 429,
+///    records the cooldown again - and the next long-running success wipes it
+///    again.
+///
+/// That is the `claude-1 → claude-2 → claude-1 → claude-2` ladder, and no
+/// amount of locking the rotation decision (ADR-0020) can stop it, because the
+/// state the decision reads is being erased from underneath it by a request
+/// that learned nothing about the present.
+///
+/// `request_started` is when the successful request was issued. A cooldown noted
+/// after that instant is strictly newer evidence and is kept.
+pub fn clear_account_rate_limit_if_newer(
+    provider: ActiveProvider,
+    label: &str,
+    request_started: std::time::Instant,
+) -> bool {
+    let cleared = {
+        let Ok(mut seen) = RATE_LIMITED_ACCOUNTS.lock() else {
+            return false;
+        };
+        let key = (cooldown_provider_key(provider), label.to_string());
+        match seen.get(&key) {
+            // A refusal observed after this request set out. The success proves
+            // only that the account was serving *earlier*, so leave it alone.
+            Some(note) if note.noted_at > request_started => false,
+            Some(_) => {
+                seen.remove(&key);
+                true
+            }
+            None => true,
+        }
+    };
+
+    // The usage verdict is cleared on exactly the same condition. Clearing it
+    // while keeping the cooldown would put the two back out of step, which is
+    // the ADR-0017 failure in a new place: the cooldown expires in 60s and the
+    // decision then reads a cache that says "plenty of headroom".
+    if cleared && provider == ActiveProvider::Claude {
+        crate::usage::invalidate_anthropic_account_usage(label);
+    }
+    cleared
+}
+
 /// Clear a cooldown, e.g. after a request on that account succeeds.
 pub fn clear_account_cooldown(provider: ActiveProvider, label: &str) {
     if let Ok(mut seen) = RATE_LIMITED_ACCOUNTS.lock() {
@@ -181,6 +259,55 @@ pub fn clear_all_account_cooldowns() {
     }
 }
 
+/// How long until the first account in the pool leaves its cooldown, when every
+/// account is currently cooling.
+///
+/// `None` when some account is already eligible (rotation should run instead of
+/// waiting) or when the pool is not known.
+///
+/// This exists because the wait that follows a dead end used a fixed backoff:
+/// five attempts, ~15s apart, each one a real request that gets a real 429 and
+/// *re-extends* the cooldown it just re-proved. With five sessions open that is
+/// 25 requests to learn one fact the process already knew. Sleeping until the
+/// pool's own deadline replaces all of them with one request at the moment it
+/// can succeed. See ADR-0023.
+pub fn time_until_any_account_is_eligible(provider: ActiveProvider) -> Option<std::time::Duration> {
+    let labels: Vec<String> = match provider {
+        ActiveProvider::Claude => crate::auth::claude::list_accounts()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|account| account.label)
+            .collect(),
+        ActiveProvider::OpenAI => crate::auth::codex::list_accounts()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|account| account.label)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if labels.is_empty() {
+        return None;
+    }
+
+    let seen = RATE_LIMITED_ACCOUNTS.lock().ok()?;
+    let now = std::time::Instant::now();
+    let key = cooldown_provider_key(provider);
+    let mut soonest: Option<std::time::Duration> = None;
+    for label in labels {
+        match seen.get(&(key, label)) {
+            Some(note) if note.until > now => {
+                let remaining = note.until - now;
+                if soonest.is_none_or(|best| remaining < best) {
+                    soonest = Some(remaining);
+                }
+            }
+            // This account is not cooling, so there is something to rotate to
+            // and nothing to wait for.
+            _ => return None,
+        }
+    }
+    soonest
+}
 /// Serialises tests that mutate the process-global cooldown map.
 ///
 /// `RATE_LIMITED_ACCOUNTS` is one map for the whole process, and cargo runs

@@ -118,6 +118,19 @@ Diagnostic worth keeping: single-session cross-turn flapping always pairs a swit
 
 Note for anyone touching the caches: the per-account cache is the one decisions read. Invalidating the single-slot one alone looks correct and changes nothing.
 
+## Part 5 - The Success That Erased The Evidence (2026-08-21)
+
+Part 4 serialised the rotation *decision*. It did not protect the state that decision reads, and the ladder came back on a binary carrying every fix above.
+
+- **A success deleted a cooldown recorded after it started.** The success path called `clear_account_rate_limit` unconditionally, which removes the cooldown *and* the cached per-account usage verdict - the exact two things ADR-0016 and ADR-0017 exist to keep correct. A streaming turn runs for minutes, so the normal daemon state is: one long request in flight on `claude-1`, siblings meanwhile getting 429 there and correctly rotating away, then the long request finishes and wipes their evidence. Next request rotates straight back onto `claude-1`. The success was true *about the moment it was accepted*, and was being read as a statement about now.
+- **Fixed by `clear_account_rate_limit_if_newer`**, which clears only when the cooldown predates the request. `RateLimitNote` now carries `noted_at` next to `until`: `until` says when the account recovers, `noted_at` says whether a given success is entitled to speak about it.
+- **The dead-end wait re-proved what the process already knew.** Five attempts, ~15s apart, each a real request earning a real 429 that *re-extended the cooldown it had just re-proved*, per session. The 10:38 window in the log shows `attempt 1/5 ... 4/5` interleaved across sessions while the same process was printing `earliest reset 1h 22m (claude-1)`. The wait now sleeps until the pool's soonest cooldown actually expires (`time_until_any_account_is_eligible`), capped at 90s so an unrecoverable quota wall surfaces instead of stalling silently.
+- **The spread is load-bearing.** Every session computes the same deadline from the same shared cooldown, so without `pool_recovery_spread` they wake in the same millisecond and fire a synchronised burst at an account that can serve one of them. Salt is per-request and allocated once, so retries keep their slot.
+
+Diagnostic, extending Part 4's: switches with **no** restore line and **minutes** apart (not seconds) is this bug, not the stampede. Seconds apart means the rotation lock; minutes apart means something erased the cooldown in between.
+
+See ADR-0023.
+
 ## Files Changed
 
 ### Core logic
@@ -153,6 +166,10 @@ c0eeca7 feat: skip model downgrade on rate-limit, prefer cross-provider fallback
 
 9dfe8d2 fix(anthropic): treat any spent usage window as an exhausted account
 ```
+
+### Part 5 (the success that erased the evidence)
+- `crates/jcode-base/src/provider/account_failover.rs` - `RateLimitNote { until, noted_at }` replaces a bare deadline; `clear_account_rate_limit_if_newer` refuses to clear a cooldown newer than the succeeding request; `time_until_any_account_is_eligible` reports the pool's soonest recovery, and `None` while any account is still serviceable
+- `crates/jcode-provider-anthropic-runtime/src/lib.rs` - success path clears conditionally and logs when it declines; the dead-end wait sizes itself to the pool deadline (`MAX_POOL_RECOVERY_WAIT`) with a per-request spread (`pool_recovery_spread`, `MAX_POOL_RECOVERY_SPREAD_MS`)
 
 ADRs: [0016](adr/0016-exhaustion-is-any-window-not-every-window.md) (the verdict), [0017](adr/0017-invalidate-the-cache-the-decision-reads.md) (the caches), [0018](adr/0018-claim-the-shared-account-override-only-when-better-informed.md) (cross-session), plus a correction recorded in [0015](adr/0015-rate-limits-wait-on-their-own-clock.md).
 

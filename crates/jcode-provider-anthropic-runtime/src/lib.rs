@@ -549,6 +549,44 @@ const RATE_LIMIT_RETRY_BASE_DELAY_MS: u64 = 5000;
 /// the quota path no longer waits at all. See ADR-0016.
 const MAX_BURST_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Longest this loop will sleep waiting for the account pool's own cooldown.
+///
+/// Past this the wait stops being "outlast a burst" and becomes "sit silently
+/// through a quota reset", which the user should be told about and allowed to
+/// route around instead. See ADR-0023.
+const MAX_POOL_RECOVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Widest extra spread added on top of a pool-recovery wait.
+///
+/// Every session on the daemon computes the *same* deadline from the same shared
+/// cooldown, so without this they all wake in the same millisecond and fire a
+/// synchronised burst at an account that can serve maybe one of them: a
+/// thundering herd that re-limits the pool instantly and starts the cycle again.
+///
+/// The spread is derived from a per-request salt, so it is stable within a
+/// request (a retry does not re-roll into the same slot as a sibling) while
+/// still differing between concurrent requests.
+const MAX_POOL_RECOVERY_SPREAD_MS: u64 = 2_000;
+
+/// Deterministic spread in `0..MAX_POOL_RECOVERY_SPREAD_MS` for one request.
+///
+/// `salt` is the request's own identity, so two concurrent requests waiting on
+/// the same pool deadline wake at different moments while a single request's
+/// retries stay in its own slot.
+fn pool_recovery_spread(salt: u64) -> std::time::Duration {
+    // Cheap integer hash (splitmix64 finaliser): the salt is a monotonic
+    // counter, whose low bits alone would put consecutive requests in adjacent
+    // millisecond slots and defeat the point.
+    let mut x = salt.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    std::time::Duration::from_millis(x % MAX_POOL_RECOVERY_SPREAD_MS)
+}
+
+/// Source of per-request salts for [`pool_recovery_spread`].
+static POOL_RECOVERY_SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Cached OAuth credentials
 #[derive(Clone)]
 struct CachedCredentials {
@@ -1823,6 +1861,10 @@ async fn run_stream_with_retries(
     // been shown. Once per turn: the branch that emits it is reached by every
     // later failing attempt.
     let mut announced_quota_exhaustion = false;
+    // This request's slot in the pool-recovery wake-up spread. Allocated once,
+    // so the request keeps its slot across retries instead of colliding with a
+    // sibling on a later attempt.
+    let pool_recovery_salt = POOL_RECOVERY_SALT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut attempt: u32 = 0;
 
     while attempt < attempt_budget {
@@ -1871,6 +1913,12 @@ async fn run_stream_with_retries(
             jcode_provider_core::fresh_transport_client()
         };
 
+        // When this attempt set out. A success proves the account was serving at
+        // this instant, not now: a streaming turn can run for minutes, and the
+        // pool can hit its limit meanwhile. Used to refuse clearing a cooldown
+        // that was recorded *after* this point. See ADR-0023.
+        let attempt_started = std::time::Instant::now();
+
         match stream_response(
             attempt_client,
             token.clone(),
@@ -1885,18 +1933,31 @@ async fn run_stream_with_retries(
         {
             Ok(()) => {
                 let _ = attempt_guard.finish().await;
-                // This account is serving again, so drop any cooldown *and* any
-                // cached limit verdict from an earlier refusal, rather than
-                // avoiding it for the full window.
+                // This account served *this* request, so drop any cooldown and
+                // cached limit verdict that predate it, rather than avoiding the
+                // account for the full window.
+                //
+                // Conditional on the cooldown being older than this attempt. A
+                // long stream that started before the pool tipped over would
+                // otherwise erase the refusals its siblings collected while it
+                // ran, and the next request would rotate straight back onto the
+                // limited account: the observed
+                // `claude-1 → claude-2 → claude-1` ladder. See ADR-0023.
                 if account_rotation_enabled
                     && let Some(label) = current_account
                         .clone()
                         .or_else(|| Some(auth::claude::primary_account_label()))
                 {
-                    jcode_base::provider::clear_account_rate_limit(
+                    let cleared = jcode_base::provider::clear_account_rate_limit_if_newer(
                         jcode_provider_core::ActiveProvider::Claude,
                         &label,
+                        attempt_started,
                     );
+                    if !cleared {
+                        jcode_base::logging::info(&format!(
+                            "Keeping the Anthropic cooldown on '{label}': it was recorded after this request started, so this success is older evidence"
+                        ));
+                    }
                 }
                 return; // Success
             }
@@ -2174,14 +2235,36 @@ async fn run_stream_with_retries(
                     // sends the same `retry-after: 60` for a burst as for a
                     // spent quota, and four consecutive minutes of silence is
                     // the wrong response to either. See ADR-0016.
-                    let delay = jcode_provider_core::retry_after::retry_after_from_error(&e)
-                        .map(|hint| hint.min(MAX_BURST_RETRY_AFTER))
-                        .unwrap_or_else(|| {
-                            jcode_provider_core::attempt_tracker::retry_backoff_delay(
-                                rate_limit_retries,
-                                RATE_LIMIT_RETRY_BASE_DELAY_MS,
-                            )
-                        });
+                    //
+                    // The pool's own cooldown wins over both when it is known.
+                    // Every account is refusing and this process already knows
+                    // when the first of them comes back, so retrying before then
+                    // is a guaranteed 429 that also re-extends the cooldown it
+                    // re-proves. With several sessions open that noise is
+                    // multiplied by the session count, which is what the user
+                    // sees as a wall of switch lines. Waiting for the real
+                    // deadline collapses it to one request at the moment it can
+                    // succeed. Clamped so a long quota reset does not turn into
+                    // an unbounded silent sleep: past the cap the loop gives up
+                    // and the caller can downgrade or switch provider.
+                    // See ADR-0023.
+                    let pool_delay = jcode_base::provider::time_until_any_account_is_eligible(
+                        jcode_provider_core::ActiveProvider::Claude,
+                    )
+                    .filter(|wait| *wait <= MAX_POOL_RECOVERY_WAIT)
+                    // Spread the wake-up: every session computed this same
+                    // deadline from the same shared cooldown.
+                    .map(|wait| wait + pool_recovery_spread(pool_recovery_salt));
+                    let delay = pool_delay.unwrap_or_else(|| {
+                        jcode_provider_core::retry_after::retry_after_from_error(&e)
+                            .map(|hint| hint.min(MAX_BURST_RETRY_AFTER))
+                            .unwrap_or_else(|| {
+                                jcode_provider_core::attempt_tracker::retry_backoff_delay(
+                                    rate_limit_retries,
+                                    RATE_LIMIT_RETRY_BASE_DELAY_MS,
+                                )
+                            })
+                    });
                     jcode_base::logging::info(&format!(
                         "Anthropic rate limited on every account (attempt {}/{}), waiting {:?}: {}",
                         rate_limit_retries, MAX_RATE_LIMIT_RETRIES, delay, e

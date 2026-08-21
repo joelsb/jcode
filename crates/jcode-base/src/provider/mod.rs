@@ -53,8 +53,9 @@ pub use account_failover::prefer_account_failover_enabled;
 pub use account_failover::with_quota_exhausted_override;
 pub use account_failover::{
     account_is_cooling_down, clear_account_cooldown, clear_account_rate_limit,
-    clear_all_account_cooldowns, note_account_rate_limited, note_account_rate_limited_until,
-    note_account_rate_limited_with_reset,
+    clear_account_rate_limit_if_newer, clear_all_account_cooldowns, note_account_rate_limited,
+    note_account_rate_limited_until, note_account_rate_limited_with_reset,
+    time_until_any_account_is_eligible,
 };
 pub use catalog_routes::{
     append_simplified_anthropic_model_routes, remote_current_openai_compatible_route_for_model,
