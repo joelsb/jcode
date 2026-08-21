@@ -1224,30 +1224,41 @@ fn test_ctrl_tab_toggles_queue_mode() {
 
 #[test]
 fn test_auto_poke_starts_enabled_by_default() {
-    let app = create_test_app();
+    // Must run in its own JCODE_HOME: the session default comes from
+    // `features.auto_poke`, and a sibling test in this binary writes
+    // `auto_poke = false` into the config (see
+    // `auto_poke_config_sets_the_session_default_and_poke_on_still_overrides`).
+    // Reading the ambient config made this assert the other test's setting.
+    with_temp_jcode_home(|| {
+        let app = create_test_app();
 
-    assert!(app.auto_poke_incomplete_todos);
+        assert!(app.auto_poke_incomplete_todos);
+    });
 }
 
 #[test]
 fn test_ctrl_p_toggles_auto_poke_locally() {
-    let mut app = create_test_app();
+    // Hermetic for the same reason as `test_auto_poke_starts_enabled_by_default`:
+    // this starts from the config-derived default before toggling it.
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
 
-    assert!(app.auto_poke_incomplete_todos);
+        assert!(app.auto_poke_incomplete_todos);
 
-    app.handle_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
-        .unwrap();
-    assert!(!app.auto_poke_incomplete_todos);
-    assert_eq!(app.status_notice(), Some("Poke: OFF".to_string()));
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+            .unwrap();
+        assert!(!app.auto_poke_incomplete_todos);
+        assert_eq!(app.status_notice(), Some("Poke: OFF".to_string()));
 
-    app.handle_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
-        .unwrap();
-    assert!(app.auto_poke_incomplete_todos);
-    assert_eq!(app.status_notice(), Some("Poke: ON".to_string()));
-    assert!(app.display_messages().iter().any(|msg| {
-        msg.content
-            .contains("Auto-poke enabled. Nothing unfinished right now")
-    }));
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+            .unwrap();
+        assert!(app.auto_poke_incomplete_todos);
+        assert_eq!(app.status_notice(), Some("Poke: ON".to_string()));
+        assert!(app.display_messages().iter().any(|msg| {
+            msg.content
+                .contains("Auto-poke enabled. Nothing unfinished right now")
+        }));
+    });
 }
 
 #[test]

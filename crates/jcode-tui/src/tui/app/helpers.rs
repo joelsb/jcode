@@ -266,20 +266,26 @@ pub(super) fn partition_queued_messages(
     (user_messages, reminder, display_system_messages)
 }
 
+/// Recover `Ctrl+[` on macOS, where the terminal collapses it into `Esc`.
+///
+/// `Ctrl+[` and `Esc` are the same byte (0x1b) in a legacy tty, so the default
+/// `scroll_prompt_up` binding would otherwise be unreachable. Mapping the
+/// control-modified `Esc` back to `Char('[')` restores it.
+///
+/// This deliberately does NOT remap `Ctrl+5`. It used to, as a second legacy
+/// alias for `Ctrl+]`, which silently broke the documented `Ctrl+5..9`
+/// "jump to the Nth most recent prompt" hotkeys on every macOS install:
+/// `Ctrl+5` was rewritten to `Ctrl+]` before dispatch, so `prompt_jump` claimed
+/// it and scrolled to the *next* prompt instead of the 5th most recent. The
+/// alias bought nothing, because `Ctrl+]` already arrives as `Char(']')` with
+/// CONTROL and matches `scroll_prompt_down` directly.
 #[cfg(target_os = "macos")]
 pub(super) fn ctrl_bracket_fallback_to_esc(code: &mut KeyCode, modifiers: &mut KeyModifiers) {
     if !modifiers.contains(KeyModifiers::CONTROL) {
         return;
     }
-    match code {
-        KeyCode::Esc => {
-            *code = KeyCode::Char('[');
-        }
-        KeyCode::Char('5') => {
-            // Legacy tty mapping for Ctrl+]
-            *code = KeyCode::Char(']');
-        }
-        _ => {}
+    if *code == KeyCode::Esc {
+        *code = KeyCode::Char('[');
     }
 }
 

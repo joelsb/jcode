@@ -83,8 +83,18 @@ fn test_expand_badge_shortcut_toggles_inline_diff_and_pulses_key() {
 
 #[test]
 fn test_alt_shift_i_toggles_inline_images_and_persists() {
-    let _render_lock = scroll_render_test_lock();
+    // Lock order matters: env lock BEFORE the render-state lock.
+    //
+    // `create_test_app` (reached via `create_copy_test_app`) takes the
+    // render-state lock while a caller may already hold the env lock, so every
+    // test that needs both must acquire them env-first. This test used to take
+    // them render-first, which is a textbook AB-BA deadlock: with
+    // --test-threads>1 it hung the whole jcode-tui suite whenever it raced a
+    // test using `with_temp_jcode_home` (which takes env, then builds an app).
+    // The suite then sat at "has been running for over 60 seconds" forever
+    // instead of failing, so it read as a slow suite rather than a deadlock.
     let _env_guard = crate::storage::lock_test_env();
+    let _render_lock = scroll_render_test_lock();
     let temp = tempfile::tempdir().expect("tempdir");
     let prev_home = std::env::var_os("JCODE_HOME");
     crate::env::set_var("JCODE_HOME", temp.path());
@@ -108,9 +118,14 @@ fn test_alt_shift_i_toggles_inline_images_and_persists() {
         KeyModifiers::ALT | KeyModifiers::SHIFT,
     ));
     assert!(!app.inline_images_visible, "Alt+Shift+I should hide images");
+    // Mac keyboards label this modifier ⌥, so build the expected chord from
+    // the platform helper instead of hardcoding "Alt+Shift+I".
     assert_eq!(
         app.status_notice(),
-        Some("Inline images: hidden (Alt+Shift+I to show)".to_string())
+        Some(format!(
+            "Inline images: hidden ({} to show)",
+            jcode_tui_core::keybind::alt_chord("Shift+I")
+        ))
     );
 
     // The flag persists for the next app (e.g. resume after restart).

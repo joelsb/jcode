@@ -16,6 +16,66 @@ fn test_prompt_jump_ctrl_digit_is_recency_rank_in_app() {
     assert!(app.scroll_offset > 0);
 }
 
+/// Ctrl+5 must reach the recency-rank jump, not be rewritten into Ctrl+].
+///
+/// On macOS, `ctrl_bracket_fallback_to_esc` used to alias Ctrl+5 to Ctrl+]
+/// as a second "legacy tty" mapping. That silently broke the documented
+/// Ctrl+5..9 "jump to the Nth most recent prompt" hotkeys on every macOS
+/// install: prompt_jump claimed the key first and scrolled to the *next*
+/// prompt (bottom, offset 0) instead. The alias was also unnecessary, since
+/// Ctrl+] already arrives as Char(']') + CONTROL.
+#[test]
+fn ctrl_5_is_a_recency_jump_not_an_alias_for_ctrl_bracket() {
+    let _render_lock = scroll_render_test_lock();
+    let (mut app, mut terminal) = create_scroll_test_app(100, 30, 1, 20);
+    render_and_snap(&app, &mut terminal);
+
+    // Park the viewport away from the bottom so a stray "next prompt" jump
+    // (which lands at offset 0) is distinguishable from a real rank jump.
+    let (prompt_up_code, prompt_up_mods) = prompt_up_key(&app);
+    app.handle_key(prompt_up_code, prompt_up_mods).unwrap();
+    let parked = app.scroll_offset;
+    assert!(parked > 0, "setup: expected to scroll up off the bottom");
+
+    app.handle_key(KeyCode::Char('5'), KeyModifiers::CONTROL)
+        .unwrap();
+
+    assert!(
+        app.scroll_offset > 0,
+        "Ctrl+5 must jump by recency, not fall through to scroll_to_next_prompt (offset 0)"
+    );
+    // The rank jump reports itself in user terms, never as raw internals.
+    let notice = app.status_notice().unwrap_or_default();
+    assert!(
+        notice.contains("prompt"),
+        "expected a human-readable jump notice, got {notice:?}"
+    );
+    assert!(
+        !notice.contains("idx=") && !notice.contains("max="),
+        "status notice must not leak debug internals: {notice:?}"
+    );
+}
+
+/// Ctrl+] must still work as scroll_prompt_down after dropping the Ctrl+5
+/// alias, so removing it did not cost the real binding.
+#[test]
+fn ctrl_bracket_close_still_jumps_to_the_next_prompt() {
+    let _render_lock = scroll_render_test_lock();
+    let (mut app, mut terminal) = create_scroll_test_app(100, 30, 1, 20);
+    render_and_snap(&app, &mut terminal);
+
+    let (prompt_up_code, prompt_up_mods) = prompt_up_key(&app);
+    app.handle_key(prompt_up_code, prompt_up_mods).unwrap();
+    assert!(app.scroll_offset > 0, "setup: scrolled up off the bottom");
+
+    app.handle_key(KeyCode::Char(']'), KeyModifiers::CONTROL)
+        .unwrap();
+    assert_eq!(
+        app.scroll_offset, 0,
+        "Ctrl+] should still move toward the newest prompt"
+    );
+}
+
 #[test]
 fn test_scroll_cmd_j_k_fallback_in_app() {
     let _render_lock = scroll_render_test_lock();

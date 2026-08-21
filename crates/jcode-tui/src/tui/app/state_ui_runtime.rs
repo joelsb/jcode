@@ -421,7 +421,6 @@ impl App {
         let rank = rank.max(1);
         let positions = ui::last_user_prompt_positions();
         let max_scroll = ui::last_max_scroll();
-
         if positions.is_empty() {
             return;
         }
@@ -430,15 +429,25 @@ impl App {
         // positions are in document order (top to bottom), we want most-recent first
         let target_idx = positions.len().saturating_sub(rank);
         let target_line = positions[target_idx];
-        self.set_status_notice(format!(
-            "Ctrl+{}: idx={}/{} line={} max={}",
-            rank,
-            target_idx,
-            positions.len(),
-            target_line,
-            max_scroll
-        ));
-        self.scroll_offset = target_line;
+        // Report the jump the way a user thinks about it. This used to emit the
+        // raw internals ("Ctrl+5: idx=0/1 line=20 max=32"), which is debug
+        // output, not a status notice.
+        let total = positions.len();
+        self.set_status_notice(if rank >= total {
+            format!("Jumped to the oldest loaded prompt (of {})", total)
+        } else {
+            format!("Jumped to prompt {} of {} (newest first)", rank, total)
+        });
+        // Never scroll past the end of the document. `last_max_scroll` was
+        // previously read only to print it into a debug notice, so an oversized
+        // prompt position could park the viewport past the bottom. Skip the
+        // clamp when it is 0, which means "no frame measured yet" rather than
+        // "the document cannot scroll".
+        self.scroll_offset = if max_scroll > 0 {
+            target_line.min(max_scroll)
+        } else {
+            target_line
+        };
         self.auto_scroll_paused = true;
     }
 

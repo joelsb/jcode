@@ -15,6 +15,25 @@ pub const CLAUDE_CODE_NATIVE_AUTH_SOURCE_ID: &str = "claude_code_native_credenti
 /// `refreshToken`, and `expiresAt`.
 const CLAUDE_CODE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
+/// Env var that makes every external-Keychain probe report "nothing there".
+///
+/// The macOS login Keychain is per-user machine state: unlike files, it does
+/// not move when `JCODE_HOME` is redirected. Tests that assert first-run
+/// behaviour ("a fresh install has no importable logins") therefore read the
+/// developer's own Claude Code credential and flip depending on whose machine
+/// runs them. Setting this to `1`/`true` makes those probes deterministic.
+pub const IGNORE_EXTERNAL_KEYCHAIN_ENV: &str = "JCODE_IGNORE_EXTERNAL_KEYCHAIN";
+
+#[cfg(target_os = "macos")]
+fn external_keychain_ignored() -> bool {
+    std::env::var(IGNORE_EXTERNAL_KEYCHAIN_ENV)
+        .map(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
 /// Environment variable Claude Code reads its OAuth token from (set by
 /// `claude setup-token`, and prioritized by Claude Code over the Keychain).
 const CLAUDE_CODE_OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
@@ -700,8 +719,17 @@ fn load_claude_code_env_credentials() -> Option<ClaudeCredentials> {
 /// macOS: read Claude Code's OAuth credentials from the login Keychain item
 /// (`Claude Code-credentials`). Returns `None` on non-macOS platforms, when the
 /// item is missing, or when the Keychain is locked/inaccessible (e.g. over SSH).
+///
+/// Honors `JCODE_IGNORE_EXTERNAL_KEYCHAIN=1`. The Keychain is per-user machine
+/// state that no `JCODE_HOME` override can isolate, so a test asserting
+/// "a fresh install has nothing to import" would otherwise pass or fail
+/// depending on whether the developer happens to use Claude Code. That is a
+/// test reading the machine instead of the code.
 #[cfg(target_os = "macos")]
 fn load_claude_code_keychain_credentials() -> Option<ClaudeCredentials> {
+    if external_keychain_ignored() {
+        return None;
+    }
     let blob = read_claude_code_keychain_blob()?;
     match parse_claude_code_credentials_blob(&blob) {
         Ok(creds) => Some(creds),
@@ -793,8 +821,16 @@ pub fn native_credentials_present() -> bool {
 
 /// macOS: cheaply check whether the Claude Code Keychain item exists without
 /// reading (and therefore without unlocking/prompting for) its secret value.
+///
+/// Honors `JCODE_IGNORE_EXTERNAL_KEYCHAIN` for the same reason as
+/// `load_claude_code_keychain_credentials`: this is the probe that decides
+/// whether onboarding offers an import, and the Keychain is machine state that
+/// `JCODE_HOME` cannot sandbox.
 #[cfg(target_os = "macos")]
 fn claude_code_keychain_item_exists() -> bool {
+    if external_keychain_ignored() {
+        return false;
+    }
     use std::process::{Command, Stdio};
     Command::new("/usr/bin/security")
         .args(["find-generic-password", "-s", CLAUDE_CODE_KEYCHAIN_SERVICE])

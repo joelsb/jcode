@@ -17,7 +17,14 @@ fn unknown_ctrl_chord_sets_hotkey_feedback_with_suggestion() {
         .expect("unknown chord should set feedback");
     assert!(message.contains("Ctrl+M"), "{message}");
     assert!(message.contains("isn't bound"), "{message}");
-    assert!(message.contains("Alt+M"), "{message}");
+    // Mac keyboards have no key labelled "Alt", so the hint renders the ⌥
+    // keycap there. Assert the platform's own label instead of hardcoding
+    // "Alt", which made this test fail on every macOS checkout.
+    let alt = jcode_tui_core::keybind::alt_label();
+    assert!(
+        message.contains(&format!("{alt}+M")),
+        "expected the platform Alt label {alt:?} in {message}"
+    );
     assert!(message.contains("side panel"), "{message}");
 
     // The renderer consumes the trait accessor; it must surface the same text

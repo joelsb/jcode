@@ -401,6 +401,13 @@ fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");
     let prev_home = std::env::var_os("JCODE_HOME");
+    // The macOS login Keychain does NOT follow JCODE_HOME, so first-run
+    // assertions ("no importable logins") otherwise read the developer's own
+    // Claude Code credential and pass or fail per machine. Neutralize it for
+    // the duration of the hermetic block.
+    let prev_ignore_keychain =
+        std::env::var_os(crate::auth::claude::IGNORE_EXTERNAL_KEYCHAIN_ENV);
+    crate::env::set_var(crate::auth::claude::IGNORE_EXTERNAL_KEYCHAIN_ENV, "1");
     crate::env::set_var("JCODE_HOME", temp.path());
     crate::auth::claude::set_active_account_override(None);
     crate::auth::codex::set_active_account_override(None);
@@ -420,6 +427,12 @@ fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
         crate::env::set_var("JCODE_HOME", prev_home);
     } else {
         crate::env::remove_var("JCODE_HOME");
+    }
+    match prev_ignore_keychain {
+        Some(value) => {
+            crate::env::set_var(crate::auth::claude::IGNORE_EXTERNAL_KEYCHAIN_ENV, value)
+        }
+        None => crate::env::remove_var(crate::auth::claude::IGNORE_EXTERNAL_KEYCHAIN_ENV),
     }
     // Drop any config loaded from the temp home so it cannot leak into the next
     // test, which is process-global state shared across this suite.
