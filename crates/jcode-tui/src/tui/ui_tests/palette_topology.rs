@@ -49,6 +49,11 @@ fn measure() -> (
                 DisplayMessage::error("something failed"),
             ],
             input: "next question".to_string(),
+            status: crate::tui::ProcessingStatus::Streaming,
+            streaming_text: "streaming reply with `code` and **bold**".to_string(),
+            queued_messages: vec!["queued follow-up".to_string()],
+            active_skill: Some("commit".to_string()),
+            suppress_info_widgets: false,
             ..Default::default()
         };
 
