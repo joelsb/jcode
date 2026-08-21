@@ -411,6 +411,51 @@ fn reload_wait_status_message_uses_waiting_language() {
     assert!(!message.contains("retrying"));
 }
 
+/// Regression for the "reconnecting - attempt 22 - 8m 1s" hang: when the shared
+/// server dies WITHOUT a reload handoff (stop --force, crash, OOM, SIGTERM to
+/// the process group) every spawn path was gated behind `reload_handoff_active`,
+/// so no client ever tried to bring a server back and all of them retried a
+/// dead socket indefinitely.
+#[test]
+fn a_server_that_died_without_a_reload_handoff_gets_revived() {
+    let mut state = RemoteRunState::default();
+    let now = std::time::Instant::now();
+
+    // Early attempts must NOT spawn: a normal restart deserves a moment.
+    state.reconnect_attempts = 1;
+    assert!(
+        !reconnect::should_revive_dead_server(&state, now),
+        "must not race a server that is merely restarting"
+    );
+
+    // Enough failures with no handoff in flight: revive.
+    state.reconnect_attempts = 4;
+    assert!(
+        reconnect::should_revive_dead_server(&state, now),
+        "a server gone for several attempts with no reload handoff must be revived"
+    );
+
+    // While a reload handoff IS in flight, the reload path owns recovery.
+    state.server_reload_in_progress = true;
+    assert!(
+        !reconnect::should_revive_dead_server(&state, now),
+        "must not spawn a competing server during a reload handoff"
+    );
+    state.server_reload_in_progress = false;
+
+    // After one spawn, the cooldown prevents a spawn loop when the replacement
+    // also dies immediately.
+    state.last_dead_server_revive = Some(now);
+    assert!(
+        !reconnect::should_revive_dead_server(&state, now + std::time::Duration::from_secs(5)),
+        "a server that dies on startup must not become a spawn loop"
+    );
+    assert!(
+        reconnect::should_revive_dead_server(&state, now + std::time::Duration::from_secs(25)),
+        "past the cooldown it is worth trying again"
+    );
+}
+
 #[test]
 fn submit_prepared_remote_input_defers_until_history_loads() {
     // Regression for the intermittent "first prompt vanishes / weird render"

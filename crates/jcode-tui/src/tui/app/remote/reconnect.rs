@@ -14,6 +14,19 @@ use tokio::time::MissedTickBehavior;
 
 const RELOAD_MARKER_MAX_AGE: Duration = Duration::from_secs(30);
 
+/// How many failed reconnects to tolerate before concluding the shared server
+/// is gone for good (rather than mid-restart) and starting a replacement.
+///
+/// Deliberately small: with the default backoff, attempt 4 lands about 2s after
+/// the disconnect, which is well past a normal reload handoff (that path is
+/// handled separately and returns before we get here) but fast enough that a
+/// dead daemon does not strand every client.
+const DEAD_SERVER_REVIVE_AFTER_ATTEMPTS: u32 = 4;
+
+/// Minimum gap between replacement-server spawn attempts, so a server that
+/// starts and immediately dies cannot become a spawn loop.
+const DEAD_SERVER_REVIVE_COOLDOWN: Duration = Duration::from_secs(20);
+
 #[derive(Default)]
 pub(in crate::tui::app) struct RemoteRunState {
     pub reconnect_attempts: u32,
@@ -24,6 +37,9 @@ pub(in crate::tui::app) struct RemoteRunState {
     pub server_reload_in_progress: bool,
     pub reload_recovery_attempted: bool,
     pub last_reload_pid: Option<u32>,
+    /// When we last tried to start a replacement for a server that died
+    /// outside a reload handoff. See `revive_dead_server`.
+    pub last_dead_server_revive: Option<Instant>,
 }
 
 #[expect(
@@ -351,6 +367,82 @@ async fn recover_reloading_server(
     }
 }
 
+/// Decide whether a reconnect loop that keeps failing should start a
+/// replacement shared server.
+///
+/// Separate from the reload-handoff recovery above, which only fires while a
+/// reload marker is present. A daemon can also die with no handoff at all:
+/// `jcode server stop --force`, an OOM kill, a crash, or a `SIGTERM` to the
+/// process group. In that case `reload_handoff_active` is false, so every
+/// branch that could spawn a replacement was skipped and the client retried a
+/// socket that nobody was listening on - forever. Observed live as
+/// "reconnecting - attempt 22 - 8m 1s" across five sessions at once after a
+/// SIGTERM reached the daemon; the shared server had been gone for eight
+/// minutes and no client ever tried to bring one back.
+///
+/// Gated on: enough failed attempts to rule out a normal restart, no server
+/// actually reachable, and a cooldown so a server that dies on startup cannot
+/// turn this into a spawn loop.
+pub(in crate::tui::app) fn should_revive_dead_server(state: &RemoteRunState, now: Instant) -> bool {
+    if reload_handoff_active(state) {
+        // The reload path owns recovery while a handoff is in flight.
+        return false;
+    }
+    if state.reconnect_attempts < DEAD_SERVER_REVIVE_AFTER_ATTEMPTS {
+        return false;
+    }
+    match state.last_dead_server_revive {
+        Some(last) => now.duration_since(last) >= DEAD_SERVER_REVIVE_COOLDOWN,
+        None => true,
+    }
+}
+
+/// Start a replacement shared server after the old one died without a reload
+/// handoff. Returns true when a spawn was attempted.
+async fn revive_dead_server(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    state: &mut RemoteRunState,
+) -> Result<bool> {
+    if !should_revive_dead_server(state, Instant::now()) {
+        return Ok(false);
+    }
+    if crate::server_spawn::is_running().await {
+        // A server came back on its own; let the next attempt connect to it.
+        return Ok(false);
+    }
+
+    state.last_dead_server_revive = Some(Instant::now());
+
+    crate::logging::warn(&format!(
+        "Shared server appears gone (no reload handoff, {} failed reconnects, last_reason={:?}); starting a replacement",
+        state.reconnect_attempts, state.last_disconnect_reason
+    ));
+
+    let detail = "server is gone; starting a replacement";
+    set_disconnect_status_message(app, state, reconnect_status_message(app, state, detail));
+    terminal.draw(|frame| crate::tui::ui::draw(frame, app))?;
+
+    match crate::server_spawn::spawn_default_server().await {
+        Ok(()) => {
+            state.initial_server_start = true;
+            state.last_disconnect_reason =
+                Some("replacement server started; reconnecting".to_string());
+            crate::logging::info("Replacement shared server started after the old one died");
+            Ok(true)
+        }
+        Err(error) => {
+            state.last_disconnect_reason =
+                Some(format!("could not start a replacement server: {}", error));
+            crate::logging::error(&format!(
+                "Failed to start a replacement shared server: {}",
+                error
+            ));
+            Ok(false)
+        }
+    }
+}
+
 pub(in crate::tui::app) async fn connect_with_retry(
     app: &mut App,
     terminal: &mut DefaultTerminal,
@@ -414,6 +506,9 @@ pub(in crate::tui::app) async fn connect_with_retry(
             state.last_disconnect_reason = None;
             state.reload_recovery_attempted = false;
             state.last_reload_pid = None;
+            // A later death must be able to revive a server again, so do not
+            // carry this cooldown across a healthy connection.
+            state.last_dead_server_revive = None;
             Ok(ConnectOutcome::Connected(remote))
         }
         Err(e) => {
@@ -529,6 +624,14 @@ pub(in crate::tui::app) async fn connect_with_retry(
                         return Ok(ConnectOutcome::Retry);
                     }
                 }
+            }
+
+            // No reload handoff is in flight, so nothing above will bring a
+            // server back. If the daemon simply died (stop --force, crash,
+            // OOM), start a replacement instead of retrying a dead socket
+            // forever.
+            if revive_dead_server(app, terminal, state).await? {
+                return Ok(ConnectOutcome::Retry);
             }
 
             let backoff = if (state.initial_server_start && state.reconnect_attempts <= 20)
