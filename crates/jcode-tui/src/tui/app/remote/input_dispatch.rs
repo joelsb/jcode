@@ -83,6 +83,46 @@ pub(in crate::tui::app) fn history_matches_pending_startup_prompt(app: &App) -> 
         .is_some_and(|message| message.content == app.input)
 }
 
+/// Route a prompt that was submitted while a turn is still running through the
+/// same queue policy that plain Enter uses, returning true when it took the
+/// prompt.
+///
+/// `submit_prepared_remote_input` is reached by paths that never consult
+/// `send_action`: a skill invocation with a trailing prompt
+/// (`/handoff new`), the `/`-shaped fallbacks in `submit_remote_slash_input`,
+/// and the deferred startup/model-switch dispatches. Mid-turn those called
+/// `begin_remote_send` directly, the server answered "Already processing a
+/// message", and `recover_rejected_user_submission` folded the prompt onto
+/// `queued_messages`. Net effect: with the queue OFF, `/handoff new` still
+/// ended up waiting in the queue, which is exactly what the user turned off.
+///
+/// So apply the policy up front: queue ON parks it (one per turn), queue OFF
+/// interleaves it into the live turn, same as Enter on ordinary text.
+async fn route_mid_turn_prompt_by_queue_policy(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    prepared: &input::PreparedInput,
+) -> bool {
+    if !app.is_processing {
+        return false;
+    }
+    if app.queue_mode {
+        app.queued_messages.push(prepared.expanded.clone());
+        app.pending_images.clear();
+        let waiting = app.queued_messages.len();
+        app.set_status_notice(format!("Queued ({} waiting) - queue is on", waiting));
+        return true;
+    }
+    super::key_handling::send_interleave_now(
+        app,
+        prepared.expanded.clone(),
+        prepared.images.clone(),
+        remote,
+    )
+    .await;
+    true
+}
+
 pub(in crate::tui::app) async fn submit_prepared_remote_input(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -116,6 +156,12 @@ pub(in crate::tui::app) async fn submit_prepared_remote_input(
 
     if let Some(command) = input::extract_input_shell_command(&prepared.expanded) {
         submit_remote_input_shell(app, remote, prepared.raw_input, command.to_string()).await?;
+        return Ok(());
+    }
+
+    // A turn is still running: honor /queue instead of racing the server into
+    // "Already processing a message". See the helper's docs.
+    if route_mid_turn_prompt_by_queue_policy(app, remote, &prepared).await {
         return Ok(());
     }
 

@@ -1648,6 +1648,66 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
     }
 }
 
+/// Stop making the *already waiting* messages wait.
+///
+/// `/queue off` used to change only the policy for future messages, so a
+/// backlog parked while the queue was on kept draining one message per turn
+/// boundary anyway - the user turned queueing off and still watched their
+/// messages sit there. Turning it off now also releases the backlog by the
+/// fastest route the current state allows:
+///
+/// - mid-turn: fold the queued user messages into the interleave, which is
+///   exactly where Enter puts a message with the queue off;
+/// - idle: re-arm `pending_queued_dispatch` so the run loop sends the whole
+///   backlog on its next tick (with `serialize_queued_messages` false it goes
+///   as a single turn) instead of waiting for some later turn boundary.
+///
+/// `[SYSTEM: ...]` entries stay queued: they are turn reminders, not user
+/// messages, and must ride with the turn they belong to.
+///
+/// Returns the number of user messages released.
+pub(super) fn flush_queued_messages_now(app: &mut App) -> usize {
+    if app.queued_messages.is_empty() {
+        return 0;
+    }
+
+    if !app.is_processing {
+        let count = app
+            .queued_messages
+            .iter()
+            .filter(|message| super::helpers::extract_bracketed_system_message(message).is_none())
+            .count();
+        if count > 0 {
+            app.pending_queued_dispatch = true;
+        }
+        return count;
+    }
+
+    let mut flushed: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    for message in std::mem::take(&mut app.queued_messages) {
+        if super::helpers::extract_bracketed_system_message(&message).is_some() {
+            kept.push(message);
+        } else {
+            flushed.push(message);
+        }
+    }
+    app.queued_messages = kept;
+    if flushed.is_empty() {
+        return 0;
+    }
+
+    let count = flushed.len();
+    let mut combined = flushed.join("\n\n");
+    if let Some(existing) = app.interleave_message.take()
+        && !existing.trim().is_empty()
+    {
+        combined = format!("{}\n\n{}", existing, combined);
+    }
+    app.interleave_message = Some(combined);
+    count
+}
+
 /// `/queue [on|off|status]` - control what happens to a message typed while the
 /// model is still working.
 ///
@@ -1655,9 +1715,11 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
 /// `queue_mode` decides whether Enter mid-turn parks the message in
 /// `queued_messages` (on) or injects it into the running turn as an interleave
 /// (off), and `serialize_queued_messages` decides whether the parked backlog
-/// then drains one user message per turn. `/queue` used to set only the second,
-/// so `/queue on` followed by Enter still interleaved and `/queue status` still
-/// reported "0 waiting" - the message never reached the queue at all.
+/// then drains one user message per turn.
+///
+/// Turning the queue OFF also releases whatever is already waiting, via
+/// `flush_queued_messages_now`: "off" means nothing of mine is sitting in a
+/// queue, not merely "future messages skip the queue".
 pub(super) fn handle_queue_command(app: &mut App, trimmed: &str) -> bool {
     let queueing_now = app.queue_mode && app.serialize_queued_messages;
     let enable = match trimmed {
@@ -1674,30 +1736,35 @@ pub(super) fn handle_queue_command(app: &mut App, trimmed: &str) -> bool {
         _ => return false,
     };
 
-    if trimmed != "/queue status" {
+    let is_status = trimmed == "/queue status";
+    let mut flushed = 0usize;
+    if !is_status {
         app.queue_mode = enable;
         app.serialize_queued_messages = enable;
+        if !enable {
+            flushed = flush_queued_messages_now(app);
+        }
     }
     let label = if enable { "ON" } else { "OFF" };
     app.set_status_notice(format!("Queue: {}", label));
     app.push_display_message(DisplayMessage::system(if enable {
         format!(
             "Queue {}: messages typed while the model works wait their turn, one per turn ({} waiting).",
-            if trimmed == "/queue status" {
-                "is ON"
-            } else {
-                "ON"
-            },
+            if is_status { "is ON" } else { "ON" },
+            app.queued_messages.len()
+        )
+    } else if flushed > 0 {
+        format!(
+            "Queue {}: messages are injected into the running turn instead of waiting. Released {} waiting message{} to send as soon as the model allows ({} waiting).",
+            if is_status { "is OFF" } else { "OFF" },
+            flushed,
+            if flushed == 1 { "" } else { "s" },
             app.queued_messages.len()
         )
     } else {
         format!(
             "Queue {}: messages are injected into the running turn instead of waiting ({} waiting).",
-            if trimmed == "/queue status" {
-                "is OFF"
-            } else {
-                "OFF"
-            },
+            if is_status { "is OFF" } else { "OFF" },
             app.queued_messages.len()
         )
     }));

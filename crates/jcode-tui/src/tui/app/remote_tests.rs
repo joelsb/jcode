@@ -1244,3 +1244,108 @@ fn busy_rejection_requeue_does_not_resubmit_on_every_tool_event() {
          turn (token-burning resubmit loop regression)"
     );
 }
+
+/// Repro of the reported bug: `/queue off`, then `/handoff new` typed while a
+/// turn is running. A skill invocation with a trailing prompt goes through
+/// `submit_remote_slash_input` -> `submit_prepared_remote_input`, which never
+/// consulted `send_action`, so the prompt raced the running turn, was rejected
+/// as "Already processing a message" and got folded onto `queued_messages`.
+/// With the queue OFF it must interleave into the live turn instead.
+#[test]
+fn queue_off_makes_a_mid_turn_skill_prompt_interleave_instead_of_queueing() {
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.runtime_mode = crate::tui::app::AppRuntimeMode::RemoteClient;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let skill_dir = temp.path().join(".jcode/skills/handoff");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: handoff\ndescription: Compact the conversation\n---\nUse it.\n",
+    )
+    .expect("write skill");
+    app.session.working_dir = Some(temp.path().to_string_lossy().to_string());
+
+    // Queue OFF, and a turn already running.
+    assert!(crate::tui::app::commands::handle_queue_command(
+        &mut app,
+        "/queue off"
+    ));
+    app.is_processing = true;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+    rt.block_on(crate::tui::app::remote::submit_remote_slash_input(
+        &mut app,
+        &mut remote,
+        crate::tui::app::input::PreparedInput {
+            raw_input: "/handoff new".to_string(),
+            expanded: "/handoff new".to_string(),
+            images: vec![],
+        },
+    ))
+    .expect("mid-turn skill prompt should be routed, not error");
+
+    assert_eq!(app.active_skill.as_deref(), Some("handoff"));
+    assert!(
+        app.queued_messages.is_empty(),
+        "with the queue off, a mid-turn skill prompt must not be parked in the queue: {:?}",
+        app.queued_messages
+    );
+    assert!(
+        app.interleave_message.is_some() || !app.pending_soft_interrupts.is_empty(),
+        "the prompt should have gone out as an interleave into the running turn"
+    );
+}
+
+/// Same path with the queue ON: the prompt must wait in `queued_messages`
+/// rather than being interleaved, so `/queue on` still means what it says for
+/// skill invocations.
+#[test]
+fn queue_on_makes_a_mid_turn_skill_prompt_wait_in_the_queue() {
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.runtime_mode = crate::tui::app::AppRuntimeMode::RemoteClient;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let skill_dir = temp.path().join(".jcode/skills/handoff");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: handoff\ndescription: Compact the conversation\n---\nUse it.\n",
+    )
+    .expect("write skill");
+    app.session.working_dir = Some(temp.path().to_string_lossy().to_string());
+
+    assert!(crate::tui::app::commands::handle_queue_command(
+        &mut app,
+        "/queue on"
+    ));
+    app.is_processing = true;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+    rt.block_on(crate::tui::app::remote::submit_remote_slash_input(
+        &mut app,
+        &mut remote,
+        crate::tui::app::input::PreparedInput {
+            raw_input: "/handoff new".to_string(),
+            expanded: "/handoff new".to_string(),
+            images: vec![],
+        },
+    ))
+    .expect("mid-turn skill prompt should be routed, not error");
+
+    assert_eq!(
+        app.queued_messages,
+        &["new".to_string()],
+        "with the queue on, the trailing prompt must wait its turn"
+    );
+    assert!(
+        app.interleave_message.is_none(),
+        "queue on must not interleave"
+    );
+}

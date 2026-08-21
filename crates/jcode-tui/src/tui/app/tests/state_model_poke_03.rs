@@ -2953,3 +2953,69 @@ fn queue_off_makes_the_queue_drain_in_a_single_turn_again() {
     assert_eq!(batch, vec!["one".to_string(), "two".to_string()]);
     assert!(rest.is_empty());
 }
+
+/// `/queue off` must also release what is ALREADY waiting. Changing only the
+/// policy for future messages left a backlog parked while the queue was on
+/// still draining one message per turn boundary, so the user turned queueing
+/// off and kept watching their messages wait.
+///
+/// Mid-turn, release means "interleave into the running turn", the same place
+/// Enter puts a message with the queue off.
+#[test]
+fn queue_off_releases_the_waiting_backlog_into_the_running_turn() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+    app.queued_messages.push("one".to_string());
+    app.queued_messages.push("two".to_string());
+    // A turn reminder must NOT be treated as a user message.
+    app.queued_messages
+        .push("[SYSTEM: keep going]".to_string());
+
+    super::commands::handle_queue_command(&mut app, "/queue off");
+
+    assert_eq!(
+        app.queued_messages,
+        vec!["[SYSTEM: keep going]".to_string()],
+        "user messages must be released; only the turn reminder stays queued"
+    );
+    assert_eq!(
+        app.interleave_message.as_deref(),
+        Some("one\n\ntwo"),
+        "released messages go out as an interleave, in order"
+    );
+    let last = app.display_messages.last().expect("queue notice");
+    assert!(
+        last.content.contains("Released 2 waiting messages"),
+        "the user must be told the backlog was released: {}",
+        last.content
+    );
+}
+
+/// Idle variant: there is no running turn to interleave into, so releasing the
+/// backlog means re-arming the dispatch so the run loop sends it on its next
+/// tick (as one turn, since `serialize_queued_messages` is now false) instead
+/// of waiting for some later turn boundary.
+#[test]
+fn queue_off_while_idle_rearms_dispatch_for_the_waiting_backlog() {
+    let mut app = create_test_app();
+    app.is_processing = false;
+    app.pending_queued_dispatch = false;
+    app.queued_messages.push("one".to_string());
+    app.queued_messages.push("two".to_string());
+
+    super::commands::handle_queue_command(&mut app, "/queue off");
+
+    assert!(
+        app.pending_queued_dispatch,
+        "/queue off on an idle client must re-arm the queued dispatch"
+    );
+    assert_eq!(
+        app.queued_messages,
+        vec!["one".to_string(), "two".to_string()],
+        "the backlog stays intact; the run loop sends it as one turn"
+    );
+    assert!(
+        app.interleave_message.is_none(),
+        "nothing to interleave into while idle"
+    );
+}
