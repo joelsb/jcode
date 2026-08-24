@@ -3774,3 +3774,97 @@ fn concurrent_waiters_do_not_wake_in_lockstep() {
         "one request's slot must not move between its own attempts"
     );
 }
+
+/// The user's report, as a test: one session rotates the pool, every other
+/// session keeps 429ing on the old account.
+///
+/// The token cache was keyed on expiry alone, so a session holding a valid
+/// `claude-2` token never re-read the (process-wide) override after another
+/// session moved it to `claude-1`. The token is valid, so nothing rejects it as
+/// auth; the request just keeps landing on the account that already refused it,
+/// while the session header claims the new one. See ADR-0024.
+#[test]
+fn a_cached_token_for_another_account_is_not_reused() {
+    let future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    let cached = CachedCredentials {
+        access_token: "token-for-claude-2".to_string(),
+        refresh_token: "refresh".to_string(),
+        expires_at: future,
+        account_label: Some("claude-2".to_string()),
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+
+    assert!(
+        cached_token_is_usable(&cached, Some("claude-2"), now),
+        "a fresh token for the active account must be reused"
+    );
+    assert!(
+        !cached_token_is_usable(&cached, Some("claude-1"), now),
+        "a token for another account must be refused even though it is valid"
+    );
+    assert!(
+        !cached_token_is_usable(&cached, None, now),
+        "no known active account must not silently keep an account-specific token"
+    );
+}
+
+/// A token cached before the label existed (a live cache carried across a
+/// reload) is refused once, so it is replaced by a labelled one rather than
+/// trusted blindly.
+#[test]
+fn an_unlabelled_cached_token_is_refreshed_once() {
+    let cached = CachedCredentials {
+        access_token: "legacy".to_string(),
+        refresh_token: "refresh".to_string(),
+        expires_at: chrono::Utc::now().timestamp_millis() + 3_600_000,
+        account_label: None,
+    };
+    assert!(!cached_token_is_usable(
+        &cached,
+        Some("claude-1"),
+        chrono::Utc::now().timestamp_millis()
+    ));
+}
+
+/// Expiry still disqualifies a token, label match or not.
+#[test]
+fn an_expiring_token_is_refused_even_for_the_active_account() {
+    let cached = CachedCredentials {
+        access_token: "about-to-expire".to_string(),
+        refresh_token: "refresh".to_string(),
+        // Inside the 5-minute refresh buffer.
+        expires_at: chrono::Utc::now().timestamp_millis() + 60_000,
+        account_label: Some("claude-1".to_string()),
+    };
+    assert!(!cached_token_is_usable(
+        &cached,
+        Some("claude-1"),
+        chrono::Utc::now().timestamp_millis()
+    ));
+}
+
+/// Meta-test: the pre-fix rule (expiry only) must fail the case above.
+///
+/// Guards against a future "simplification" that drops the label comparison and
+/// leaves a green suite behind.
+#[test]
+fn the_pre_fix_expiry_only_rule_would_have_missed_the_bug() {
+    fn expiry_only(cached: &CachedCredentials, now_ms: i64) -> bool {
+        cached.expires_at > now_ms + 300_000
+    }
+    let cached = CachedCredentials {
+        access_token: "token-for-claude-2".to_string(),
+        refresh_token: "refresh".to_string(),
+        expires_at: chrono::Utc::now().timestamp_millis() + 3_600_000,
+        account_label: Some("claude-2".to_string()),
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    assert!(
+        expiry_only(&cached, now),
+        "the old rule accepted a token for the wrong account"
+    );
+    assert!(
+        !cached_token_is_usable(&cached, Some("claude-1"), now),
+        "the current rule must reject what the old one accepted"
+    );
+}

@@ -39,3 +39,4 @@ Format: Michael Nygard's ADR template, trimmed to the sections this codebase act
 | [0021](0021-memory-decay-requires-a-verdict.md) | Memory confidence decays only on a real judge verdict, never on judge failure | Accepted |
 | [0022](0022-retention-decays-from-last-use.md) | Memory retention decays from last use; expiry retires before it deletes | Accepted |
 | [0023](0023-a-success-is-evidence-about-when-it-started.md) | A success clears a rate-limit cooldown only if it predates it; the pool wait uses the real deadline | Accepted |
+| [0024](0024-a-cached-token-belongs-to-an-account.md) | A cached OAuth token belongs to an account, not just to a clock, so a rotation reaches every session | Accepted |

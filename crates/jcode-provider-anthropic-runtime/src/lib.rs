@@ -593,6 +593,49 @@ struct CachedCredentials {
     access_token: String,
     refresh_token: String,
     expires_at: i64,
+    /// Anthropic account label this token belongs to, when known.
+    ///
+    /// Without it, a cached-but-unexpired token is indistinguishable from a
+    /// token for the account the shared override now points at, and
+    /// `get_oauth_access_token` returns early on expiry alone. One daemon serves
+    /// every session (ADR-0009), so when one session rotated the pool to
+    /// `claude-1`, every *other* session kept sending its still-valid
+    /// `claude-2` token and kept getting 429 from the account that had just
+    /// refused - while its own header claimed `claude-1`. See ADR-0024.
+    account_label: Option<String>,
+}
+
+/// Whether a cached OAuth token may still be used for a request.
+///
+/// Two independent reasons to refuse it, and only the first used to be checked:
+///
+/// 1. it is expired (or inside the 5-minute refresh buffer);
+/// 2. it belongs to a *different* account than the pool now points at.
+///
+/// (2) is what made account rotation look like it did nothing outside the
+/// session that triggered it. One daemon serves every session (ADR-0009) and the
+/// active-account override is process-wide, so a rotation moved the pointer for
+/// everyone - but each session's provider was still holding a perfectly valid
+/// token for the old account, so it never re-read the pointer and kept sending
+/// requests to the account that had just refused them. Nothing rejected the
+/// token as auth, so the only symptom was a 429 loop in every session except
+/// the one that rotated, with the header claiming the new account.
+///
+/// An unlabelled token predates this field (a live cache across a reload), so it
+/// is refused once and replaced by a labelled one rather than trusted blindly.
+/// See ADR-0024.
+fn cached_token_is_usable(
+    cached: &CachedCredentials,
+    active_label: Option<&str>,
+    now_ms: i64,
+) -> bool {
+    if cached.expires_at <= now_ms + 300_000 {
+        return false;
+    }
+    match cached.account_label.as_deref() {
+        Some(label) => Some(label) == active_label,
+        None => false,
+    }
 }
 
 /// Direct Anthropic API provider
@@ -1091,19 +1134,25 @@ impl AnthropicProvider {
     }
 
     async fn get_oauth_access_token(&self) -> Result<(String, bool)> {
+        // Which account this session must be on *now*. Re-read per request, not
+        // cached, because another session on this daemon may have rotated the
+        // shared override since the last turn.
+        let active_label = auth::claude::active_account_label();
+
         // Check cached credentials
         {
             let cached = self.credentials.read().await;
             if let Some(ref creds) = *cached {
                 let now = chrono::Utc::now().timestamp_millis();
-                // Return cached token if not expired (with 5 min buffer)
-                if creds.expires_at > now + 300_000 {
+                if cached_token_is_usable(creds, active_label.as_deref(), now) {
                     return Ok((creds.access_token.clone(), true));
                 }
             }
         }
 
-        // Load fresh credentials or refresh expired ones
+        // Load fresh credentials or refresh expired ones. `load_credentials`
+        // already honours the active-account override, so this is the account
+        // switch actually taking effect for this session.
         let fresh_creds =
             auth::claude::load_credentials().context("Failed to load Claude credentials")?;
 
@@ -1137,11 +1186,12 @@ impl AnthropicProvider {
                 "OAuth token expired or expiring soon, attempting refresh...",
             );
 
-            let active_label = auth::claude::active_account_label()
+            let refresh_label = active_label
+                .clone()
                 .unwrap_or_else(auth::claude::primary_account_label);
             match oauth::refresh_claude_tokens_for_account(
                 &fresh_creds.refresh_token,
-                &active_label,
+                &refresh_label,
             )
             .await
             {
@@ -1154,6 +1204,7 @@ impl AnthropicProvider {
                         access_token: refreshed.access_token.clone(),
                         refresh_token: refreshed.refresh_token,
                         expires_at: refreshed.expires_at,
+                        account_label: Some(refresh_label.clone()),
                     });
 
                     return Ok((refreshed.access_token, true));
@@ -1183,6 +1234,9 @@ impl AnthropicProvider {
             access_token: fresh_creds.access_token.clone(),
             refresh_token: fresh_creds.refresh_token,
             expires_at: fresh_creds.expires_at,
+            account_label: Some(
+                active_label.unwrap_or_else(auth::claude::primary_account_label),
+            ),
         });
 
         Ok((fresh_creds.access_token, true))
@@ -2605,6 +2659,7 @@ async fn credentials_for_claude_account(label: &str) -> Result<CachedCredentials
             access_token: creds.access_token,
             refresh_token: creds.refresh_token,
             expires_at: creds.expires_at,
+            account_label: Some(label.to_string()),
         });
     }
 
@@ -2620,6 +2675,7 @@ async fn credentials_for_claude_account(label: &str) -> Result<CachedCredentials
         access_token: refreshed.access_token,
         refresh_token: refreshed.refresh_token,
         expires_at: refreshed.expires_at,
+        account_label: Some(label.to_string()),
     })
 }
 
@@ -2833,6 +2889,7 @@ async fn force_refresh_oauth_token(
             access_token: refreshed.access_token.clone(),
             refresh_token: refreshed.refresh_token,
             expires_at: refreshed.expires_at,
+            account_label: Some(active_label.clone()),
         });
     }
 
