@@ -108,13 +108,26 @@ pub(super) fn infer_protocol_from_multiplexer_survivors(
 }
 
 fn infer_protocol_from_multiplexer_survivors_env() -> Option<ProtocolType> {
-    let protocol = infer_protocol_from_multiplexer_survivors(
+    infer_protocol_from_multiplexer_survivors(
         std::env::var("WEZTERM_EXECUTABLE").ok().as_deref(),
         std::env::var("WEZTERM_PANE").ok().as_deref(),
         std::env::var("GHOSTTY_RESOURCES_DIR").ok().as_deref(),
         std::env::var("GHOSTTY_BIN_DIR").ok().as_deref(),
-    )?;
-    if protocol_is_multiplexer_stable(protocol) || multiplexer_images_opt_in() {
+    )
+}
+
+/// Filter a detected protocol through the multiplexer's actual passthrough
+/// ability.
+///
+/// Outside a multiplexer every protocol is usable. Inside one, only protocols
+/// that survive a repaint are, unless the user opted back in.
+pub(super) fn usable_protocol_in_multiplexer(
+    protocol: Option<ProtocolType>,
+    multiplexer: Multiplexer,
+    opt_in: bool,
+) -> Option<ProtocolType> {
+    let protocol = protocol?;
+    if multiplexer == Multiplexer::None || opt_in || protocol_is_multiplexer_stable(protocol) {
         return Some(protocol);
     }
     None
@@ -146,18 +159,29 @@ fn multiplexer_images_opt_in() -> bool {
 /// Protocol for the current process: generic env signals first, then
 /// outer-terminal markers that survive a multiplexer.
 pub(super) fn infer_protocol_for_current_env() -> Option<ProtocolType> {
-    if let Some(protocol) = infer_protocol_from_env(
+    let multiplexer = detect_multiplexer_from_env();
+    let opt_in = multiplexer_images_opt_in();
+    let direct = infer_protocol_from_env(
         std::env::var("TERM").ok().as_deref(),
         std::env::var("TERM_PROGRAM").ok().as_deref(),
         std::env::var("LC_TERMINAL").ok().as_deref(),
         std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
-    ) {
-        return Some(protocol);
+    );
+    if direct.is_some() {
+        // A multiplexer does not always mask the outer terminal's identity:
+        // Herdr leaves TERM_PROGRAM intact, so the direct signal can name a
+        // protocol the multiplexer cannot actually forward. Gate it the same
+        // way the survivor path is gated.
+        return usable_protocol_in_multiplexer(direct, multiplexer, opt_in);
     }
-    if detect_multiplexer_from_env() == Multiplexer::None {
+    if multiplexer == Multiplexer::None {
         return None;
     }
-    infer_protocol_from_multiplexer_survivors_env()
+    usable_protocol_in_multiplexer(
+        infer_protocol_from_multiplexer_survivors_env(),
+        multiplexer,
+        opt_in,
+    )
 }
 
 fn parse_env_bool(raw: &str) -> Option<bool> {
@@ -179,15 +203,30 @@ fn parse_env_bool(raw: &str) -> Option<bool> {
 ///   critical path. Users behind multiplexers that hide the outer terminal can
 ///   still opt into the authoritative probe with
 ///   `JCODE_MERMAID_PICKER_PROBE=1`.
+/// * The one exception is a multiplexer that left us with no usable protocol.
+///   There the fast path's answer is halfblocks, which is visibly wrong: two
+///   pixels per cell renders a mermaid diagram as a blurry smear. A
+///   multiplexer may still forward a real protocol (Herdr composites Kitty
+///   graphics), and env vars cannot tell us whether it does, because the
+///   multiplexer's passthrough is a runtime setting rather than an exported
+///   marker. Guessing is what produced blank diagrams, so ask the terminal.
+///   The cost lands only on multiplexer users who would otherwise get the
+///   blurry fallback.
 pub(super) fn decide_picker_init_mode(
     probe_override: Option<bool>,
-    _env_protocol: Option<ProtocolType>,
-    _multiplexer: Multiplexer,
+    env_protocol: Option<ProtocolType>,
+    multiplexer: Multiplexer,
 ) -> PickerInitMode {
-    if probe_override == Some(true) {
-        PickerInitMode::Probe
-    } else {
-        PickerInitMode::Fast
+    match probe_override {
+        Some(true) => PickerInitMode::Probe,
+        Some(false) => PickerInitMode::Fast,
+        None => {
+            if multiplexer != Multiplexer::None && env_protocol.is_none() {
+                PickerInitMode::Probe
+            } else {
+                PickerInitMode::Fast
+            }
+        }
     }
 }
 
@@ -342,6 +381,25 @@ fn probe_picker() -> Picker {
                 );
                 protocol = ProtocolType::Halfblocks;
             }
+            // The probe answers for the outer terminal, so inside a
+            // multiplexer it can name a protocol that cannot survive the trip
+            // back through it. WezTerm behind Herdr answers iTerm2, which
+            // Herdr does not forward, and the result was a blank diagram.
+            let multiplexer = detect_multiplexer_from_env();
+            if usable_protocol_in_multiplexer(
+                Some(protocol),
+                multiplexer,
+                multiplexer_images_opt_in(),
+            )
+            .is_none()
+            {
+                crate::log_info(&format!(
+                    "Probe reported {:?}, which does not survive {}; falling back to halfblocks",
+                    protocol,
+                    multiplexer.label()
+                ));
+                protocol = ProtocolType::Halfblocks;
+            }
             crate::log_info(&format!(
                 "Mermaid picker stdio probe detected protocol: {:?}",
                 protocol
@@ -355,7 +413,52 @@ fn probe_picker() -> Picker {
             ));
         }
     }
+    if picker.protocol_type() == ProtocolType::Halfblocks {
+        rescue_halfblocks_with_direct_kitty_query(&mut picker);
+    }
     picker
+}
+
+/// Second-chance Kitty detection when the upstream probe settled on halfblocks.
+///
+/// `ratatui-image` blacklists the Kitty protocol outright when
+/// `WEZTERM_EXECUTABLE` is set, so it never asks, and WezTerm users get
+/// halfblocks (two pixels per cell, visibly blurry) even when something in the
+/// stack does support Kitty. That blacklist exists because WezTerm's own
+/// Unicode-placeholder implementation is wrong, which is true when WezTerm is
+/// the thing drawing. It is not true when a multiplexer sits in between and
+/// composites the graphics itself: Herdr with
+/// `experimental.kitty_graphics = true` answers the Kitty query and draws the
+/// image, so the outer terminal's placeholder handling never comes into it.
+///
+/// Only the multiplexer case is rescued, and only on a real terminal answer.
+/// Bare WezTerm keeps upstream's decision, because there the blacklist is
+/// right.
+fn rescue_halfblocks_with_direct_kitty_query(picker: &mut Picker) {
+    let multiplexer = detect_multiplexer_from_env();
+    if multiplexer == Multiplexer::None {
+        return;
+    }
+    match crate::kitty_probe::terminal_speaks_kitty_graphics() {
+        Some(true) => {
+            crate::log_info(&format!(
+                "Direct Kitty query answered OK through {}; upgrading halfblocks to Kitty",
+                multiplexer.label()
+            ));
+            picker.set_protocol_type(ProtocolType::Kitty);
+        }
+        Some(false) => {
+            crate::log_info(&format!(
+                "Direct Kitty query declined through {}; keeping halfblocks",
+                multiplexer.label()
+            ));
+        }
+        None => {
+            crate::log_info(
+                "Direct Kitty query got no answer; keeping the upstream halfblocks decision",
+            );
+        }
+    }
 }
 
 /// Start loading the system font database on a background thread.
@@ -952,6 +1055,47 @@ mod tests {
         );
     }
 
+    /// Herdr leaves `TERM_PROGRAM=WezTerm` visible, so the direct env signal
+    /// names the iTerm2 protocol. Herdr cannot forward that out-of-band
+    /// payload, so jcode reserved image cells and drew nothing: a blank box
+    /// where the diagram should be. Only repaint-stable protocols may pass.
+    #[test]
+    fn out_of_band_protocol_is_rejected_inside_a_multiplexer() {
+        assert_eq!(
+            usable_protocol_in_multiplexer(
+                Some(ProtocolType::Iterm2),
+                Multiplexer::Herdr,
+                false
+            ),
+            None,
+            "WezTerm's iTerm2 path inside Herdr renders a blank image"
+        );
+        assert_eq!(
+            usable_protocol_in_multiplexer(Some(ProtocolType::Sixel), Multiplexer::Tmux, false),
+            None,
+            "sixel is equally out-of-band"
+        );
+        assert_eq!(
+            usable_protocol_in_multiplexer(Some(ProtocolType::Kitty), Multiplexer::Herdr, false),
+            Some(ProtocolType::Kitty),
+            "kitty unicode placeholders survive a repaint"
+        );
+        assert_eq!(
+            usable_protocol_in_multiplexer(Some(ProtocolType::Iterm2), Multiplexer::None, false),
+            Some(ProtocolType::Iterm2),
+            "no multiplexer, no restriction"
+        );
+        assert_eq!(
+            usable_protocol_in_multiplexer(Some(ProtocolType::Iterm2), Multiplexer::Herdr, true),
+            Some(ProtocolType::Iterm2),
+            "JCODE_MULTIPLEXER_IMAGES=1 opts back in"
+        );
+        assert_eq!(
+            usable_protocol_in_multiplexer(None, Multiplexer::Herdr, true),
+            None
+        );
+    }
+
     #[test]
     fn decide_mode_respects_explicit_override() {
         // Force-on always probes, even when env already detected a protocol.
@@ -973,11 +1117,12 @@ mod tests {
             decide_picker_init_mode(None, Some(ProtocolType::Kitty), Multiplexer::None),
             PickerInitMode::Fast
         );
-        // An env miss must not turn an optional capability query into a
-        // two-second startup stall. Multiplexer users can opt in explicitly.
+        // An env miss inside a multiplexer is the one case worth the probe's
+        // latency: the fallback is halfblocks, which is visibly blurry, and a
+        // multiplexer may still forward a real protocol.
         assert_eq!(
             decide_picker_init_mode(None, None, Multiplexer::Herdr),
-            PickerInitMode::Fast
+            PickerInitMode::Probe
         );
         assert_eq!(
             decide_picker_init_mode(None, None, Multiplexer::None),

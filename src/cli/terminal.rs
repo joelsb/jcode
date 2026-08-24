@@ -12,6 +12,15 @@ pub struct TuiRuntimeState {
 
 const INHERITED_MODES_ENV: &str = "JCODE_TUI_INHERITED_MODES";
 const INHERITED_THEME_ENV: &str = "JCODE_TUI_INHERITED_THEME";
+/// Kitty-graphics capability handed across an `exec` (reload/rebuild/update).
+///
+/// The capability query needs a cooked terminal, which an exec handoff never
+/// has: the previous process deliberately left raw mode and the alternate
+/// screen active. Without this the reloaded process has no answer and every
+/// mermaid diagram silently drops to halfblocks until the user starts a wholly
+/// new session. The terminal is the same process on the other side of the
+/// exec, so its answer carries over unchanged.
+const INHERITED_KITTY_GRAPHICS_ENV: &str = "JCODE_TUI_INHERITED_KITTY_GRAPHICS";
 
 // Crossterm's Windows implementation enables Win32 console mouse input but does
 // not emit the VT mouse-tracking modes. Windows Terminal and other ConPTY hosts
@@ -339,6 +348,19 @@ mod crash_resume_hint_tests {
     }
 }
 
+/// Decode the Kitty-graphics exec handoff value.
+///
+/// Only an explicit `1`/`0` is an answer. Anything else, including an absent
+/// variable, means the previous process never got one, and the new process must
+/// be free to ask rather than inherit a false negative.
+fn parse_inherited_kitty_graphics(raw: Option<&str>) -> Option<bool> {
+    match raw? {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
 fn init_tui_terminal(inherited_terminal: bool) -> Result<ratatui::DefaultTerminal> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!("jcode TUI requires an interactive terminal (stdin/stdout must be a TTY)");
@@ -358,6 +380,8 @@ fn init_tui_terminal(inherited_terminal: bool) -> Result<ratatui::DefaultTermina
 pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)> {
     let is_resuming = std::env::var_os("JCODE_RESUMING").is_some();
     let inherited_theme = std::env::var(INHERITED_THEME_ENV).ok();
+    let inherited_kitty_graphics =
+        parse_inherited_kitty_graphics(std::env::var(INHERITED_KITTY_GRAPHICS_ENV).ok().as_deref());
     let inherited_modes_raw = std::env::var(INHERITED_MODES_ENV).ok();
     let inherited_modes = inherited_modes_raw
         .as_deref()
@@ -368,16 +392,30 @@ pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)>
     // new process still took the resume path, leaving it on the primary screen
     // without mouse capture.
     let inherited_terminal = has_terminal_exec_handoff(is_resuming, inherited_modes);
+    // Install the mermaid log hooks before anything in that crate runs, so its
+    // startup diagnostics (notably the Kitty graphics query below) reach the
+    // log instead of being dropped on the floor.
+    crate::tui::mermaid::install_jcode_mermaid_hooks();
     if inherited_terminal {
         // OSC terminal queries are unsafe here because the previous process
         // deliberately exec'd without leaving raw mode or the alternate screen.
         crate::tui::theme_detect::init_theme_mode_for_resume(inherited_theme.as_deref());
+        // Same reason the theme is inherited rather than re-detected: the
+        // Kitty-graphics query cannot run on a raw-mode terminal, and without
+        // the previous process's answer mermaid silently degrades to
+        // halfblocks for the rest of the session.
+        if let Some(answer) = inherited_kitty_graphics {
+            crate::tui::mermaid::seed_kitty_graphics_answer(answer);
+        }
     } else {
         // The OSC 11 query needs the cooked terminal and must happen before init.
         crate::tui::theme_detect::init_theme_mode();
+        // Same constraint, same window: the Kitty graphics query is answered
+        // with an escape sequence, so it must be read before the TUI attaches
+        // its own reader and starts decoding the reply as keystrokes.
+        crate::tui::mermaid::prewarm_kitty_graphics_query();
     }
     let terminal = init_tui_terminal(inherited_terminal)?;
-    crate::tui::mermaid::install_jcode_mermaid_hooks();
     crate::tui::markdown::install_jcode_markdown_hooks();
     crate::tui::mermaid::init_picker();
 
@@ -386,6 +424,7 @@ pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)>
     // leaking them into tools or unrelated child jcode processes.
     crate::env::remove_var(INHERITED_MODES_ENV);
     crate::env::remove_var(INHERITED_THEME_ENV);
+    crate::env::remove_var(INHERITED_KITTY_GRAPHICS_ENV);
 
     let fallback_modes = InheritedTerminalModes {
         mouse_capture: perf_policy.enable_mouse_capture,
@@ -525,6 +564,12 @@ fn export_tui_exec_handoff(state: &TuiRuntimeState) {
     crate::env::set_var(INHERITED_MODES_ENV, modes.encode());
     let theme = crate::tui::theme_detect::current_theme_label();
     crate::env::set_var(INHERITED_THEME_ENV, theme);
+    // Only a definite answer is worth passing on: absence means "never asked",
+    // which the next process must be free to resolve for itself rather than
+    // inherit as a negative.
+    if let Some(kitty) = crate::tui::mermaid::kitty_graphics_answer() {
+        crate::env::set_var(INHERITED_KITTY_GRAPHICS_ENV, if kitty { "1" } else { "0" });
+    }
     crate::logging::info(&format!(
         "EVENT event=TUI_TERMINAL_MODES phase=exec_handoff pid={} raw_mode={} modes={} theme={}",
         std::process::id(),
@@ -658,6 +703,28 @@ mod tests {
     use std::sync::Mutex;
 
     static TEST_SESSION_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A reload `exec`s onto a raw-mode terminal, where the Kitty-graphics
+    /// query cannot run. Before the handoff existed, the new process had no
+    /// answer and every mermaid diagram fell back to halfblocks (two pixels
+    /// per cell, visibly blurry) until a wholly new session was started.
+    /// Verified live: after a `selfdev build-reload` the log went from
+    /// `probe detected protocol: Kitty` to `Direct Kitty query got no answer;
+    /// keeping the upstream halfblocks decision`.
+    #[test]
+    fn kitty_graphics_answer_survives_an_exec_handoff() {
+        assert_eq!(
+            parse_inherited_kitty_graphics(Some("1")),
+            Some(true),
+            "a positive answer must carry across the exec, or the reload downgrades to halfblocks"
+        );
+        assert_eq!(parse_inherited_kitty_graphics(Some("0")), Some(false));
+        // No answer is not a negative answer: the next process must stay free
+        // to ask for itself.
+        assert_eq!(parse_inherited_kitty_graphics(None), None);
+        assert_eq!(parse_inherited_kitty_graphics(Some("")), None);
+        assert_eq!(parse_inherited_kitty_graphics(Some("true")), None);
+    }
 
     fn test_guard() -> TuiRuntimeGuard {
         // All terminal-mode flags disabled so teardown only performs the minimal

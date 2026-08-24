@@ -2330,6 +2330,9 @@ impl SessionPicker {
         }
         // Detect light/dark terminal background before raw mode (OSC 11 query).
         super::theme_detect::init_theme_mode();
+        // The Kitty graphics query is answered the same way and must also be
+        // read before `ratatui::init` takes the terminal.
+        super::mermaid::prewarm_kitty_graphics_query();
         let mut terminal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ratatui::init))
             .map_err(|payload| {
                 let msg = if let Some(s) = payload.downcast_ref::<&str>() {

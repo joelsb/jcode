@@ -221,6 +221,7 @@ mod cache_render;
 mod content_render;
 #[path = "mermaid_inline.rs"]
 mod inline_image;
+mod kitty_probe;
 #[path = "mermaid_runtime.rs"]
 mod runtime;
 #[path = "mermaid_viewport.rs"]
@@ -249,6 +250,10 @@ pub use content_render::{
 pub use inline_image::{
     inline_image_dims, inline_image_id, inline_image_is_materialized, materialize_inline_image,
     materialize_inline_image_by_id, rediscover_inline_image,
+};
+pub use kitty_probe::{
+    cached_answer as kitty_graphics_answer, prewarm as prewarm_kitty_graphics_query,
+    seed_answer as seed_kitty_graphics_answer,
 };
 pub use runtime::{
     error_lines_for, get_cached_png, get_font_size, halfblocks_allowed, image_protocol_available,

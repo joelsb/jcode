@@ -947,6 +947,13 @@ async fn run_default_command(args: Args) -> Result<()> {
     // the inherited terminal is already live.
     if std::env::var_os("JCODE_RESUMING").is_none() {
         crate::tui::theme_detect::prewarm_theme_mode();
+        // The Kitty graphics query has the same precondition (cooked terminal,
+        // nothing else reading stdin) and the same one-shot cache, so take the
+        // same window. Its answer decides whether mermaid diagrams render as
+        // real images or as blurry halfblocks. Install the log hooks first or
+        // its diagnostics are discarded.
+        crate::tui::mermaid::install_jcode_mermaid_hooks();
+        crate::tui::mermaid::prewarm_kitty_graphics_query();
     }
     let mut server_running = if args.fresh_spawn {
         true
