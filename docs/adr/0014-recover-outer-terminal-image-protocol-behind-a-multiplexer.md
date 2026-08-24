@@ -1,7 +1,9 @@
 # ADR-0014: Recover the outer terminal's image protocol from markers that survive a multiplexer
 
-Status: Accepted
+Status: Accepted, extended by 0025
 Date: 2026-08-10
+
+> **Read 0025 with this.** The surviving markers tell the truth about the *terminal*, but not about what the *multiplexer* will forward. Under Herdr, `TERM_PROGRAM=WezTerm` survives intact and yields the iTerm2 protocol, which Herdr cannot pass through, so jcode reserved image cells and drew nothing. 0025 filters any detected protocol by what survives a repaint.
 
 ## Context
 
