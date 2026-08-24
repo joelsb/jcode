@@ -1860,3 +1860,5 @@ async fn fable_guardrail_reconsideration_recovers_the_streaming_turn() {
         "{text:?}"
     );
 }
+
+include!("agent_tests/turn_hooks.rs");

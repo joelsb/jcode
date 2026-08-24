@@ -15,7 +15,7 @@ impl Agent {
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
-        let _ = self.run_turn(true).await?;
+        let _ = self.run_turn_with_hooks(true, "run_once").await?;
         Ok(())
     }
 
@@ -41,7 +41,33 @@ impl Agent {
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
-        self.run_turn(false).await
+        self.run_turn_with_hooks(false, "capture").await
+    }
+
+    /// `run_turn` wrapped in the `turn_start`/`turn_end` observer hooks.
+    ///
+    /// The streaming path (`run_once_streaming_mpsc_with_display_role`) fires
+    /// these itself. The non-streaming path did not, so `jcode run`, ambient
+    /// runs, debug jobs and swarm workers completed a turn without ever
+    /// emitting `turn_end`. Anything tracking agent state from hooks saw the
+    /// turn begin and never end: a status integration would sit on "working"
+    /// forever. Observers are fire-and-forget, so this cannot fail the turn.
+    async fn run_turn_with_hooks(
+        &mut self,
+        print_output: bool,
+        source: &str,
+    ) -> Result<String> {
+        let turn_started_at = Instant::now();
+        let start_message_index = self.message_count();
+        self.fire_turn_start_hook(source);
+        let result = self.run_turn(print_output).await;
+        // fire_turn_end_hook takes the unit result the streaming path produces;
+        // map the captured text away without discarding the error.
+        let hook_result = result.as_ref().map(|_| ()).map_err(|error| {
+            anyhow::anyhow!(error.to_string())
+        });
+        self.fire_turn_end_hook(&hook_result, turn_started_at, start_message_index);
+        result
     }
 
     /// Run one conversation turn with streaming events via mpsc channel (per-client)
