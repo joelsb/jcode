@@ -401,11 +401,15 @@ pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)>
         // deliberately exec'd without leaving raw mode or the alternate screen.
         crate::tui::theme_detect::init_theme_mode_for_resume(inherited_theme.as_deref());
         // Same reason the theme is inherited rather than re-detected: the
-        // Kitty-graphics query cannot run on a raw-mode terminal, and without
-        // the previous process's answer mermaid silently degrades to
-        // halfblocks for the rest of the session.
-        if let Some(answer) = inherited_kitty_graphics {
-            crate::tui::mermaid::seed_kitty_graphics_answer(answer);
+        // Kitty-graphics query cannot run once a reader owns the terminal.
+        // Prefer the previous process's answer, but fall back to asking in
+        // this window, which is still reader-free. Without that fallback a
+        // reload chain never obtains an answer at all, because every process
+        // in it inherits from one that also could not ask, and mermaid stays
+        // stuck on halfblocks.
+        match inherited_kitty_graphics {
+            Some(answer) => crate::tui::mermaid::seed_kitty_graphics_answer(answer),
+            None => crate::tui::mermaid::prewarm_kitty_graphics_query_in_exec_window(),
         }
     } else {
         // The OSC 11 query needs the cooked terminal and must happen before init.

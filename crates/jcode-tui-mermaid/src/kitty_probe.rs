@@ -283,18 +283,41 @@ mod tests {
     /// session, so refusing to ask is the actual fix.
     #[test]
     fn query_is_refused_unless_the_terminal_is_known_to_be_cooked() {
+        use QueryWindow::BeforeRawMode;
         assert!(
-            safe_to_query(Some(false)),
+            safe_to_query(Some(false), BeforeRawMode),
             "a cooked terminal is the one safe case"
         );
         assert!(
-            !safe_to_query(Some(true)),
+            !safe_to_query(Some(true), BeforeRawMode),
             "raw mode means a reader owns stdin and would eat the reply"
         );
         assert!(
-            !safe_to_query(None),
+            !safe_to_query(None, BeforeRawMode),
             "unknown terminal state must not be treated as safe"
         );
+    }
+
+    /// A reload `exec`s onto a terminal the previous process left in raw mode,
+    /// so the startup rule refuses to ask there. Seeding the answer forward
+    /// cannot rescue it either, because every process in a reload chain is in
+    /// that same position, so no process ever obtains an answer to pass on and
+    /// mermaid stays on halfblocks for the rest of the chain. Observed live:
+    /// a fresh session logged `probe detected protocol: Kitty`, and after
+    /// `selfdev build-reload` the same terminal logged `Direct Kitty query got
+    /// no answer; keeping the upstream halfblocks decision`.
+    ///
+    /// The exec window has no reader attached yet, which is what actually made
+    /// the query unsafe, so it must be allowed to ask despite raw mode.
+    #[test]
+    fn exec_handoff_window_may_query_a_raw_terminal() {
+        use QueryWindow::ExecHandoff;
+        assert!(
+            safe_to_query(Some(true), ExecHandoff),
+            "refusing here leaves a whole reload chain unable to ever get an answer"
+        );
+        assert!(safe_to_query(None, ExecHandoff));
+        assert!(safe_to_query(Some(false), ExecHandoff));
     }
 
     /// The accessor must never trigger a query of its own: it is called while

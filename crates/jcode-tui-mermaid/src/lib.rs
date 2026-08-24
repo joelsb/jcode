@@ -253,6 +253,7 @@ pub use inline_image::{
 };
 pub use kitty_probe::{
     cached_answer as kitty_graphics_answer, prewarm as prewarm_kitty_graphics_query,
+    prewarm_in_exec_window as prewarm_kitty_graphics_query_in_exec_window,
     seed_answer as seed_kitty_graphics_answer,
 };
 pub use runtime::{

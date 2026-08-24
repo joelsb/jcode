@@ -39,7 +39,8 @@ pub use jcode_tui_mermaid::{ImageScrollBenchmark, cache_stat_syscalls};
 #[cfg(feature = "mmdr-size-api")]
 pub use jcode_tui_mermaid::terminal_theme;
 pub use jcode_tui_mermaid::{
-    kitty_graphics_answer, prewarm_kitty_graphics_query, seed_kitty_graphics_answer,
+    kitty_graphics_answer, prewarm_kitty_graphics_query,
+    prewarm_kitty_graphics_query_in_exec_window, seed_kitty_graphics_answer,
 };
 
 pub fn install_jcode_mermaid_hooks() {
