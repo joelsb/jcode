@@ -32,7 +32,7 @@ pub fn spawn_command_in_new_terminal(command: &TerminalCommand, cwd: &Path) -> R
         return Ok(true);
     }
     jcode_terminal_launch::spawn_command_in_new_terminal_with(command, cwd, |cmd| {
-        crate::platform::spawn_detached(cmd).map(|_| ())
+        crate::platform::spawn_detached_reaped(cmd).map(|_| ())
     })
 }
 

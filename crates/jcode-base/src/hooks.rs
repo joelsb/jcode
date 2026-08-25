@@ -232,7 +232,7 @@ pub fn dispatch_observer(event: HookEvent) {
                 cmd.stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());
-                match crate::platform::spawn_detached(&mut cmd) {
+                match crate::platform::spawn_detached_reaped(&mut cmd) {
                     Ok(_) => crate::logging::debug(&format!(
                         "Hook '{event_name}' dispatched to '{command_line}' (session={:?})",
                         event.session_id
@@ -746,6 +746,75 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&second_output.stdout),
             "client-pane-b|herdr-pane-b|client-pane-b|herdr-pane-b"
+        );
+    }
+
+    /// End-to-end guard for the process-table leak that took the machine down
+    /// on 2026-08-25. `dispatch_observer` fires on every `post_tool` and
+    /// `turn_start`, so a hook child that is spawned and dropped without a
+    /// `wait()` leaks one process-table slot per tool call. Ten hours of that
+    /// produced 2254 zombies against a `kern.maxprocperuid` of 2666 and every
+    /// `fork()` on the machine began failing with EAGAIN.
+    ///
+    /// This drives the real dispatch path rather than the spawn helper, and
+    /// asserts the OS-visible process state, because the defect is invisible
+    /// in both the code shape and the hook's own observable behaviour: the
+    /// hooks ran perfectly the whole time they were leaking.
+    #[cfg(unix)]
+    #[test]
+    fn observer_dispatch_does_not_leak_zombies() {
+        fn zombies_owned_by_us() -> usize {
+            let me = std::process::id().to_string();
+            let Ok(output) = std::process::Command::new("ps")
+                .args(["-Ao", "ppid=,stat="])
+                .output()
+            else {
+                return 0;
+            };
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let mut parts = line.split_whitespace();
+                    let ppid = parts.next()?;
+                    let stat = parts.next()?;
+                    (ppid == me && stat.starts_with('Z')).then_some(())
+                })
+                .count()
+        }
+
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let script = write_executable_script(temp.path(), "noop.sh", "#!/bin/sh\nexit 0\n");
+
+        let prev = std::env::var_os("JCODE_HOOK_TURN_END");
+        crate::env::set_var("JCODE_HOOK_TURN_END", script.to_string_lossy().to_string());
+
+        let before = zombies_owned_by_us();
+        for i in 0..30 {
+            dispatch_observer(HookEvent::new("turn_end").session_id(format!("ses_{i}")));
+        }
+
+        // The reaper polls at 250ms. Give it well over that, then require the
+        // count to come back to where it started.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut leaked = usize::MAX;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            leaked = zombies_owned_by_us().saturating_sub(before);
+            if leaked == 0 {
+                break;
+            }
+        }
+
+        match prev {
+            Some(value) => crate::env::set_var("JCODE_HOOK_TURN_END", value),
+            None => crate::env::remove_var("JCODE_HOOK_TURN_END"),
+        }
+
+        assert_eq!(
+            leaked, 0,
+            "30 observer hook dispatches leaked {leaked} zombie(s); each one \
+             permanently consumes a process-table slot until this process exits"
         );
     }
 }

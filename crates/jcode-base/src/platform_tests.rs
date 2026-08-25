@@ -155,3 +155,115 @@ fn spawn_replacement_process_returns_without_waiting_for_child_exit() {
     child.kill().ok();
     let _ = child.wait();
 }
+
+/// A zombie is a child that exited but whose parent never `wait()`ed for it.
+/// It holds a process-table slot until the parent dies, so a long-lived server
+/// that fire-and-forgets children eventually cannot `fork()` at all. Reproduced
+/// on 2026-08-25: 2254 zombies under one 10h-old shared server against a
+/// `kern.maxprocperuid` of 2666.
+///
+/// This asserts the observable OS state (state `Z` in `ps`), not that some
+/// helper was called, because the whole failure mode is invisible in code shape.
+#[cfg(unix)]
+fn process_is_zombie(pid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .starts_with('Z')
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_a_detached_child_leaks_a_zombie() {
+    // Guard test: proves the defect is real and that `process_is_zombie`
+    // actually detects it. Without this, the fix test below could pass because
+    // the detector never fires rather than because the reaper works.
+    let mut cmd = std::process::Command::new("true");
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let child = super::spawn_detached(&mut cmd).expect("spawn");
+    let pid = child.id();
+    drop(child); // std::process::Child::drop does NOT wait.
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !process_is_zombie(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert!(
+        process_is_zombie(pid),
+        "a dropped detached child must become a zombie, otherwise this test \
+         cannot prove the reaper below is what removes it"
+    );
+
+    // Do not leak from the test process itself.
+    super::try_reap_child_process(pid).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_detached_reaped_leaves_no_zombie() {
+    let mut cmd = std::process::Command::new("true");
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let pid = super::spawn_detached_reaped(&mut cmd).expect("spawn");
+
+    // The reaper polls at 250ms; allow several cycles before failing.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut zombie = true;
+    while std::time::Instant::now() < deadline {
+        if !process_is_zombie(pid) {
+            zombie = false;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    assert!(
+        !zombie,
+        "spawn_detached_reaped must reap the child; pid {pid} is still a zombie"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reaper_handles_many_children_without_leaking() {
+    // The real workload is many short-lived hook processes, not one. A reaper
+    // that only tracked a single child would pass the test above and still
+    // leak in production.
+    let pids: Vec<u32> = (0..25)
+        .map(|_| {
+            let mut cmd = std::process::Command::new("true");
+            cmd.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            super::spawn_detached_reaped(&mut cmd).expect("spawn")
+        })
+        .collect();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let remaining: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|pid| process_is_zombie(*pid))
+            .collect();
+        if remaining.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} of {} children still zombies: {:?}",
+            remaining.len(),
+            pids.len(),
+            remaining
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}

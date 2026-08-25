@@ -373,6 +373,82 @@ pub fn try_reap_child_process(pid: u32) -> std::io::Result<Option<i32>> {
     }
 }
 
+/// Hand a child we will never `wait()` on to the background reaper.
+///
+/// Rust's `std::process::Child::drop` explicitly does NOT wait, so a child
+/// dropped while running stays in the process table as a zombie for the whole
+/// life of this process. A zombie costs no CPU and no memory, only a slot in
+/// the per-uid process table, which is why the failure mode is a machine that
+/// looks completely healthy until `fork()` starts returning `EAGAIN`.
+///
+/// That is not hypothetical: a shared server running for ten hours with
+/// `post_tool`/`turn_start` hooks firing on every tool call accumulated 2254
+/// zombies against a `kern.maxprocperuid` of 2666, and every new process on the
+/// machine (not just jcode's) failed to spawn.
+///
+/// The reaper only ever waits on children explicitly handed to it, one owned
+/// `Child` at a time. It deliberately does NOT call `waitpid(-1)`, which would
+/// race every other `wait()`/`try_wait()` in the process and steal exit codes
+/// from callers that need them (`background.rs` reaps its own pids this way).
+pub fn reap_child_in_background(child: std::process::Child) {
+    use std::sync::OnceLock;
+    use std::sync::mpsc::{Sender, channel};
+
+    static REAPER: OnceLock<Sender<std::process::Child>> = OnceLock::new();
+
+    let sender = REAPER.get_or_init(|| {
+        let (tx, rx) = channel::<std::process::Child>();
+        // Detached OS thread, not a tokio task: this must keep working in
+        // processes that never build a runtime, and it outlives every runtime.
+        std::thread::Builder::new()
+            .name("jcode-child-reaper".to_string())
+            .spawn(move || {
+                let mut pending: Vec<std::process::Child> = Vec::new();
+                loop {
+                    // Block only while nothing is pending, so an idle reaper
+                    // costs nothing and a busy one polls.
+                    if pending.is_empty() {
+                        match rx.recv() {
+                            Ok(child) => pending.push(child),
+                            // Sender is in a `OnceLock` that lives forever, so
+                            // this is unreachable in practice; exit rather than
+                            // spin if it ever happens.
+                            Err(_) => return,
+                        }
+                    } else {
+                        while let Ok(child) = rx.try_recv() {
+                            pending.push(child);
+                        }
+                        // `try_wait` reaps an exited child and releases its
+                        // process-table slot. Errors mean the child is
+                        // unwaitable, so stop tracking it either way.
+                        pending.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                }
+            })
+            .ok();
+        tx
+    });
+
+    // If the reaper thread failed to start, dropping here is the old behavior:
+    // a leaked slot, never a crash.
+    let _ = sender.send(child);
+}
+
+/// Spawn a process detached from the current client session and reap it in the
+/// background.
+///
+/// Use this for every fire-and-forget spawn. Prefer it over `spawn_detached`
+/// whenever the returned `Child` would just be dropped: dropping it leaks a
+/// process-table slot until this process exits. Returns the child pid.
+pub fn spawn_detached_reaped(cmd: &mut std::process::Command) -> std::io::Result<u32> {
+    let child = spawn_detached(cmd)?;
+    let pid = child.id();
+    reap_child_in_background(child);
+    Ok(pid)
+}
+
 /// Atomically swap a symlink by creating a temp symlink and renaming.
 ///
 /// On Unix: creates temp symlink, then renames over target (atomic).
