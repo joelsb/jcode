@@ -44,6 +44,14 @@ fn shell_prompt_module_is_always_present_and_platform_aware() {
 
     let module = shell_prompt();
     assert_eq!(module.contains("bash 3.2"), cfg!(target_os = "macos"));
+    // The macOS block is appended to the base text, so it must carry its own
+    // paragraph break. A `"\` continuation silently ate this once.
+    if cfg!(target_os = "macos") {
+        assert!(
+            module.contains("one number.\n\nOn macOS"),
+            "macOS block must start a new paragraph: {module}"
+        );
+    }
 }
 
 #[test]
