@@ -34,6 +34,49 @@ pub fn load_base_system_prompt(working_dir: Option<&Path>) -> String {
 /// Prompt guidance for the optional Mermaid rendering capability.
 pub const MERMAID_PROMPT: &str = "# Mermaid\n\nRender fenced `mermaid` blocks inline.";
 
+/// Prompt guidance for the `bash` tool's shell. Sessions run every command as
+/// `bash -c <string>`, so the tool's reported exit code is the exit status of
+/// the *last* element of the chain. Long inspection chains ending in `grep`,
+/// `ls`, `test` or `[` therefore report failure on a perfectly successful run,
+/// which the model then tries to "fix". Measured on 60 real local sessions
+/// (20425 bash calls, 361 nonzero): 164 of the nonzero results were a trailing
+/// no-match `grep`/`ls`/`diff`/`which`, i.e. noise, not a broken command.
+pub const SHELL_PROMPT_BASE: &str = "\
+# Shell (`bash` tool)
+
+Commands run as `bash -c <string>`. The exit code you see is the status of the **last**
+element of the chain, not of the work you cared about.
+
+- A chain ending in `grep`/`rg`/`ls`/`test`/`[`/`diff`/`which` reports exit 1 on *no match*.
+  That is a successful command with an empty result, not a failure. Do not retry it.
+- When a no-match is an acceptable outcome, neutralize it: `grep -c foo file || true`,
+  or end the chain with `echo done`.
+- Prefer `;` over `&&` for independent inspection steps, and `&&` only where a later step
+  genuinely requires an earlier one to have succeeded.
+- Read the output before reacting to the exit code. If the output shows the answer, you are done.
+- Keep chains short. One purpose per call is easier to interpret than a ten-step pipeline
+  whose status collapses into one number.";
+
+/// macOS-specific addendum: Apple ships bash 3.2 (2007) as `/bin/bash` for
+/// licensing reasons, so bash 4+ builtins fail with confusing syntax errors.
+pub const SHELL_PROMPT_MACOS: &str = "\
+
+On macOS `/bin/bash` is **bash 3.2**, not bash 4/5. These are syntax errors here:
+`mapfile`/`readarray`, associative arrays (`declare -A`), `${var,,}`/`${var^^}` case
+conversion, `&>>`, and `;;&` in `case`. Use `while read` loops, `tr` for case folding, and
+`>>file 2>&1`. BSD userland also differs from GNU: `sed -i` needs an argument (`sed -i ''`),
+`date`, `stat`, `readlink -f` and `grep -P` behave differently. Reach for `python3` when the
+portable shell version gets awkward.";
+
+/// Build the shell prompt module for the host platform.
+pub fn shell_prompt() -> String {
+    let mut prompt = SHELL_PROMPT_BASE.to_string();
+    if cfg!(target_os = "macos") {
+        prompt.push_str(SHELL_PROMPT_MACOS);
+    }
+    prompt
+}
+
 /// Harness capabilities that conditionally contribute prompt modules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptCapabilities {
@@ -59,6 +102,7 @@ fn base_system_prompt_parts(
     working_dir: Option<&Path>,
 ) -> Vec<String> {
     let mut parts = vec![load_base_system_prompt(working_dir)];
+    parts.push(shell_prompt());
     if capabilities.mermaid {
         parts.push(MERMAID_PROMPT.to_string());
     }

@@ -16,6 +16,36 @@ fn test_default_system_prompt_no_claude_code_identity() {
     );
 }
 
+/// The shell prompt module must always reach the model: it is the fix for
+/// trailing-`grep` exit 1 being mistaken for a broken command. On macOS it must
+/// also warn about bash 3.2, because `/bin/bash` there predates bash 4 builtins.
+#[test]
+fn shell_prompt_module_is_always_present_and_platform_aware() {
+    let (prompt, _) = build_system_prompt_split_with_capabilities(
+        None,
+        &[],
+        false,
+        None,
+        None,
+        PromptCapabilities { mermaid: false },
+    );
+    assert!(
+        prompt.static_part.contains(SHELL_PROMPT_BASE),
+        "shell guidance must be in the static system prompt"
+    );
+    assert!(prompt.static_part.contains("reports exit 1 on *no match*"));
+
+    let has_macos_block = prompt.static_part.contains(SHELL_PROMPT_MACOS);
+    assert_eq!(
+        has_macos_block,
+        cfg!(target_os = "macos"),
+        "bash 3.2 warning must appear exactly on macOS"
+    );
+
+    let module = shell_prompt();
+    assert_eq!(module.contains("bash 3.2"), cfg!(target_os = "macos"));
+}
+
 #[test]
 fn mermaid_prompt_module_follows_capability() {
     let (enabled, _) = build_system_prompt_split_with_capabilities(
