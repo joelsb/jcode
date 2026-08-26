@@ -1204,10 +1204,39 @@ pub(in crate::tui::app) fn handle_server_event(
             completed_current_message || auto_poked
         }
         ServerEvent::Error {
+            id,
             message,
             retry_after_secs,
-            ..
         } => {
+            // An Error that belongs to a *different* request than the running
+            // turn must never be interpreted as a turn failure.
+            //
+            // Control requests (`rename_session`, `clear`, `set_feature`,
+            // `transfer`, `set_subagent_model`, `trigger_memory_extraction`)
+            // are rejected server-side while the agent is busy, via
+            // `send_agent_busy_error`, which sets `retry_after_secs: Some(1)`.
+            // This arm used to ignore the id entirely, so a `/rename` typed
+            // mid-turn was charged to the in-flight turn: `retry_after_secs`
+            // made `reset_duration` Some, the running turn's
+            // `rate_limit_pending_message` was read as the rate-limited
+            // payload, and the client printed "Rate limit hit. Will auto-retry
+            // in 1 seconds", switched Anthropic account, marked the live turn
+            // idle, and re-sent the last user message - which then surfaced as
+            // "+1 queued" with the queue explicitly OFF. Nothing was rate
+            // limited and nothing should have been queued; the only real event
+            // was a rename that the server declined.
+            //
+            // Report such an error and leave every piece of turn state alone.
+            if app.is_processing && app.current_message_id.is_some_and(|mid| mid != id) {
+                crate::logging::info(&format!(
+                    "Reporting non-turn request error id={} (current_message_id={:?}) without touching turn state: {}",
+                    id, app.current_message_id, message
+                ));
+                app.push_display_message(DisplayMessage::error(message.clone()));
+                app.set_status_notice(crate::util::truncate_str(&message, 60).to_string());
+                return true;
+            }
+
             // The server rejects a Message request with this error while its
             // previous turn is still running. This typically happens when a
             // reload/reconnect raced the turn-end dispatch: the history
