@@ -70,4 +70,19 @@ cargo build --release
 bash scripts/install_release.sh --fast
 ```
 
+## Installing a tool or plugin (Joel's machine)
+
+Applies where this checkout lives under `~/MYNE/Projects/tools/`.
+
+Installing a jcode plugin, a Herdr plugin, or any other tool that has a git repository is not finished when the installer succeeds. An installer drops a prebuilt binary into a state directory (`~/.local/state/herdr/plugins/` for Herdr plugins) that holds no source, no upstream remote and no history, so the next session cannot read the tool's code, diff it against upstream, or patch it.
+
+So in the same piece of work, also:
+
+1. Clone the upstream repo to `~/MYNE/Projects/tools/<name>/`.
+2. Add `/<name>/` to `~/MYNE/Projects/tools/.gitignore`. Each tool stays its own upstream checkout and is never vendored into the `tools` repo.
+3. Add its row to `~/MYNE/Projects/tools/TOOLS.md`: tool, dir, upstream, local branch, what it is, and how it is installed (plugin id, binary path).
+4. Run `bash ~/MYNE/Projects/tools/scripts/tools-status.sh` and require `ok`.
+
+A tool installed but absent from `TOOLS.md` is invisible to the next session, which is how a plugin gets reinstalled, or debugged with no source to read. The full rules for that registry live in `~/MYNE/Projects/tools/AGENTS.md`.
+
 Official docs: https://jcode.sh/docs#configuration
