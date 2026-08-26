@@ -12,9 +12,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
-/// Hard cap. `process_title::terminal_window_title` truncates at 48 chars
-/// including the icon, so anything longer is silently destroyed.
-pub const MAX_LABEL_CHARS: usize = 30;
+/// Hard cap. `process_title::terminal_window_title` truncates at 48 chars, and
+/// the title no longer carries an icon, so the label keeps that budget minus
+/// room for the ` [self-dev]` suffix.
+pub const MAX_LABEL_CHARS: usize = 36;
 
 const MAX_LABEL_WORDS: usize = 4;
 /// Below this many keyword-bearing words a message is not evidence of a task.

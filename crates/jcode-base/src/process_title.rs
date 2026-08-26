@@ -70,11 +70,17 @@ pub fn terminal_display_title_for_id(session_id: &str) -> Option<String> {
         })
 }
 
-/// Build the deliberately minimal terminal window title. The emoji already
-/// identifies the session/connection, so do not repeat `jcode` or the memorable
-/// animal name in window chrome.
+/// Build the deliberately minimal terminal window title.
+///
+/// `icon` is optional and is normally `None`. Terminal-title consumers that
+/// matter here (Herdr's agent sidebar) already render their own state icon
+/// column, so a second emoji carries no information and costs characters in a
+/// row that is the only view of ten concurrent jobs. Surfaces where the title
+/// stands alone, such as the macOS menubar dropdown, still pass one.
+///
+/// Never repeats `jcode` or the memorable animal name in window chrome.
 pub fn terminal_window_title(
-    icon: &str,
+    icon: Option<&str>,
     display_title: Option<&str>,
     fallback_label: Option<&str>,
     is_selfdev: bool,
@@ -83,11 +89,15 @@ pub fn terminal_window_title(
         .and_then(normalized_display_title)
         .map(|title| truncate_chars(&title, 48));
     let suffix = if is_selfdev { " [self-dev]" } else { "" };
+    let prefix = match icon.map(str::trim).filter(|icon| !icon.is_empty()) {
+        Some(icon) => format!("{icon} "),
+        None => String::new(),
+    };
     let title = match display_title {
-        Some(title) => format!("{icon} {title}{suffix}"),
+        Some(title) => format!("{prefix}{title}{suffix}"),
         None => match fallback_label.and_then(normalized_display_title) {
-            Some(label) => format!("{icon} {label}{suffix}"),
-            None => format!("{icon}{suffix}"),
+            Some(label) => format!("{prefix}{label}{suffix}"),
+            None => format!("{}{suffix}", prefix.trim_end()),
         },
     };
     crate::output_style::terminal_text(&title).into_owned()
@@ -165,10 +175,29 @@ mod tests {
     }
 
     #[test]
+    fn terminal_window_title_omits_the_icon_when_there_is_none() {
+        // Herdr renders its own state_icon column, so a second emoji in the
+        // title says nothing and costs ~2 of the 48 chars the row gets.
+        assert_eq!(
+            terminal_window_title(None, Some("DI-2507 Chat Endpoint"), None, false),
+            "DI-2507 Chat Endpoint"
+        );
+        assert_eq!(
+            terminal_window_title(None, None, Some("jcode Octopus"), false),
+            "jcode Octopus"
+        );
+        assert_eq!(
+            terminal_window_title(None, Some("Release planning"), None, true),
+            "Release planning [self-dev]"
+        );
+        assert_eq!(terminal_window_title(None, None, None, false), "");
+    }
+
+    #[test]
     fn terminal_window_title_omits_product_and_animal_names() {
         assert_eq!(
             terminal_window_title(
-                "🐙",
+                Some("🐙"),
                 Some("resume window title"),
                 Some("jcode Octopus"),
                 false
@@ -176,12 +205,12 @@ mod tests {
             "🐙 resume window title"
         );
         assert_eq!(
-            terminal_window_title("🐙", None, Some("jcode Octopus"), false),
+            terminal_window_title(Some("🐙"), None, Some("jcode Octopus"), false),
             "🐙 jcode Octopus"
         );
         assert_eq!(
             terminal_window_title(
-                "🐙",
+                Some("🐙"),
                 Some("resume window title"),
                 Some("jcode Octopus"),
                 true
