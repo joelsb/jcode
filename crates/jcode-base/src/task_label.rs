@@ -7,8 +7,10 @@
 //! This module derives a 2-4 word label from the latest substantive user
 //! message instead, with no provider call at all.
 
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 
 /// Hard cap. `process_title::terminal_window_title` truncates at 48 chars
 /// including the icon, so anything longer is silently destroyed.
@@ -228,9 +230,264 @@ fn clamp_words(words: &[String]) -> String {
     }
 }
 
+/// Where a stored label came from. A model-written label is sticky: the
+/// deterministic path never overwrites it, because the model had the whole
+/// session in context and the heuristic had one sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLabelSource {
+    Derived,
+    Model,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTaskLabel {
+    pub label: String,
+    pub source: TaskLabelSource,
+    /// Hash of the text this label was derived from. `0` for model labels.
+    #[serde(default)]
+    pub source_hash: u64,
+}
+
+fn label_path(session_id: &str) -> Option<PathBuf> {
+    let dir = crate::storage::jcode_dir().ok()?.join("labels");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("{session_id}.json")))
+}
+
+/// Read the stored label. Any failure (missing file, corrupt JSON, unreadable
+/// home) reads as `None`; a display cache must never be an error path.
+pub fn load(session_id: &str) -> Option<StoredTaskLabel> {
+    let dir = crate::storage::jcode_dir().ok()?.join("labels");
+    let path = dir.join(format!("{session_id}.json"));
+    if !path.exists() {
+        return None;
+    }
+    let stored: StoredTaskLabel = crate::storage::read_json(&path).ok()?;
+    (!stored.label.trim().is_empty()).then_some(stored)
+}
+
+pub fn load_label(session_id: &str) -> Option<String> {
+    load(session_id).map(|stored| stored.label)
+}
+
+fn write(session_id: &str, stored: &StoredTaskLabel) -> bool {
+    let Some(path) = label_path(session_id) else {
+        return false;
+    };
+    crate::storage::write_json_fast(&path, stored).is_ok()
+}
+
+fn clamp_label(label: &str) -> Option<String> {
+    let normalized = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let clamped: String = normalized.chars().take(MAX_LABEL_CHARS).collect();
+    let clamped = clamped.trim_end().to_string();
+    (!clamped.is_empty()).then_some(clamped)
+}
+
+/// Store a model-written label. Returns whether anything changed on disk.
+pub fn store_model_label(session_id: &str, label: &str) -> bool {
+    let Some(label) = clamp_label(label) else {
+        return false;
+    };
+    if load(session_id)
+        .is_some_and(|stored| stored.source == TaskLabelSource::Model && stored.label == label)
+    {
+        return false;
+    }
+    write(
+        session_id,
+        &StoredTaskLabel {
+            label,
+            source: TaskLabelSource::Model,
+            source_hash: 0,
+        },
+    )
+}
+
+/// Recompute the deterministic label from `user_texts` (newest last) and store
+/// it when it actually changed. Returns whether anything changed on disk.
+///
+/// No-ops when: the evidence is too weak, a model label already exists, or the
+/// source text is the one the current label already came from. That last guard
+/// is what stops the sidebar row rewriting itself every turn.
+pub fn refresh_derived(session_id: &str, user_texts: &[&str]) -> bool {
+    let existing = load(session_id);
+    if existing
+        .as_ref()
+        .is_some_and(|stored| stored.source == TaskLabelSource::Model)
+    {
+        return false;
+    }
+    let Some(source) = latest_substantive(user_texts) else {
+        return false;
+    };
+    let hash = source_hash(source);
+    if existing
+        .as_ref()
+        .is_some_and(|stored| stored.source_hash == hash)
+    {
+        return false;
+    }
+    let Some(label) = derive_label(user_texts).and_then(|label| clamp_label(&label)) else {
+        return false;
+    };
+    if existing.as_ref().is_some_and(|stored| stored.label == label) {
+        return false;
+    }
+    write(
+        session_id,
+        &StoredTaskLabel {
+            label,
+            source: TaskLabelSource::Derived,
+            source_hash: hash,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::lock_test_env;
+
+    struct TempHome {
+        _dir: tempfile::TempDir,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TempHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let previous = std::env::var_os("JCODE_HOME");
+            crate::env::set_var("JCODE_HOME", dir.path());
+            Self {
+                _dir: dir,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => crate::env::set_var("JCODE_HOME", value),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_derived_label_round_trips_through_storage() {
+        let _guard = lock_test_env();
+        let _home = TempHome::new();
+
+        assert!(refresh_derived(
+            "session_fox_1",
+            &["Rewrite the segment sync job"]
+        ));
+        assert_eq!(
+            load_label("session_fox_1"),
+            Some("Rewrite Segment Sync Job".to_string())
+        );
+        assert_eq!(
+            load("session_fox_1").expect("stored").source,
+            TaskLabelSource::Derived
+        );
+    }
+
+    #[test]
+    fn an_unchanged_source_does_not_rewrite_the_label() {
+        let _guard = lock_test_env();
+        let _home = TempHome::new();
+
+        let texts = ["Rewrite the segment sync job"];
+        assert!(refresh_derived("session_fox_2", &texts));
+        assert!(
+            !refresh_derived("session_fox_2", &texts),
+            "an unchanged source must be a no-op so the sidebar label does not churn"
+        );
+    }
+
+    #[test]
+    fn a_continuation_turn_does_not_move_the_label() {
+        let _guard = lock_test_env();
+        let _home = TempHome::new();
+
+        assert!(refresh_derived(
+            "session_fox_3",
+            &["Rewrite the segment sync job"]
+        ));
+        assert!(!refresh_derived(
+            "session_fox_3",
+            &["Rewrite the segment sync job", "continue"]
+        ));
+        assert_eq!(
+            load_label("session_fox_3"),
+            Some("Rewrite Segment Sync Job".to_string())
+        );
+    }
+
+    #[test]
+    fn a_model_label_outranks_and_survives_derivation() {
+        let _guard = lock_test_env();
+        let _home = TempHome::new();
+
+        assert!(store_model_label("session_fox_4", "DI-2507 Chat Endpoint"));
+        assert!(!refresh_derived(
+            "session_fox_4",
+            &["Rewrite the segment sync job"]
+        ));
+        assert_eq!(
+            load_label("session_fox_4"),
+            Some("DI-2507 Chat Endpoint".to_string())
+        );
+    }
+
+    #[test]
+    fn a_model_label_is_trimmed_capped_and_rejected_when_empty() {
+        let _guard = lock_test_env();
+        let _home = TempHome::new();
+
+        assert!(!store_model_label("session_fox_5", "   "));
+        assert_eq!(load_label("session_fox_5"), None);
+
+        assert!(store_model_label(
+            "session_fox_5",
+            "  An Extremely Long Model Written Task Label That Overflows  "
+        ));
+        let label = load_label("session_fox_5").expect("label");
+        assert!(label.chars().count() <= MAX_LABEL_CHARS);
+        assert_eq!(label.trim(), label);
+    }
+
+    #[test]
+    fn a_weak_session_stores_nothing() {
+        let _guard = lock_test_env();
+        let _home = TempHome::new();
+
+        assert!(!refresh_derived("session_fox_6", &["hi"]));
+        assert_eq!(load_label("session_fox_6"), None);
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_file_reads_as_none_without_erroring() {
+        let _guard = lock_test_env();
+        let _home = TempHome::new();
+
+        assert_eq!(load_label("session_fox_7"), None);
+
+        let path = crate::storage::jcode_dir()
+            .expect("home")
+            .join("labels")
+            .join("session_fox_7.json");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"{ not json").expect("write");
+
+        assert_eq!(load_label("session_fox_7"), None);
+    }
 
     #[test]
     fn derives_a_short_label_from_a_plain_request() {
