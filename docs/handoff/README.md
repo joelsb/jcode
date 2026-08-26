@@ -1,4 +1,16 @@
-# START HERE: state of the rate-limit work on `mine`
+# START HERE: handoff tasks on `mine`
+
+## Open
+
+| # | Bug | File | Status |
+|---|---|---|---|
+| 3 | A dead MCP child keeps serving from a tombstone handle; `tools/list_changed` is dropped | `TASK-3-mcp-stale-handle-and-list-changed.md` | **not started**, nothing fixed |
+
+Task 3 is unrelated to the rate-limit work below. Read its file only.
+
+---
+
+# The rate-limit work (both done)
 
 Updated 2026-08-14 after both tasks were completed and installed.
 
