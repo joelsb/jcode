@@ -400,6 +400,9 @@ fn merge_plan(stored: &TodoPlan, incoming: Option<TodoPlan>) -> TodoPlan {
     if plan.user_intention.is_none() {
         plan.user_intention = stored.user_intention.clone();
     }
+    if plan.task_label.is_none() {
+        plan.task_label = stored.task_label.clone();
+    }
     if plan.understands_user_intent.is_none() {
         plan.understands_user_intent = stored.understands_user_intent;
     }
@@ -785,6 +788,10 @@ impl Tool for TodoTool {
                             "type": "string",
                             "description": "What the user actually wants: underlying reason and desired end state. Omit later to retain."
                         },
+                        "task_label": {
+                            "type": "string",
+                            "description": "2-4 word label naming the current work, under 30 chars, e.g. 'DI-2507 Chat Endpoint'. Shown as the terminal title. Omit to keep the existing one."
+                        },
                         "understands_user_intent": {
                             "type": "string",
                             "enum": ["uncertain", "partial", "clear", "complete"],
@@ -914,6 +921,10 @@ impl Tool for TodoTool {
                 save_todos(&ctx.session_id, &todos)?;
                 save_goals(&ctx.session_id, &goals)?;
                 save_plan(&ctx.session_id, &plan)?;
+                if let Some(label) = plan.task_label.as_deref() {
+                    // Best effort: a title cache must never fail a todo write.
+                    crate::task_label::store_model_label(&ctx.session_id, label);
+                }
                 if let Err(err) = update_todo_review_cycle(&ctx.session_id, &previous, &todos) {
                     crate::logging::warn(&format!(
                         "[tool:todo] failed to update review cycle session_id={} error={}",
@@ -965,6 +976,39 @@ mod tests {
     }
 
     #[test]
+    fn the_plan_schema_exposes_an_optional_task_label() {
+        let schema = TodoTool::new().parameters_schema();
+        let plan_props = schema["properties"]["plan"]["properties"]
+            .as_object()
+            .expect("plan properties");
+        assert!(plan_props.contains_key("task_label"));
+        let required = schema["properties"]["plan"]["required"]
+            .as_array()
+            .expect("plan required");
+        assert!(
+            !required.iter().any(|value| value == "task_label"),
+            "task_label must stay optional so an omitted label never fails a todo write"
+        );
+    }
+
+    #[test]
+    fn an_omitted_task_label_inherits_the_stored_one() {
+        let stored = TodoPlan {
+            user_intention: Some("ship it".to_string()),
+            task_label: Some("DI-2507 Chat Endpoint".to_string()),
+            ..Default::default()
+        };
+        let merged = merge_plan(
+            &stored,
+            Some(TodoPlan {
+                user_intention: Some("ship it".to_string()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(merged.task_label.as_deref(), Some("DI-2507 Chat Endpoint"));
+    }
+
+    #[test]
     fn schema_advertises_intent_and_todos() {
         let schema = TodoTool::new().parameters_schema();
         let props = schema
@@ -1004,9 +1048,10 @@ mod tests {
             .expect("plan should describe properties");
         assert!(plan_props.contains_key("user_intention"));
         assert!(plan_props.contains_key("understands_user_intent"));
+        assert!(plan_props.contains_key("task_label"));
         assert!(!plan_props.contains_key("alignment_score"));
         assert!(!plan_props.contains_key("user_intention_alignment"));
-        assert_eq!(plan_props.len(), 2);
+        assert_eq!(plan_props.len(), 3);
         let plan_required = props["plan"]["required"]
             .as_array()
             .expect("plan should advertise required fields");
@@ -1404,6 +1449,7 @@ mod tests {
             user_intention: Some("understood".to_string()),
             understands_user_intent: Some(crate::todo::IntentUnderstanding::Complete),
             understands_user_intent_history: vec![crate::todo::IntentUnderstanding::Complete],
+            ..Default::default()
         }
     }
 
@@ -1574,6 +1620,7 @@ mod tests {
             user_intention: Some("make search feel instant".to_string()),
             understands_user_intent: Some(crate::todo::IntentUnderstanding::Partial),
             understands_user_intent_history: vec![crate::todo::IntentUnderstanding::Partial],
+            ..Default::default()
         };
 
         let merged = merge_plan(
@@ -2079,6 +2126,7 @@ mod tests {
             user_intention: Some("partially understood".to_string()),
             understands_user_intent: Some(crate::todo::IntentUnderstanding::Partial),
             understands_user_intent_history: vec![crate::todo::IntentUnderstanding::Partial],
+            ..Default::default()
         };
         let (observations, nudges) = record_reframe_observations(
             &plan,
@@ -2113,6 +2161,7 @@ mod tests {
             user_intention: Some("guessing".to_string()),
             understands_user_intent: Some(crate::todo::IntentUnderstanding::Uncertain),
             understands_user_intent_history: vec![crate::todo::IntentUnderstanding::Uncertain],
+            ..Default::default()
         };
         let (_, nudges) = record_reframe_observations(&plan, &[], &todos, &[]);
         assert_eq!(nudges, vec![TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE]);
@@ -2180,6 +2229,7 @@ mod tests {
             user_intention: Some("partially understood".to_string()),
             understands_user_intent: Some(crate::todo::IntentUnderstanding::Partial),
             understands_user_intent_history: vec![crate::todo::IntentUnderstanding::Partial],
+            ..Default::default()
         };
         let (observations, _) = record_reframe_observations(
             &plan,
@@ -2258,6 +2308,7 @@ mod tests {
             user_intention: Some("ship it".to_string()),
             understands_user_intent: Some(crate::todo::IntentUnderstanding::Partial),
             understands_user_intent_history: vec![crate::todo::IntentUnderstanding::Partial],
+            ..Default::default()
         };
         let merged = merge_plan(
             &stored,
