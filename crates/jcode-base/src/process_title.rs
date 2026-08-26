@@ -54,8 +54,9 @@ pub fn terminal_session_label(session_name: &str, display_title: Option<&str>) -
 }
 
 /// Resolve the human-authored title used by terminal windows and `/resume`.
-/// Explicit renames win over todo/goal-derived titles, which win over the
-/// generated session title.
+/// Ranked, one writer per source: an explicit rename wins, then the short task
+/// label, then the todo/goal-derived title (kept for sessions that predate the
+/// label file), then the generated session title.
 pub fn terminal_display_title_for_id(session_id: &str) -> Option<String> {
     crate::session::Session::load_startup_stub(session_id)
         .ok()
@@ -63,6 +64,7 @@ pub fn terminal_display_title_for_id(session_id: &str) -> Option<String> {
             session
                 .custom_title
                 .filter(|title| !title.trim().is_empty())
+                .or_else(|| crate::task_label::load_label(session_id))
                 .or_else(|| crate::todo::load_session_title(session_id))
                 .or(session.title)
         })
@@ -255,6 +257,80 @@ mod tests {
             crate::env::set_var("JCODE_HOME", previous_home);
         } else {
             crate::env::remove_var("JCODE_HOME");
+        }
+    }
+
+    #[test]
+    fn terminal_display_title_prefers_the_task_label_over_the_todo_title() {
+        let _guard = lock_test_env();
+        let previous_home = std::env::var_os("JCODE_HOME");
+        let temp = tempfile::tempdir().expect("temp dir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        let session_id = "session_fox_789";
+        let mut session = crate::session::Session::create_with_id(
+            session_id.to_string(),
+            None,
+            Some("Generated title".to_string()),
+        );
+        session.save().expect("save session");
+        crate::todo::save_todos(
+            session_id,
+            &[crate::todo::TodoItem {
+                content: "Synchronize terminal window names".to_string(),
+                status: "in_progress".to_string(),
+                priority: "high".to_string(),
+                id: "window-title".to_string(),
+                group: Some("resume title sync".to_string()),
+                confidence: None,
+                completion_confidence: None,
+                confidence_history: Vec::new(),
+                blocked_by: Vec::new(),
+                assigned_to: None,
+            }],
+        )
+        .expect("save todos");
+        assert!(crate::task_label::store_model_label(
+            session_id,
+            "DI-2507 Chat Endpoint"
+        ));
+
+        assert_eq!(
+            terminal_display_title_for_id(session_id).as_deref(),
+            Some("DI-2507 Chat Endpoint")
+        );
+
+        match previous_home {
+            Some(previous_home) => crate::env::set_var("JCODE_HOME", previous_home),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+    }
+
+    #[test]
+    fn an_explicit_rename_still_outranks_the_task_label() {
+        let _guard = lock_test_env();
+        let previous_home = std::env::var_os("JCODE_HOME");
+        let temp = tempfile::tempdir().expect("temp dir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        let session_id = "session_fox_790";
+        let mut session =
+            crate::session::Session::create_with_id(session_id.to_string(), None, None);
+        session.rename_title(Some("Manual name".to_string()));
+        session.save().expect("save session");
+        assert!(crate::task_label::store_model_label(
+            session_id,
+            "Derived Name"
+        ));
+
+        assert_eq!(
+            terminal_display_title_for_id(session_id).as_deref(),
+            Some("Manual name")
+        );
+
+        match previous_home {
+            Some(previous_home) => crate::env::set_var("JCODE_HOME", previous_home),
+            None => crate::env::remove_var("JCODE_HOME"),
         }
     }
 }

@@ -57,6 +57,31 @@ impl App {
         &self.session.id
     }
 
+    /// Recompute the short task label from the session's user messages.
+    ///
+    /// Called at turn end, after the turn has already completed. Every failure
+    /// mode inside is swallowed by `task_label` itself, so this can never fail
+    /// a turn, block it, or surface an error: the worst case is that the title
+    /// keeps its previous value or falls back to the animal name.
+    pub(super) fn refresh_task_label(&self) {
+        if self.is_replay || self.suppress_terminal_title_updates {
+            return;
+        }
+        if self.session.custom_title.is_some() {
+            return;
+        }
+        let session_id = if self.is_remote {
+            self.remote_session_id
+                .as_deref()
+                .unwrap_or(&self.session.id)
+        } else {
+            &self.session.id
+        };
+        let texts = crate::task_label::user_texts_from_stored(&self.session.messages);
+        let refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+        crate::task_label::refresh_derived(session_id, &refs);
+    }
+
     pub(super) fn update_terminal_title(&self) {
         if self.suppress_terminal_title_updates {
             return;
@@ -73,18 +98,19 @@ impl App {
             .unwrap_or_else(|| session_id.to_string());
         let session_icon = crate::id::session_icon(&session_name);
         // Keep the live terminal title aligned with /resume: an explicit rename
-        // wins, then the model's current todo/goal title, then the generated title.
-        let todo_title = self
-            .session
-            .custom_title
-            .is_none()
-            .then(|| crate::todo::load_session_title(session_id))
-            .flatten();
+        // wins, then the short task label, then the todo/goal title, then the
+        // generated title. Herdr's agent sidebar renders this string, so a
+        // clipped prose sentence costs a full row and says less than a label.
+        let generated_title = self.session.custom_title.is_none().then(|| {
+            crate::task_label::load_label(session_id)
+                .or_else(|| crate::todo::load_session_title(session_id))
+        });
+        let generated_title = generated_title.flatten();
         let display_title = self
             .session
             .custom_title
             .as_deref()
-            .or(todo_title.as_deref())
+            .or(generated_title.as_deref())
             .or(self.session.title.as_deref());
         let is_canary = if self.is_remote {
             self.remote_is_canary.unwrap_or(self.session.is_canary)
