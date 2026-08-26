@@ -93,7 +93,9 @@ fn format_session_menu_item_title_with_display(
 ) -> String {
     let display = crate::id::extract_session_name(session_id).unwrap_or(session_id);
     let icon = crate::id::session_icon(display);
-    let label = crate::process_title::terminal_window_title(icon, display_title, None, false);
+    // The menubar dropdown keeps its icon: unlike a Herdr row it renders no
+    // separate state column, so the emoji is the only per-session marker.
+    let label = crate::process_title::terminal_window_title(Some(icon), display_title, None, false);
     if streaming {
         format!("{label} · streaming")
     } else {

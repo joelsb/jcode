@@ -474,6 +474,12 @@ pub struct TodoPlan {
     /// distinct from the agent's steps and validation loops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_intention: Option<String>,
+    /// A 2-4 word label naming the current work, shown as the terminal window
+    /// title and therefore as the agent's row in external session dashboards.
+    /// Optional: an omitted label inherits the stored one, and a session that
+    /// never writes one still gets a label derived from its user messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_label: Option<String>,
     /// How well the agent understands what the user actually wants and how
     /// faithfully this plan represents it. It does not measure implementation
     /// progress. Older payloads stored a 0-100 score under this name or

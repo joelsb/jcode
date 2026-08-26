@@ -66,6 +66,7 @@ impl Agent {
         let hook_result = result.as_ref().map(|_| ()).map_err(|error| {
             anyhow::anyhow!(error.to_string())
         });
+        self.refresh_task_label();
         self.fire_turn_end_hook(&hook_result, turn_started_at, start_message_index);
         result
     }
@@ -123,6 +124,7 @@ impl Agent {
         self.fire_turn_start_hook("chat");
         let result = self.run_turn_streaming_mpsc(event_tx).await;
         self.current_turn_system_reminder = None;
+        self.refresh_task_label();
         self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
         result
     }
@@ -180,6 +182,24 @@ impl Agent {
             event = event.cwd(cwd);
         }
         crate::hooks::dispatch_observer(event);
+    }
+
+    /// Recompute the session's short task label from its user messages.
+    ///
+    /// Lives on the agent rather than in the TUI because every turn path -
+    /// streaming, non-streaming, `jcode run`, remote client - ends here, and a
+    /// label that only existed for TUI panes would leave one-shot and harness
+    /// sessions on the animal-name fallback.
+    ///
+    /// Infallible by construction: `task_label` swallows every failure and
+    /// returns a bool, so nothing here can fail, delay or block the turn.
+    pub(crate) fn refresh_task_label(&self) {
+        if self.session.custom_title.is_some() {
+            return;
+        }
+        let texts = crate::task_label::user_texts_from_stored(&self.session.messages);
+        let refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+        crate::task_label::refresh_derived(&self.session.id, &refs);
     }
 
     /// Fire the `turn_end` observer hook with turn outcome metadata.

@@ -1176,6 +1176,8 @@ pub(in crate::tui::app) fn handle_server_event(
                 remote.clear_pending();
                 remote.reset_call_output_tokens_seen();
                 app.note_runtime_memory_event_force("turn_completed", "remote_turn_finished");
+                app.refresh_task_label();
+                app.update_terminal_title();
                 crate::process_memory::release_retained_heap_debounced(
                     "client_turn_completed",
                     std::time::Duration::from_secs(30),
