@@ -348,6 +348,34 @@ pub fn refresh_derived(session_id: &str, user_texts: &[&str]) -> bool {
     )
 }
 
+/// Plain user request texts, oldest first. Skips assistant/tool messages,
+/// system-role injections and reminder blocks, so a `<system-reminder>` or a
+/// background-task note can never become the session's label.
+pub fn user_texts_from_stored(messages: &[crate::session::StoredMessage]) -> Vec<String> {
+    use crate::message::{ContentBlock, Role};
+
+    messages
+        .iter()
+        .filter(|message| matches!(message.role, Role::User) && message.display_role.is_none())
+        .filter_map(|message| {
+            let text = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let text = text.trim();
+            let is_injected = text.starts_with("<system-reminder>")
+                || text.starts_with("[NOTIFICATION]")
+                || text.starts_with("<system>");
+            (!text.is_empty() && !is_injected).then(|| text.to_string())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +515,58 @@ mod tests {
         std::fs::write(&path, b"{ not json").expect("write");
 
         assert_eq!(load_label("session_fox_7"), None);
+    }
+
+    #[test]
+    fn user_texts_are_extracted_in_order_ignoring_non_user_and_tool_blocks() {
+        use crate::message::{ContentBlock, Role};
+
+        let message = |role: Role, text: &str| crate::session::StoredMessage {
+            id: text.to_string(),
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        };
+
+        let messages = vec![
+            message(Role::User, "Rewrite the segment sync job"),
+            message(Role::Assistant, "On it"),
+            message(Role::User, "now fix the Mautic webhook timeout"),
+        ];
+
+        assert_eq!(
+            user_texts_from_stored(&messages),
+            vec![
+                "Rewrite the segment sync job".to_string(),
+                "now fix the Mautic webhook timeout".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_system_display_role_message_is_not_treated_as_a_user_request() {
+        use crate::message::{ContentBlock, Role};
+
+        let messages = vec![crate::session::StoredMessage {
+            id: "reminder".to_string(),
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "<system-reminder>build finished</system-reminder>".to_string(),
+                cache_control: None,
+            }],
+            display_role: Some(crate::session::StoredDisplayRole::System),
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        }];
+
+        assert!(user_texts_from_stored(&messages).is_empty());
     }
 
     #[test]
