@@ -1956,16 +1956,6 @@ pub(super) fn handle_control_key(app: &mut App, code: KeyCode) -> bool {
             paste_from_clipboard(app);
             true
         }
-        KeyCode::Tab | KeyCode::Char('t') => {
-            app.queue_mode = !app.queue_mode;
-            let mode_str = if app.queue_mode {
-                "Queue mode: messages wait until response completes"
-            } else {
-                "Immediate mode: messages send next (no interrupt)"
-            };
-            app.set_status_notice(mode_str);
-            true
-        }
         KeyCode::Left => {
             if app.cursor_pos > 0 {
                 app.cursor_pos = app.find_word_boundary_back();
@@ -2311,6 +2301,10 @@ pub(super) fn handle_pre_control_shortcuts(
     }
     if app.toggle_keys.todo_card.matches(code, modifiers) {
         app.toggle_todo_card();
+        return true;
+    }
+    if app.toggle_keys.queue_toggle.matches(code, modifiers) {
+        super::commands::toggle_queue_mode(app);
         return true;
     }
     if app.dictation_key_matches(code, modifiers) {

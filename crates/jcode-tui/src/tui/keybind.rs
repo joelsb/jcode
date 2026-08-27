@@ -384,6 +384,7 @@ pub struct ToggleKeys {
     pub info_widget: ToggleBinding,
     pub todo_card: ToggleBinding,
     pub swarm_panel_focus: ToggleBinding,
+    pub queue_toggle: ToggleBinding,
 }
 
 pub fn load_toggle_keys() -> ToggleKeys {
@@ -400,6 +401,10 @@ pub fn load_toggle_keys() -> ToggleKeys {
             &cfg.keybindings.swarm_panel_focus,
             swarm_panel_focus_default(),
         ),
+        queue_toggle: ToggleBinding::load_with_default(
+            &cfg.keybindings.queue_toggle,
+            queue_toggle_default(),
+        ),
     }
 }
 
@@ -414,6 +419,14 @@ fn swarm_panel_focus_default() -> KeyBinding {
     KeyBinding {
         code: KeyCode::Char('n'),
         modifiers: KeyModifiers::ALT,
+    }
+}
+
+/// The default queue-toggle chord: Ctrl+Q.
+fn queue_toggle_default() -> KeyBinding {
+    KeyBinding {
+        code: KeyCode::Char('q'),
+        modifiers: KeyModifiers::CONTROL,
     }
 }
 

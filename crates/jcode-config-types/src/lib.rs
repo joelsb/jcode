@@ -976,6 +976,9 @@ pub struct KeybindingsConfig {
     pub diff_mode_cycle: String,
     /// Toggle the info widget (default: "alt+i")
     pub info_widget_toggle: String,
+    /// Toggle the message queue on/off, the same flip `/queue` performs
+    /// (default: "ctrl+q"). Set "" to disable.
+    pub queue_toggle: String,
     /// Show/dismiss the session todo list as an inline card in the chat
     /// transcript (default: "alt+x")
     pub todo_card_toggle: String,
@@ -1030,6 +1033,7 @@ impl Default for KeybindingsConfig {
             typing_scroll_lock_toggle: get("typing_scroll_lock_toggle", "alt+s"),
             diff_mode_cycle: get("diff_mode_cycle", "alt+g"),
             info_widget_toggle: get("info_widget_toggle", "alt+i"),
+            queue_toggle: get("queue_toggle", "ctrl+q"),
             todo_card_toggle: get("todo_card_toggle", "alt+x"),
             swarm_panel_focus: get("swarm_panel_focus", "alt+n"),
             new_terminal: get("new_terminal", ""),
