@@ -591,6 +591,13 @@ pub struct ApiRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    /// Anthropic fast mode opt-in (`"fast"`). Requires the
+    /// `fast-mode-2026-02-01` beta header.
+    ///
+    /// Distinct from `service_tier`, which selects Priority Tier; the two are
+    /// separate features and are mutually exclusive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
     pub stream: bool,
 }
 

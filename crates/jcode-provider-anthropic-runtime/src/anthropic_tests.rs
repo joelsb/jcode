@@ -497,6 +497,7 @@ fn test_anthropic_opus_48_fast_mode_service_tier_serializes_priority() {
         output_config: None,
         temperature: None,
         service_tier: provider.current_service_tier_for_model(&provider.model()),
+        speed: None,
         stream: true,
     };
     let value = serde_json::to_value(&request).unwrap();
@@ -522,6 +523,26 @@ fn test_anthropic_fast_mode_is_limited_to_opus_48() {
 
     provider.set_service_tier("off").unwrap();
     assert_eq!(provider.service_tier(), None);
+}
+
+#[test]
+fn test_api_request_speed_field_serializes_and_omits() {
+    let mut request = e2e_test_request();
+    assert!(
+        serde_json::to_value(&request)
+            .unwrap()
+            .get("speed")
+            .is_none(),
+        "speed must be omitted when unset"
+    );
+
+    request.speed = Some("fast".to_string());
+    let value = serde_json::to_value(&request).unwrap();
+    assert_eq!(value["speed"], "fast");
+    assert!(
+        value.get("service_tier").is_none(),
+        "fast mode must not also send the Priority Tier parameter"
+    );
 }
 
 #[test]
@@ -2257,6 +2278,7 @@ fn e2e_test_request() -> ApiRequest {
         output_config: None,
         temperature: None,
         service_tier: None,
+        speed: None,
         stream: true,
     }
 }

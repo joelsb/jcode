@@ -1234,9 +1234,7 @@ impl AnthropicProvider {
             access_token: fresh_creds.access_token.clone(),
             refresh_token: fresh_creds.refresh_token,
             expires_at: fresh_creds.expires_at,
-            account_label: Some(
-                active_label.unwrap_or_else(auth::claude::primary_account_label),
-            ),
+            account_label: Some(active_label.unwrap_or_else(auth::claude::primary_account_label)),
         });
 
         Ok((fresh_creds.access_token, true))
@@ -1411,6 +1409,7 @@ impl Provider for AnthropicProvider {
             output_config,
             temperature,
             service_tier: self.current_service_tier_for_model(&model),
+            speed: None,
             stream: true,
         };
 
@@ -1790,6 +1789,7 @@ impl Provider for AnthropicProvider {
             output_config,
             temperature,
             service_tier: self.current_service_tier_for_model(&model),
+            speed: None,
             stream: true,
         };
 
