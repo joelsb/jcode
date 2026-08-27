@@ -585,6 +585,22 @@ fn test_api_request_speed_field_serializes_and_omits() {
 }
 
 #[test]
+fn test_fast_mode_beta_header_is_appended_once() {
+    let base = "prompt-caching-2024-07-31";
+    assert_eq!(
+        anthropic_beta_header_with_fast(base, false),
+        "prompt-caching-2024-07-31"
+    );
+    assert_eq!(
+        anthropic_beta_header_with_fast(base, true),
+        "prompt-caching-2024-07-31,fast-mode-2026-02-01"
+    );
+    // Idempotent: never duplicate the beta token.
+    let already = "prompt-caching-2024-07-31,fast-mode-2026-02-01";
+    assert_eq!(anthropic_beta_header_with_fast(already, true), already);
+}
+
+#[test]
 fn test_anthropic_manual_thinking_budget_for_opus_45() {
     let provider = AnthropicProvider::new();
     // Keep this request-builder test independent of the live/persisted Anthropic

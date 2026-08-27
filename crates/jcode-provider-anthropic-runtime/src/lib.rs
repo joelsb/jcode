@@ -2975,6 +2975,7 @@ async fn stream_response(
             oauth_beta_headers(model_name),
             request.thinking.is_some(),
         );
+        let beta_header = anthropic_beta_header_with_fast(&beta_header, request.speed.is_some());
         req = apply_oauth_attribution_headers(
             req.header("Authorization", format!("Bearer {}", token))
                 .header("User-Agent", CLAUDE_CLI_USER_AGENT)
@@ -2991,6 +2992,7 @@ async fn stream_response(
         };
         let beta_header =
             anthropic_beta_header_with_thinking(beta_header, request.thinking.is_some());
+        let beta_header = anthropic_beta_header_with_fast(&beta_header, request.speed.is_some());
         req = match direct_transport.auth_mode.as_str() {
             "none" => req,
             "bearer" => req.header("Authorization", format!("Bearer {token}")),
@@ -3339,6 +3341,18 @@ fn is_oauth_catalog_auth_error(error_str: &str) -> bool {
 fn anthropic_beta_header_with_thinking(base: &str, thinking_enabled: bool) -> String {
     if thinking_enabled && !base.contains("interleaved-thinking-2025-05-14") {
         format!("{base},interleaved-thinking-2025-05-14")
+    } else {
+        base.to_string()
+    }
+}
+
+/// Append the fast-mode beta token when the request opts into `speed: "fast"`.
+///
+/// Anthropic rejects the `speed` field without this header, so the two must
+/// always travel together.
+fn anthropic_beta_header_with_fast(base: &str, fast: bool) -> String {
+    if fast && !base.contains(jcode_provider_core::ANTHROPIC_FAST_MODE_BETA) {
+        format!("{base},{}", jcode_provider_core::ANTHROPIC_FAST_MODE_BETA)
     } else {
         base.to_string()
     }
