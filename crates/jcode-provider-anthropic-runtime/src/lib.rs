@@ -979,32 +979,38 @@ impl AnthropicProvider {
         )
     }
 
-    fn model_supports_priority_service_tier(model: &str) -> bool {
-        Self::normalized_model_key(model).contains("claude-opus-4-8")
+    fn model_supports_fast_mode(model: &str) -> bool {
+        jcode_provider_core::anthropic_supports_fast_mode(model)
     }
 
     fn normalize_service_tier(raw: &str) -> Result<Option<String>> {
         let value = raw.trim().to_ascii_lowercase();
         match value.as_str() {
-            "" | "default" => Ok(None),
-            "off" | "standard" | "standard_only" => Ok(Some("standard_only".to_string())),
-            // The Anthropic API uses `auto` for the latency-optimized tier. Keep
-            // accepting `priority` because `/fast on` is shared with OpenAI.
-            "priority" | "auto" => Ok(Some("auto".to_string())),
+            "" | "default" | "off" | "standard" | "standard_only" => Ok(None),
+            // `/fast on` is shared with OpenAI, which spells this `priority`.
+            // Anthropic's own spelling for fast mode is `speed: "fast"`; the
+            // legacy `auto` is accepted so older saved state keeps working.
+            "priority" | "auto" | "fast" => Ok(Some("fast".to_string())),
             other => anyhow::bail!(
-                "Unsupported Anthropic service tier '{}'; expected priority/auto or off/standard_only",
+                "Unsupported Anthropic speed '{}'; expected fast/priority or off/standard",
                 other
             ),
         }
     }
 
-    fn current_service_tier_for_model(&self, model: &str) -> Option<String> {
-        let tier = self
+    /// `Some("fast")` when fast mode is enabled and `model` supports it.
+    ///
+    /// Anthropic fast mode is the `speed` request field, NOT `service_tier`.
+    /// `service_tier` selects Priority Tier, which is unsupported on Opus 5
+    /// and mutually exclusive with fast mode, so this never yields a tier.
+    pub(crate) fn fast_speed_for_model(&self, model: &str) -> Option<String> {
+        let enabled = self
             .service_tier
             .read()
             .map(|guard| guard.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-        tier.filter(|_| Self::model_supports_priority_service_tier(model))
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+            .is_some();
+        (enabled && Self::model_supports_fast_mode(model)).then(|| "fast".to_string())
     }
 
     /// Output-token budget for `model`: an explicit env override when set,
@@ -1408,8 +1414,10 @@ impl Provider for AnthropicProvider {
             thinking,
             output_config,
             temperature,
-            service_tier: self.current_service_tier_for_model(&model),
-            speed: None,
+            // Priority Tier is a separate feature, unsupported on Opus 5
+            // and mutually exclusive with fast mode: never send it here.
+            service_tier: None,
+            speed: self.fast_speed_for_model(&model),
             stream: true,
         };
 
@@ -1608,21 +1616,19 @@ impl Provider for AnthropicProvider {
     }
 
     fn service_tier(&self) -> Option<String> {
-        match self
-            .current_service_tier_for_model(&self.model())
-            .as_deref()
-        {
-            Some("auto") => Some("priority".to_string()),
-            _ => None,
-        }
+        // The trait method keeps the `service_tier` name for UI/protocol
+        // compatibility, but Anthropic's feature here is fast mode. `priority`
+        // is the shared cross-provider spelling used by `/fast`.
+        self.fast_speed_for_model(&self.model())
+            .map(|_| "priority".to_string())
     }
 
     fn set_service_tier(&self, service_tier: &str) -> Result<()> {
         let normalized = Self::normalize_service_tier(service_tier)?;
-        if normalized.as_deref() == Some("auto")
-            && !Self::model_supports_priority_service_tier(&self.model())
-        {
-            anyhow::bail!("Anthropic priority fast tier is only supported for Claude Opus 4.8");
+        if normalized.is_some() && !Self::model_supports_fast_mode(&self.model()) {
+            anyhow::bail!(
+                "Anthropic fast mode is only supported on Claude Opus 5 and Claude Opus 4.8"
+            );
         }
         *self
             .service_tier
@@ -1632,7 +1638,7 @@ impl Provider for AnthropicProvider {
     }
 
     fn available_service_tiers(&self) -> Vec<&'static str> {
-        if Self::model_supports_priority_service_tier(&self.model()) {
+        if Self::model_supports_fast_mode(&self.model()) {
             vec!["off", "priority"]
         } else {
             vec![]
@@ -1788,8 +1794,10 @@ impl Provider for AnthropicProvider {
             thinking,
             output_config,
             temperature,
-            service_tier: self.current_service_tier_for_model(&model),
-            speed: None,
+            // Priority Tier is a separate feature, unsupported on Opus 5
+            // and mutually exclusive with fast mode: never send it here.
+            service_tier: None,
+            speed: self.fast_speed_for_model(&model),
             stream: true,
         };
 

@@ -476,53 +476,92 @@ fn test_anthropic_max_alias_uses_strongest_real_effort() {
 }
 
 #[test]
-fn test_anthropic_opus_48_fast_mode_service_tier_serializes_priority() {
+fn test_fast_mode_sends_speed_fast_on_opus_5() {
     let provider = AnthropicProvider::new();
-    provider.set_model("claude-opus-4-8").unwrap();
+    *provider
+        .model
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "claude-opus-5".to_string();
 
     assert_eq!(provider.available_service_tiers(), vec!["off", "priority"]);
     assert_eq!(provider.service_tier(), None);
 
     provider.set_service_tier("priority").unwrap();
     assert_eq!(provider.service_tier().as_deref(), Some("priority"));
+    assert_eq!(
+        provider.fast_speed_for_model("claude-opus-5").as_deref(),
+        Some("fast")
+    );
 
-    let request = ApiRequest {
-        model: strip_1m_suffix(&provider.model()).to_string(),
-        max_tokens: 1024,
-        system: None,
-        messages: vec![],
-        tools: None,
-        metadata: None,
-        thinking: None,
-        output_config: None,
-        temperature: None,
-        service_tier: provider.current_service_tier_for_model(&provider.model()),
-        speed: None,
-        stream: true,
-    };
-    let value = serde_json::to_value(&request).unwrap();
-
-    assert_eq!(value["model"], "claude-opus-4-8");
-    assert_eq!(value["service_tier"], "auto");
+    provider.set_service_tier("off").unwrap();
+    assert_eq!(provider.fast_speed_for_model("claude-opus-5"), None);
+    assert_eq!(provider.service_tier(), None);
 }
 
 #[test]
-fn test_anthropic_fast_mode_is_limited_to_opus_48() {
+fn test_fast_mode_sends_speed_fast_on_opus_48() {
     let provider = AnthropicProvider::new();
-    provider.set_model("claude-opus-4-6").unwrap();
-
-    assert!(provider.available_service_tiers().is_empty());
-    assert!(provider.set_service_tier("priority").is_err());
-    assert_eq!(provider.service_tier(), None);
+    provider.set_model("claude-opus-4-8").unwrap();
+    provider.set_service_tier("priority").unwrap();
+    assert_eq!(
+        provider.fast_speed_for_model("claude-opus-4-8").as_deref(),
+        Some("fast")
+    );
 
     // A stale `[1m]` alias for a native-1M model is migrated to canonical form.
     provider.set_model("claude-opus-4-8[1m]").unwrap();
     assert_eq!(provider.model(), "claude-opus-4-8");
-    provider.set_service_tier("priority").unwrap();
-    assert_eq!(provider.service_tier().as_deref(), Some("priority"));
+    assert_eq!(
+        provider
+            .fast_speed_for_model("claude-opus-4-8[1m]")
+            .as_deref(),
+        Some("fast")
+    );
+}
 
-    provider.set_service_tier("off").unwrap();
-    assert_eq!(provider.service_tier(), None);
+#[test]
+fn test_fast_mode_rejected_on_unsupported_models() {
+    // Opus 4.7 errors API-side, Opus 4.6 silently bills standard: refuse both.
+    for model in ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5"] {
+        let provider = AnthropicProvider::new();
+        *provider
+            .model
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = model.to_string();
+        assert!(
+            provider.available_service_tiers().is_empty(),
+            "{model} must not offer fast mode"
+        );
+        assert!(
+            provider.set_service_tier("priority").is_err(),
+            "{model} must refuse fast mode"
+        );
+        assert_eq!(provider.fast_speed_for_model(model), None);
+    }
+}
+
+#[test]
+fn test_fast_mode_never_sends_service_tier() {
+    // Priority Tier is a different feature and is unsupported on Opus 5;
+    // requesting fast mode must never set service_tier on the wire.
+    let provider = AnthropicProvider::new();
+    *provider
+        .model
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "claude-opus-5".to_string();
+    provider.set_service_tier("priority").unwrap();
+
+    let mut request = e2e_test_request();
+    request.model = "claude-opus-5".to_string();
+    request.speed = provider.fast_speed_for_model("claude-opus-5");
+
+    let value = serde_json::to_value(&request).unwrap();
+    assert_eq!(value["model"], "claude-opus-5");
+    assert_eq!(value["speed"], "fast");
+    assert!(
+        value.get("service_tier").is_none(),
+        "fast mode must not send Priority Tier: {value}"
+    );
 }
 
 #[test]
