@@ -6,6 +6,8 @@ use jcode_tool_types::ToolOutput;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+pub mod agent_ignore;
+
 pub const TOOL_INTENT_DESCRIPTION: &str =
     "Required short label shown in the UI: why this call is being made.";
 

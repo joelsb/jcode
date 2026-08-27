@@ -1,0 +1,77 @@
+# Paths jcode must not read.
+#
+# Gitignore syntax. jcode reads .jcodeignore first if it exists, then this file.
+#
+# WHY: every file the agent reads is re-billed as input tokens on every later
+# turn of the conversation, so one accidental read of a large generated file is
+# a tax on the whole session, not a one-off cost. Measured on 2026-08-27:
+# sessions reaching 400k+ context accounted for 44% of all token spend.
+#
+# This is a cost guard, NOT a security boundary: `bash` can still cat these
+# paths. Secrets belong in Doppler, not behind an ignore file.
+#
+# Enforced by: read, ls, agentgrep (grep and find modes).
+
+# --- Build output. Regenerated from source, never worth reading. ---
+target/
+dist/
+build/
+.next/
+out/
+
+# --- Dependencies. Read the manifest, never the vendored tree. ---
+node_modules/
+vendor/
+.venv/
+venv/
+
+# --- Lock files. Enormous, and the manifest carries the intent. ---
+Cargo.lock
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+uv.lock
+poetry.lock
+
+# --- Generated or machine-authored. AGENTS.md forbids hand-editing these. ---
+CHANGELOG.md
+*.min.js
+*.min.css
+*.map
+
+# --- Binary and media: unreadable as text, expensive to attempt. ---
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico
+*.pdf
+*.zip
+*.gz
+*.tar
+*.wasm
+*.dylib
+*.so
+*.a
+*.rlib
+
+# --- Local scratch and caches, including this repo's own conventions. ---
+.local/
+scratch/
+tmp/
+.cache/
+__pycache__/
+.pytest_cache/
+coverage/
+
+# --- Test fixture corpora: large, repetitive, low signal per token. ---
+crates/*/src/tool/testdata/
+**/snapshots/
+
+# --- Secrets: never in context, even though bash could still reach them. ---
+.env
+.env.*
+*.pem
+*.key
+auth.json
+credentials.json

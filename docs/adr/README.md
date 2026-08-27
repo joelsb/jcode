@@ -43,3 +43,4 @@ Format: Michael Nygard's ADR template, trimmed to the sections this codebase act
 | [0025](0025-ask-the-terminal-in-every-window-where-nothing-else-is-reading.md) | Ask the terminal for its image protocol in every window where nothing else is reading; filter it by what the multiplexer forwards | Accepted |
 | [0026](0026-a-fire-and-forget-child-must-still-be-reaped.md) | A fire-and-forget child must still be reaped, because a zombie costs a process-table slot | Accepted |
 | [0027](0027-anthropic-fast-mode-is-speed-not-service-tier.md) | Anthropic fast mode is the `speed` field, never `service_tier` | Accepted |
+| [0028](0028-claudeignore-is-a-cost-guard-not-a-permission-system.md) | `.claudeignore` is a token-cost guard, not a permission system; `bash` is deliberately exempt | Accepted |

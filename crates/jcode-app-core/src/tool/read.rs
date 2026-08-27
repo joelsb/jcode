@@ -154,6 +154,18 @@ impl Tool for ReadTool {
 
         let path = ctx.resolve_path(Path::new(&params.file_path));
 
+        // Refuse ignored paths before touching the file. A read is the most
+        // expensive thing this tool can do to a session: the content is
+        // re-billed on every later turn, so the guard belongs here rather than
+        // after the content is already in hand.
+        if let Some(ignore_file) =
+            jcode_tool_core::agent_ignore::ignored_by(ctx.working_dir.as_deref(), &path)
+        {
+            return Err(anyhow::anyhow!(
+                jcode_tool_core::agent_ignore::refusal_message(&params.file_path, &ignore_file)
+            ));
+        }
+
         // Check if file exists
         if !path.exists() {
             // Try to find similar files

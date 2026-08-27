@@ -316,9 +316,12 @@ fn execute_linked_agentgrep(
         "grep" => {
             let args = build_grep_args(params, ctx)?;
             let root = resolve_search_root(ctx, args.path.as_deref())?;
-            let result = filter_grep_result_to_exact_file(
-                run_grep(&root, &args).map_err(anyhow::Error::msg)?,
-                exact_file.as_deref(),
+            let (result, suppressed) = filter_grep_result_to_ignored(
+                filter_grep_result_to_exact_file(
+                    run_grep(&root, &args).map_err(anyhow::Error::msg)?,
+                    exact_file.as_deref(),
+                ),
+                ctx.working_dir.as_deref(),
             );
             // Bound the rendered matches by default. `find` and `outline` already
             // default to 5 files / 6 regions, but grep passed `None` straight
@@ -329,16 +332,27 @@ fn execute_linked_agentgrep(
             // matches exist and can raise the cap deliberately.
             let max_regions = params.max_regions.or(Some(DEFAULT_GREP_MAX_REGIONS));
             Ok(
-                ToolOutput::new(render_grep_output(&result, &args, max_regions))
-                    .with_title("agentgrep grep"),
+                ToolOutput::new(format!(
+                    "{}{}",
+                    render_grep_output(&result, &args, max_regions),
+                    suppressed_note(suppressed, ctx.working_dir.as_deref())
+                ))
+                .with_title("agentgrep grep"),
             )
         }
         "find" => {
             let args = build_find_args(params, ctx)?;
             let root = resolve_search_root(ctx, args.path.as_deref())?;
-            let result =
-                filter_find_result_to_exact_file(run_find(&root, &args), exact_file.as_deref());
-            Ok(ToolOutput::new(render_find_output(&result, &args)).with_title("agentgrep find"))
+            let (result, suppressed) = filter_find_result_to_ignored(
+                filter_find_result_to_exact_file(run_find(&root, &args), exact_file.as_deref()),
+                ctx.working_dir.as_deref(),
+            );
+            Ok(ToolOutput::new(format!(
+                "{}{}",
+                render_find_output(&result, &args),
+                suppressed_note(suppressed, ctx.working_dir.as_deref())
+            ))
+            .with_title("agentgrep find"))
         }
         "outline" => {
             let args = build_outline_args(params, ctx, context_json_path)?;
@@ -390,6 +404,72 @@ fn filter_grep_result_to_exact_file(
     result.total_files = result.files.len();
     result.total_matches = result.files.iter().map(|file| file.matches.len()).sum();
     result
+}
+
+/// Drop `.claudeignore`d files from grep output.
+///
+/// This is a post-filter rather than an `rg` flag because `GrepArgs` comes
+/// from the external `agentgrep` crate and has no field for an extra ignore
+/// file. Filtering after the fact costs one match per returned path, which is
+/// negligible next to the search itself, and it keeps the guard in one place:
+/// the same matcher the `read` tool uses, so a pattern cannot hide a file from
+/// one tool while leaving it visible to the other.
+///
+/// Note ripgrep already honours `.gitignore` and `.ignore`. This adds the
+/// jcode-specific files on top.
+fn filter_grep_result_to_ignored(
+    mut result: GrepResult,
+    working_dir: Option<&Path>,
+) -> (GrepResult, usize) {
+    if working_dir.is_none() {
+        return (result, 0);
+    }
+    let before = result.files.len();
+    result.files.retain(|file| {
+        !jcode_tool_core::agent_ignore::is_ignored(working_dir, Path::new(&file.path))
+    });
+    let suppressed = before - result.files.len();
+    result.total_files = result.files.len();
+    result.total_matches = result.files.iter().map(|file| file.matches.len()).sum();
+    (result, suppressed)
+}
+
+/// Drop `.claudeignore`d files from find output. See
+/// [`filter_grep_result_to_ignored`] for why this is a post-filter.
+fn filter_find_result_to_ignored(
+    mut result: FindResult,
+    working_dir: Option<&Path>,
+) -> (FindResult, usize) {
+    if working_dir.is_none() {
+        return (result, 0);
+    }
+    let before = result.files.len();
+    result.files.retain(|file| {
+        !jcode_tool_core::agent_ignore::is_ignored(working_dir, Path::new(&file.path))
+    });
+    let suppressed = before - result.files.len();
+    (result, suppressed)
+}
+
+/// Footer noting that results were withheld by an ignore file.
+///
+/// Silence here is a correctness problem, not a cosmetic one: a caller who sees
+/// no matches concludes the string does not exist in the repo, when in fact it
+/// exists in a suppressed path. That is a clean, plausible, wrong answer, so
+/// every filtered search says so and names the file to edit.
+fn suppressed_note(suppressed: usize, working_dir: Option<&Path>) -> String {
+    if suppressed == 0 {
+        return String::new();
+    }
+    let name = working_dir
+        .and_then(jcode_tool_core::agent_ignore::ignore_file_for)
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_else(|| ".claudeignore".to_string());
+    format!(
+        "\n\n[{suppressed} file(s) matched but were withheld by {name}. \
+         This is suppression, not absence: re-check with bash grep before concluding \
+         the match does not exist.]"
+    )
 }
 
 fn filter_find_result_to_exact_file(

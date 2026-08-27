@@ -44,6 +44,24 @@
 - On Windows, the equivalents are `%LOCALAPPDATA%\\jcode\\bin\\jcode.exe` for the launcher, `%LOCALAPPDATA%\\jcode\\builds\\stable\\jcode.exe` for stable, and `%LOCALAPPDATA%\\jcode\\builds\\versions\\<version>\\jcode.exe` for immutable installs; `scripts/install.ps1` currently installs the stable channel.
 - Ensure `~/.local/bin` is **before** `~/.cargo/bin` in `PATH`.
 
+## `.claudeignore`
+
+The repo root carries a `.claudeignore` listing paths the agent must not read
+(build output, lock files, vendored trees, binaries, fixture corpora). Gitignore
+syntax. `.jcodeignore` wins if present; the two are never merged.
+
+Enforced by `read`, `ls`, and `agentgrep` in `grep`/`find` modes. **Not** by
+`bash`, deliberately: this is a token-cost guard, not a permission system, and
+`cat` remains the documented escape hatch. Secrets belong in Doppler, never
+behind an ignore file. See `docs/adr/0028`.
+
+Two consequences worth holding:
+
+- Search and listing report what they withheld ("suppression, not absence"). A
+  short `ls` or an empty grep in a repo with an ignore file is not evidence the
+  file does not exist. Re-check with `bash grep` before concluding.
+- Editing `.claudeignore` takes effect on the next tool call, no restart needed.
+
 ## Verifying a change at runtime
 
 `cargo build` alone proves nothing about behavior. `jcode run` and interactive

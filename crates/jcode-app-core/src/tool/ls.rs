@@ -77,6 +77,10 @@ impl Tool for LsTool {
         let base_path = params.path.clone().unwrap_or_else(|| ".".to_string());
         let base = ctx.resolve_path(Path::new(&base_path));
         let ignore_extra = params.ignore.clone();
+        // Cloned for the blocking closure: the ignore file is resolved relative
+        // to the session working directory, not to the directory being listed,
+        // so that `ls some/subdir` obeys the same project-level rules.
+        let working_dir = ctx.working_dir.clone();
 
         if !base.exists() {
             return Err(anyhow::anyhow!("Directory not found: {}", base_path));
@@ -86,7 +90,7 @@ impl Tool for LsTool {
             return Err(anyhow::anyhow!("Not a directory: {}", base_path));
         }
 
-        let entries = tokio::task::spawn_blocking(move || {
+        let (entries, suppressed) = tokio::task::spawn_blocking(move || {
             let mut ignore_patterns: Vec<String> =
                 DEFAULT_IGNORE.iter().map(|s| s.to_string()).collect();
             if let Some(extra) = ignore_extra {
@@ -94,8 +98,17 @@ impl Tool for LsTool {
             }
 
             let mut entries: Vec<DirEntry> = Vec::new();
-            collect_entries(&base, 0, &ignore_patterns, &mut entries, MAX_ENTRIES)?;
-            Ok::<_, anyhow::Error>(entries)
+            let mut suppressed = 0usize;
+            collect_entries(
+                &base,
+                0,
+                &ignore_patterns,
+                working_dir.as_deref(),
+                &mut entries,
+                MAX_ENTRIES,
+                &mut suppressed,
+            )?;
+            Ok::<_, anyhow::Error>((entries, suppressed))
         })
         .await??;
 
@@ -121,6 +134,21 @@ impl Tool for LsTool {
             file_count, dir_count
         ));
 
+        // Say when entries were withheld. A silently short listing reads as
+        // "the directory contains this and nothing else", which is a plausible
+        // wrong answer; naming the count and the file keeps the omission visible.
+        if suppressed > 0 {
+            let name = ctx
+                .working_dir
+                .as_deref()
+                .and_then(jcode_tool_core::agent_ignore::ignore_file_for)
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_else(|| ".claudeignore".to_string());
+            output.push_str(&format!(
+                "\n{suppressed} entr(ies) hidden by {name} (suppression, not absence)"
+            ));
+        }
+
         Ok(ToolOutput::new(output))
     }
 }
@@ -129,8 +157,10 @@ fn collect_entries(
     dir: &Path,
     depth: usize,
     ignore: &[String],
+    working_dir: Option<&Path>,
     entries: &mut Vec<DirEntry>,
     max: usize,
+    suppressed: &mut usize,
 ) -> Result<()> {
     if entries.len() >= max {
         return Ok(());
@@ -174,6 +204,15 @@ fn collect_entries(
             continue;
         }
 
+        // Project-level `.claudeignore`. Checked after the cheap name-based
+        // filters above so the common case never builds a path, and applied to
+        // directories too: pruning here stops the walk from descending, which
+        // is where the real cost of a large vendored tree would come from.
+        if jcode_tool_core::agent_ignore::is_ignored(working_dir, &item.path()) {
+            *suppressed += 1;
+            continue;
+        }
+
         entries.push(DirEntry {
             name: name.clone(),
             is_dir,
@@ -182,7 +221,15 @@ fn collect_entries(
 
         if is_dir && depth < 5 {
             let path = item.path();
-            collect_entries(&path, depth + 1, ignore, entries, max)?;
+            collect_entries(
+                &path,
+                depth + 1,
+                ignore,
+                working_dir,
+                entries,
+                max,
+                suppressed,
+            )?;
         }
     }
 
