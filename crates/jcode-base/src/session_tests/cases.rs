@@ -223,6 +223,7 @@ fn token_usage_totals_counts_cache_reported_inputs_only_when_cache_fields_exist(
             output_tokens: 10,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            account_label: None,
         }),
     );
     session.add_message_ext(
@@ -237,6 +238,7 @@ fn token_usage_totals_counts_cache_reported_inputs_only_when_cache_fields_exist(
             output_tokens: 20,
             cache_read_input_tokens: Some(150),
             cache_creation_input_tokens: Some(25),
+            account_label: None,
         }),
     );
 
