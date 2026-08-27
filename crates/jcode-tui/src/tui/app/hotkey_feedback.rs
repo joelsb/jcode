@@ -141,6 +141,11 @@ pub(super) fn build_registry(inputs: &RegistryInputs<'_>) -> Vec<KnownHotkey> {
         "cycle the diff display mode",
     );
     push(
+        inputs.toggles.queue_toggle.binding().cloned(),
+        "queue_mode_toggle",
+        "toggle the message queue",
+    );
+    push(
         inputs.toggles.info_widget.binding().cloned(),
         "info_widget_toggle",
         "toggle the info widget",
@@ -346,11 +351,6 @@ pub(super) fn build_registry(inputs: &RegistryInputs<'_>) -> Vec<KnownHotkey> {
         ctrl('p'),
         "auto_poke_toggle",
         "toggle auto-poke",
-    ));
-    out.push(KnownHotkey::new(
-        ctrl('t'),
-        "queue_mode_toggle",
-        "toggle queue mode",
     ));
     out.push(KnownHotkey::quiet(
         ctrl('v'),
@@ -1052,6 +1052,7 @@ mod tests {
             ("workspace_right", Some(&["workspace_right"])),
             ("new_terminal", Some(&["new_terminal"])),
             ("open_resume", Some(&["open_resume"])),
+            ("queue_toggle", Some(&["queue_mode_toggle"])),
         ];
 
         let registry = test_inputs_registry(true);
@@ -1132,6 +1133,7 @@ mod tests {
             ("diff_mode_cycle", toggles.diff_mode_cycle.binding()),
             ("info_widget_toggle", toggles.info_widget.binding()),
             ("swarm_panel_focus", toggles.swarm_panel_focus.binding()),
+            ("queue_mode_toggle", toggles.queue_toggle.binding()),
         ];
         for (name, binding) in toggle_bindings {
             let Some(binding) = binding else { continue };

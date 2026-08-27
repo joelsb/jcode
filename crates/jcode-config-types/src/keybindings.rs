@@ -333,6 +333,14 @@ pub const KEYBINDING_DEFAULTS: &[KeybindingDefault] = &[
         macos: PlatformDefault::dev("cmd+b"),
         other: PlatformDefault::dev("alt+r"),
     },
+    KeybindingDefault {
+        id: "queue_toggle",
+        description: "Toggle the message queue on/off (same effect as /queue)",
+        // Ctrl+Q is XON in terminal flow control, but jcode runs the terminal in
+        // raw mode, so the chord reaches the TUI instead of unpausing output.
+        macos: PlatformDefault::dev("ctrl+q"),
+        other: PlatformDefault::dev("ctrl+q"),
+    },
 ];
 
 /// Look up a keybinding action by id.

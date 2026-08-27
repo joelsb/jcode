@@ -1721,7 +1721,7 @@ pub(super) fn flush_queued_messages_now(app: &mut App) -> usize {
 /// `flush_queued_messages_now`: "off" means nothing of mine is sitting in a
 /// queue, not merely "future messages skip the queue".
 pub(super) fn handle_queue_command(app: &mut App, trimmed: &str) -> bool {
-    let queueing_now = app.queue_mode && app.serialize_queued_messages;
+    let queueing_now = queue_is_on(app);
     let enable = match trimmed {
         "/queue" => !queueing_now,
         "/queue on" => true,
@@ -1737,6 +1737,29 @@ pub(super) fn handle_queue_command(app: &mut App, trimmed: &str) -> bool {
     };
 
     let is_status = trimmed == "/queue status";
+    apply_queue_mode(app, enable, is_status);
+    true
+}
+
+/// Whether the queue is currently on. Both flags must agree, because `/queue on`
+/// and the queue hotkey always set them together; a half-on state (from an older
+/// build or a partial toggle) reads as off so the next toggle turns it fully on.
+pub(crate) fn queue_is_on(app: &App) -> bool {
+    app.queue_mode && app.serialize_queued_messages
+}
+
+/// Flip the queue, exactly as `/queue` does: both flags move together, turning
+/// it off releases the waiting backlog, and the same status notice plus system
+/// message are emitted. The queue hotkey routes here so a chord and the slash
+/// command can never leave the session in different states.
+pub(crate) fn toggle_queue_mode(app: &mut App) {
+    let enable = !queue_is_on(app);
+    apply_queue_mode(app, enable, false);
+}
+
+/// Set the queue flags and report the result. With `is_status` the flags are
+/// left alone and only the current state is described (`/queue status`).
+fn apply_queue_mode(app: &mut App, enable: bool, is_status: bool) {
     let mut flushed = 0usize;
     if !is_status {
         app.queue_mode = enable;
@@ -1768,7 +1791,6 @@ pub(super) fn handle_queue_command(app: &mut App, trimmed: &str) -> bool {
             app.queued_messages.len()
         )
     }));
-    true
 }
 
 pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {

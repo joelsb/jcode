@@ -1207,19 +1207,26 @@ fn test_queue_message_while_processing() {
     assert!(app.display_messages().is_empty());
 }
 
+/// The queue toggle is Ctrl+Q (`keybindings.queue_toggle`). It used to be
+/// Ctrl+T/Ctrl+Tab, which only moved `queue_mode`; see
+/// `tests/queue_toggle_hotkey.rs` for the flag-parity guarantees.
 #[test]
-fn test_ctrl_tab_toggles_queue_mode() {
-    let mut app = create_test_app();
+fn test_ctrl_q_toggles_queue_mode() {
+    // Own JCODE_HOME: pressing a bound chord records hotkey usage, and a
+    // sibling test asserts Ctrl+Q is still an unfamiliar hotkey.
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
 
-    assert!(!app.queue_mode);
+        assert!(!app.queue_mode);
 
-    app.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL)
-        .unwrap();
-    assert!(app.queue_mode);
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::CONTROL)
+            .unwrap();
+        assert!(app.queue_mode);
 
-    app.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL)
-        .unwrap();
-    assert!(!app.queue_mode);
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::CONTROL)
+            .unwrap();
+        assert!(!app.queue_mode);
+    });
 }
 
 #[test]

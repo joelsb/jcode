@@ -451,6 +451,10 @@ async fn handle_remote_key_internal(
         app.toggle_todo_card();
         return Ok(());
     }
+    if app.toggle_keys.queue_toggle.matches(code, modifiers) {
+        app_mod::commands::toggle_queue_mode(app);
+        return Ok(());
+    }
     if app.centered_toggle_keys.matches(code, modifiers) {
         app.record_keybinding_fast(crate::tui::app::shortcut_hints::LearnableAction::Alignment);
         app.toggle_centered_mode();
@@ -746,16 +750,6 @@ async fn handle_remote_key_internal(
             }
             KeyCode::Char('v') => {
                 app.paste_from_clipboard();
-                return Ok(());
-            }
-            KeyCode::Tab | KeyCode::Char('t') => {
-                app.queue_mode = !app.queue_mode;
-                let mode_str = if app.queue_mode {
-                    "Queue mode: messages wait until response completes"
-                } else {
-                    "Immediate mode: messages send next (no interrupt)"
-                };
-                app.set_status_notice(mode_str);
                 return Ok(());
             }
             KeyCode::Up => {

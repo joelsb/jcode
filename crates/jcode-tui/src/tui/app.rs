@@ -1522,7 +1522,7 @@ pub struct App {
     // Local transfer preparation currently running in the background.
     pending_local_transfer: Option<PendingLocalTransfer>,
     // Queue mode: if true, Enter during processing queues; if false, Enter queues to send next
-    // Toggle with Ctrl+Tab or Ctrl+T
+    // Toggle with Ctrl+Q (keybindings.queue_toggle) or /queue
     queue_mode: bool,
     // Automatically reload the remote server when a newer server binary is detected.
     auto_server_reload: bool,
