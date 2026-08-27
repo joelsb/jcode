@@ -92,4 +92,8 @@ pub(crate) struct UsageInfo {
     pub(crate) cache_read_input_tokens: Option<u32>,
     pub(crate) cache_creation_input_tokens: Option<u32>,
     pub(crate) service_tier: Option<String>,
+    /// Speed actually granted by the API: `"fast"` or `"standard"`. This is
+    /// the only ground truth for whether fast mode took effect; a request can
+    /// ask for fast and be served standard.
+    pub(crate) speed: Option<String>,
 }

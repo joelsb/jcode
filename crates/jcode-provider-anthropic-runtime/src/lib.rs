@@ -3469,6 +3469,12 @@ fn process_sse_event(
                             eprintln!("[anthropic] granted service_tier={tier}");
                         }
                     }
+                    if let Some(speed) = usage.speed.as_deref() {
+                        jcode_base::logging::info(&format!("Anthropic granted speed={speed}"));
+                        if std::env::var("JCODE_LOG_SERVICE_TIER").is_ok() {
+                            eprintln!("[anthropic] granted speed={speed}");
+                        }
+                    }
                 }
             }
         }

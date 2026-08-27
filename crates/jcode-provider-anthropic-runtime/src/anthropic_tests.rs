@@ -585,6 +585,21 @@ fn test_api_request_speed_field_serializes_and_omits() {
 }
 
 #[test]
+fn test_usage_info_parses_granted_speed() {
+    let usage: crate::sse_types::UsageInfo =
+        serde_json::from_str(r#"{"input_tokens":8,"output_tokens":12,"speed":"fast"}"#).unwrap();
+    assert_eq!(usage.speed.as_deref(), Some("fast"));
+
+    let standard: crate::sse_types::UsageInfo =
+        serde_json::from_str(r#"{"input_tokens":8,"speed":"standard"}"#).unwrap();
+    assert_eq!(standard.speed.as_deref(), Some("standard"));
+
+    let absent: crate::sse_types::UsageInfo =
+        serde_json::from_str(r#"{"input_tokens":8}"#).unwrap();
+    assert_eq!(absent.speed, None);
+}
+
+#[test]
 fn test_fast_mode_beta_header_is_appended_once() {
     let base = "prompt-caching-2024-07-31";
     assert_eq!(
