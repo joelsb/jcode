@@ -484,6 +484,10 @@ fn test_fast_mode_sends_speed_fast_on_opus_5() {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = "claude-opus-5".to_string();
 
     assert_eq!(provider.available_service_tiers(), vec!["off", "priority"]);
+
+    // Start from a known state: a fresh provider inherits the saved `/fast
+    // default`, which is ambient config rather than a property of this test.
+    provider.set_service_tier("off").unwrap();
     assert_eq!(provider.service_tier(), None);
 
     provider.set_service_tier("priority").unwrap();
@@ -496,6 +500,38 @@ fn test_fast_mode_sends_speed_fast_on_opus_5() {
     provider.set_service_tier("off").unwrap();
     assert_eq!(provider.fast_speed_for_model("claude-opus-5"), None);
     assert_eq!(provider.service_tier(), None);
+}
+
+/// A new Anthropic session must inherit the saved `/fast default`.
+///
+/// The setting is stored once for all providers under the historical key
+/// `openai_service_tier`. Before this was honored here, an Anthropic session
+/// always started standard while `/fast` reported the saved default as on,
+/// which is exactly the mismatch that hid the fast-mode bug.
+#[test]
+fn test_fast_mode_default_is_inherited_from_saved_config() {
+    let _guard = jcode_base::storage::lock_test_env();
+
+    let _on = EnvVarGuard::set("JCODE_OPENAI_SERVICE_TIER", "priority");
+    let _model = EnvVarGuard::set("JCODE_ANTHROPIC_MODEL", "claude-opus-5");
+    jcode_base::config::invalidate_config_cache();
+    let provider = AnthropicProvider::new();
+    assert_eq!(
+        provider.service_tier().as_deref(),
+        Some("priority"),
+        "a saved fast-mode default must reach an Anthropic session"
+    );
+
+    // An unsupported model must not inherit it, or every request would be
+    // rejected by the API.
+    let _sonnet = EnvVarGuard::set("JCODE_ANTHROPIC_MODEL", "claude-sonnet-5");
+    assert_eq!(AnthropicProvider::new().service_tier(), None);
+
+    // And an explicit `off` default stays off.
+    let _off = EnvVarGuard::set("JCODE_OPENAI_SERVICE_TIER", "standard_only");
+    let _opus = EnvVarGuard::set("JCODE_ANTHROPIC_MODEL", "claude-opus-5");
+    jcode_base::config::invalidate_config_cache();
+    assert_eq!(AnthropicProvider::new().service_tier(), None);
 }
 
 #[test]
@@ -597,6 +633,43 @@ fn test_usage_info_parses_granted_speed() {
     let absent: crate::sse_types::UsageInfo =
         serde_json::from_str(r#"{"input_tokens":8}"#).unwrap();
     assert_eq!(absent.speed, None);
+}
+
+/// The fast-mode refusal predicate must fire on the real strings Anthropic
+/// sends, and must not fire on unrelated failures (which would silently drop
+/// fast mode on every hiccup).
+#[test]
+fn test_fast_mode_unavailable_error_matches_real_refusals() {
+    // Observed live 2026-08-27 against api.anthropic.com.
+    assert!(is_fast_mode_unavailable_error(
+        &"Anthropic API error (400 Bad Request): {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Fast mode is not enabled for your organization. An organization admin must enable this feature.\"}}"
+            .to_ascii_lowercase()
+    ));
+    // Documented variants.
+    for message in [
+        "fast mode has been disabled by your organization",
+        "fast mode requires usage credits",
+        "fast mode unavailable during evaluation. please purchase credits.",
+        "fast mode is currently unavailable",
+    ] {
+        assert!(
+            is_fast_mode_unavailable_error(message),
+            "must match: {message}"
+        );
+    }
+
+    // Unrelated failures must NOT silently disable fast mode.
+    for message in [
+        "overloaded_error",
+        "this request would exceed your account's rate limit.",
+        "adaptive thinking is not supported on this model",
+        "model claude-opus-9 not found",
+    ] {
+        assert!(
+            !is_fast_mode_unavailable_error(message),
+            "must not match: {message}"
+        );
+    }
 }
 
 #[test]

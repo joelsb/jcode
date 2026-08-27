@@ -803,11 +803,22 @@ impl AnthropicProvider {
             .map(|_| load_anthropic_api_key().map_err(|err| format!("{err:#}")));
         let profile_models = active_anthropic_profile_models();
 
+        // `/fast default on` is stored once for every provider, under the
+        // historical key `openai_service_tier`. Honor it here too: without
+        // this an Anthropic session always started standard while the UI
+        // reported the saved default as on.
+        let service_tier = jcode_base::config::config()
+            .provider
+            .openai_service_tier
+            .as_deref()
+            .and_then(|raw| Self::normalize_service_tier(raw).ok().flatten())
+            .filter(|_| Self::model_supports_fast_mode(&model));
+
         Self {
             client: jcode_provider_core::shared_http_client(),
             model: Arc::new(std::sync::RwLock::new(model)),
             reasoning_effort: Arc::new(std::sync::RwLock::new(reasoning_effort)),
-            service_tier: Arc::new(std::sync::RwLock::new(None)),
+            service_tier: Arc::new(std::sync::RwLock::new(service_tier)),
             credentials: Arc::new(RwLock::new(None)),
             credential_mode: Arc::new(RwLock::new(AnthropicCredentialMode::from_runtime_env(
                 jcode_provider_core::DualAuthProvider::Anthropic,
@@ -2108,6 +2119,25 @@ async fn run_stream_with_retries(
                     continue;
                 }
 
+                // Fast mode refused (organization not enabled, no usage
+                // credits, or access not provisioned in the research preview).
+                // Self-heal once by dropping `speed` and retrying at standard
+                // speed, exactly as Anthropic's own clients are documented to
+                // do, so a fast-mode entitlement problem degrades to a slower
+                // answer instead of failing the turn outright.
+                if request.speed.is_some()
+                    && !saw_output
+                    && is_fast_mode_unavailable_error(&error_str)
+                {
+                    jcode_base::logging::warn(&format!(
+                        "Anthropic refused fast mode ({}); retrying at standard speed",
+                        e
+                    ));
+                    request.speed = None;
+                    last_error = Some(e);
+                    continue;
+                }
+
                 // Anthropic OAuth can reject Fable with a model-scoped weekly
                 // quota error before the usage cache observes the exhausted
                 // window. This is terminal for Fable, not a transient 429.
@@ -3198,6 +3228,26 @@ fn is_reasoning_unsupported_error(error_str: &str) -> bool {
     let mentions_unsupported =
         error_str.contains("not supported") || error_str.contains("does not support");
     is_bad_request && mentions_reasoning_field && mentions_unsupported
+}
+
+/// True when Anthropic refused the request *because of fast mode* rather than
+/// anything about the conversation, so retrying at standard speed will work.
+///
+/// Three documented causes, all reported as a 400 or a 429 naming fast mode:
+/// the organization has not enabled it, the account has no usage credits, or
+/// research-preview access is not provisioned. Observed live on 2026-08-27:
+/// "Fast mode is not enabled for your organization. An organization admin must
+/// enable this feature."
+///
+/// `error_str` is expected to already be lowercased.
+fn is_fast_mode_unavailable_error(error_str: &str) -> bool {
+    error_str.contains("fast mode")
+        && (error_str.contains("not enabled")
+            || error_str.contains("not available")
+            || error_str.contains("unavailable")
+            || error_str.contains("disabled")
+            || error_str.contains("usage credits")
+            || error_str.contains("purchase credits"))
 }
 
 /// Models that have been retired and must never be chosen as a fallback target
