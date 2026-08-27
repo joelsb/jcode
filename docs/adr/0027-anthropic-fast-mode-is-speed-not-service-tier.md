@@ -78,6 +78,31 @@ charge.
 - If jcode ever gains real Priority Tier support, it needs a *separate* control.
   Reusing this one would recreate the bug.
 
+## Two follow-on defects the live run exposed
+
+Unit tests could not have found either; both needed a real request.
+
+**The saved default never reached an Anthropic session.** `AnthropicProvider::new`
+hardcoded `service_tier: None`. `/fast default on` is stored once for all
+providers under the historical key `provider.openai_service_tier`, and only the
+OpenAI runtime read it. So `/fast` reported the default as on while every Claude
+request went out standard. The provider now reads the same key, filtered by the
+fast-mode model gate.
+
+**An organization without fast-mode access got a hard 400 on every turn.** With
+the default honored, the first live request returned:
+
+```
+400 invalid_request_error: Fast mode is not enabled for your organization.
+An organization admin must enable this feature.
+```
+
+Fast mode is a research preview: Console organizations need access provisioned,
+and subscription plans need usage credits enabled. jcode now self-heals by
+dropping `speed` and retrying at standard speed, matching the documented
+fallback, so an entitlement gap costs latency instead of the turn. This mirrors
+the existing `is_reasoning_unsupported_error` self-heal.
+
 ## Rejected alternatives
 
 **Rename the trait surface to `fast_mode` / `set_fast_mode`.** Honest, and it
