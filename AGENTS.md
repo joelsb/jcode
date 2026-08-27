@@ -2,6 +2,22 @@
 
 ## Development Workflow
 
+- **Never reload without explicit approval.** Do not run `selfdev reload`,
+  `selfdev build-reload`, `jcode server stop`, or anything else that restarts the
+  daemon or swaps the running binary until Joel has said yes to that specific
+  reload. Building is fine and needs no approval; *activating* the build is not.
+
+  A reload restarts the process serving Joel's live session. It interrupts
+  whatever he is mid-way through, kills in-flight background tasks (a `bg wait`
+  returns "interrupted by server reload" and the underlying cargo run is
+  orphaned, still holding the compile lock), and can leave the session marked
+  "processing" so every following turn is rejected with "Already processing a
+  message". A finished feature is not worth a destroyed session.
+
+  Ask, naming it: "build is ready, reload now?" Then wait. If the work needs a
+  reload to be verifiable, say so and stop there - hand back the state, do not
+  reload to prove it yourself.
+
 - **Stay on your own branch** - Do not take, cherry-pick, merge, or copy code from other
   people's or other agents' branches unless the source branch belongs to a repository
   maintainer and the user explicitly asks you to integrate it. Only work from your branch
