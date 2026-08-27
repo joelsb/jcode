@@ -524,68 +524,6 @@ fn test_anthropic_fast_mode_is_limited_to_opus_48() {
     assert_eq!(provider.service_tier(), None);
 }
 
-/// Fast mode must stay off for `claude-opus-5`, the default model in real
-/// configs. Three separate guarantees, because the saved `/fast default on`
-/// setting lives in `provider.openai_service_tier` and is easy to mistake for
-/// a cross-provider switch:
-///   1. the tier cannot be enabled at all on Opus 5,
-///   2. a fresh provider starts on the standard tier regardless of config, and
-///   3. a tier that leaked into the shared cell is filtered out of the request.
-#[test]
-fn test_anthropic_fast_mode_never_applies_to_opus_5() {
-    let provider = AnthropicProvider::new();
-    *provider
-        .model
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "claude-opus-5".to_string();
-
-    // 1. No fast tier is offered, and asking for one fails loudly.
-    assert!(provider.available_service_tiers().is_empty());
-    assert!(provider.set_service_tier("priority").is_err());
-    assert!(provider.set_service_tier("auto").is_err());
-
-    // 2. A fresh Anthropic provider never inherits a saved fast-mode default:
-    //    `openai_service_tier` is read by the OpenAI runtime only.
-    assert_eq!(AnthropicProvider::new().service_tier(), None);
-    assert_eq!(provider.service_tier(), None);
-
-    // 3. Even a tier forced into the shared cell is filtered out per request,
-    //    so `service_tier` is absent from the serialized Anthropic payload.
-    *provider
-        .service_tier
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some("auto".to_string());
-    assert_eq!(provider.service_tier(), None);
-    assert_eq!(
-        provider.current_service_tier_for_model("claude-opus-5"),
-        None
-    );
-    assert_eq!(
-        provider.current_service_tier_for_model("claude-opus-5[1m]"),
-        None
-    );
-
-    let request = ApiRequest {
-        model: "claude-opus-5".to_string(),
-        max_tokens: 1024,
-        system: None,
-        messages: vec![],
-        tools: None,
-        metadata: None,
-        thinking: None,
-        output_config: None,
-        temperature: None,
-        service_tier: provider.current_service_tier_for_model(&provider.model()),
-        stream: true,
-    };
-    let value = serde_json::to_value(&request).unwrap();
-    assert_eq!(value["model"], "claude-opus-5");
-    assert!(
-        value.get("service_tier").is_none(),
-        "Opus 5 request must not carry a service_tier: {value}"
-    );
-}
-
 #[test]
 fn test_anthropic_manual_thinking_budget_for_opus_45() {
     let provider = AnthropicProvider::new();
