@@ -1254,6 +1254,7 @@ pub(super) async fn handle_switch_anthropic_account(
     match crate::auth::claude::set_active_account(&label) {
         Ok(()) => {
             crate::auth::AuthStatus::invalidate_cache();
+            activate_provider_after_account_switch(id, "claude", agent, client_event_tx).await;
             spawn_account_switch_refresh(
                 id,
                 "anthropic",
@@ -1280,6 +1281,7 @@ pub(super) async fn handle_switch_openai_account(
     match crate::auth::codex::set_active_account(&label) {
         Ok(()) => {
             crate::auth::AuthStatus::invalidate_cache();
+            activate_provider_after_account_switch(id, "openai", agent, client_event_tx).await;
             spawn_account_switch_refresh(id, "openai", Arc::clone(agent), client_event_tx.clone());
         }
         Err(e) => {
@@ -1287,6 +1289,68 @@ pub(super) async fn handle_switch_openai_account(
                 id,
                 message: format!("Failed to switch OpenAI account: {}", e),
                 retry_after_secs: None,
+            });
+        }
+    }
+}
+
+/// Route the session onto the provider whose account was just selected, and
+/// tell the client which model is now in force.
+///
+/// Without this the switch only re-pointed a credential: a Claude session that
+/// switched to an OpenAI account stayed on Claude and sent the next turn to the
+/// rate-limited Anthropic account, right after reporting a successful switch.
+///
+/// A failure here is not fatal to the account switch itself (the credential did
+/// change), so it is reported as a notice rather than aborting the request.
+async fn activate_provider_after_account_switch(
+    id: u64,
+    provider_key: &str,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let mut agent_guard = agent.lock().await;
+    let previous_model = agent_guard.provider_model();
+    match agent_guard.activate_provider_for_account_switch(provider_key) {
+        // Already on that provider: the account change alone is the whole
+        // switch, and `spawn_account_switch_refresh` will republish the catalog.
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            let model = agent_guard.provider_model();
+            let provider_name = agent_guard.provider_name();
+            crate::logging::event_info(
+                "server_account_switch_activated_provider",
+                vec![
+                    ("id", id.to_string()),
+                    ("provider", provider_name.clone()),
+                    ("previous_model", previous_model.clone()),
+                    ("model", model.clone()),
+                ],
+            );
+            let _ = client_event_tx.send(ServerEvent::ModelChanged {
+                id,
+                model,
+                provider_name: Some(provider_name),
+                error: None,
+            });
+        }
+        Err(error) => {
+            crate::logging::event_warn(
+                "server_account_switch_provider_activation_failed",
+                vec![
+                    ("id", id.to_string()),
+                    ("provider", provider_key.to_string()),
+                    ("error", error.to_string()),
+                ],
+            );
+            let _ = client_event_tx.send(ServerEvent::ModelChanged {
+                id,
+                model: previous_model,
+                provider_name: None,
+                error: Some(format!(
+                    "Switched the {} account, but could not route this session to {}: {}",
+                    provider_key, provider_key, error
+                )),
             });
         }
     }

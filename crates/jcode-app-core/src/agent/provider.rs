@@ -137,6 +137,47 @@ impl Agent {
         self.provider_runtime_state.selection_generation()
     }
 
+    /// Route this session to `provider_key` after one of its accounts was
+    /// selected, returning the model now in force (or `None` if already there).
+    ///
+    /// Switching an account re-points a credential; it does not move the session
+    /// onto the provider that owns it. Without this, `/account openai switch`
+    /// from a rate-limited Claude session reported success and then sent the
+    /// next turn to Claude anyway, earning the same 429.
+    ///
+    /// Session bookkeeping mirrors a model switch, because that is what this
+    /// is from the session's point of view: the provider key and model change,
+    /// and the upstream provider session id must be dropped so the next turn
+    /// does not try to resume a conversation on the provider we just left.
+    pub fn activate_provider_for_account_switch(
+        &mut self,
+        provider_key: &str,
+    ) -> Result<Option<String>> {
+        let Some(resolved_model) = self
+            .provider
+            .activate_provider_for_account_switch(provider_key)?
+        else {
+            return Ok(None);
+        };
+
+        self.session.provider_key =
+            crate::provider::MultiProvider::session_provider_key_after_model_switch(
+                &resolved_model,
+                self.provider.name(),
+                None,
+            );
+        self.session.model = Some(self.provider_model());
+        let event = crate::provider::ProviderStateEvent::selected_model(
+            crate::provider::ProviderModelSelectionSource::User,
+            resolved_model.clone(),
+        );
+        self.provider_runtime_state.apply(event);
+        self.reset_provider_session();
+        self.persist_session_best_effort("account switch provider activation");
+        self.log_env_snapshot("activate_provider_for_account_switch");
+        Ok(Some(resolved_model))
+    }
+
     pub(crate) fn user_selected_provider_model_after(&self, generation: u64) -> bool {
         self.provider_runtime_state.user_selected_after(generation)
     }

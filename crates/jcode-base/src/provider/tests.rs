@@ -1069,6 +1069,121 @@ include!("tests/issue_534_profile_preservation.rs");
 include!("tests/fallback_failover.rs");
 include!("tests/catalog_subscription.rs");
 
+/// A MultiProvider with both the Anthropic and OpenAI slots filled, active on
+/// Anthropic: the shape of a normal Claude session that also has an OpenAI
+/// login available.
+fn test_multi_provider_with_anthropic_and_openai() -> MultiProvider {
+    save_test_openai_oauth_credentials();
+    crate::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test");
+    crate::env::set_var("OPENAI_API_KEY", "sk-test-openai-api-key");
+    MultiProvider {
+        claude: RwLock::new(None),
+        anthropic: RwLock::new(Some(test_anthropic_runtime() as Arc<dyn Provider>)),
+        openai: RwLock::new(Some(test_openai_runtime() as Arc<dyn Provider>)),
+        copilot_api: RwLock::new(None),
+        antigravity: RwLock::new(None),
+        gemini: RwLock::new(None),
+        cursor: RwLock::new(None),
+        bedrock: RwLock::new(None),
+        openrouter: RwLock::new(None),
+        openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+        active_openai_compatible_profile: RwLock::new(None),
+        active: RwLock::new(ActiveProvider::Claude),
+        use_claude_cli: false,
+        startup_notices: RwLock::new(Vec::new()),
+        initial_provider: None,
+        routes_memo: std::sync::Mutex::new(None),
+        post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }
+}
+
+/// Picking an OpenAI account from a Claude session must move the session onto
+/// OpenAI, not merely re-point the OpenAI credential.
+///
+/// The reported bug: Anthropic hit its 5-hour limit, the user switched to the
+/// OpenAI account, the UI printed "Switched to OpenAI account openai-1", and the
+/// very next turn went to Anthropic again and returned the same 429. The account
+/// store had changed; the active provider had not.
+#[test]
+fn switching_to_an_openai_account_routes_the_session_to_openai() {
+    with_clean_provider_test_env(|| {
+        let runtime = enter_test_runtime();
+        let _runtime_guard = runtime.enter();
+        let provider = test_multi_provider_with_anthropic_and_openai();
+        assert_eq!(provider.active_provider(), ActiveProvider::Claude);
+
+        let activated = provider
+            .activate_provider_for_account_switch("openai")
+            .expect("activating the OpenAI slot should succeed");
+
+        assert!(
+            activated.is_some(),
+            "a switch away from Anthropic must report the model now in force so \
+             the caller can tell the user where the next turn will run"
+        );
+        assert_eq!(
+            provider.active_provider(),
+            ActiveProvider::OpenAI,
+            "the next turn must go to OpenAI, not back to the rate-limited \
+             Anthropic account"
+        );
+        assert_eq!(
+            activated.as_deref(),
+            Some(provider.model()).as_deref(),
+            "the reported model must be the one actually selected"
+        );
+    });
+}
+
+/// An ordinary claude-1 -> claude-2 switch stays on Anthropic and reports
+/// nothing, so the UI does not announce a provider change that did not happen.
+#[test]
+fn switching_between_accounts_of_the_active_provider_reports_no_change() {
+    with_clean_provider_test_env(|| {
+        let runtime = enter_test_runtime();
+        let _runtime_guard = runtime.enter();
+        let provider = test_multi_provider_with_anthropic_and_openai();
+
+        let activated = provider
+            .activate_provider_for_account_switch("claude")
+            .expect("staying on the active provider is not an error");
+
+        assert!(
+            activated.is_none(),
+            "already on Anthropic, so there is no provider switch to announce"
+        );
+        assert_eq!(provider.active_provider(), ActiveProvider::Claude);
+    });
+}
+
+/// Switching to a provider with no credentials must fail loudly rather than
+/// silently leaving the session where it was.
+///
+/// Reporting success while staying put is what made the original bug invisible:
+/// the user believed they had moved off the exhausted account.
+#[test]
+fn switching_to_an_unconfigured_provider_is_an_error() {
+    with_clean_provider_test_env(|| {
+        let runtime = enter_test_runtime();
+        let _runtime_guard = runtime.enter();
+        let provider = test_multi_provider_with_cursor();
+
+        let error = provider
+            .activate_provider_for_account_switch("openai")
+            .expect_err("OpenAI is not configured in this session");
+
+        assert!(
+            error.to_string().contains("not configured"),
+            "error should name the real problem, got: {error}"
+        );
+        assert_eq!(
+            provider.active_provider(),
+            ActiveProvider::Cursor,
+            "a failed switch must not move the session"
+        );
+    });
+}
+
 /// Rendering the route catalog must never schedule network work.
 ///
 /// Regression guard for the "spawning a session refetches every provider
