@@ -156,6 +156,11 @@ pub(super) fn build_registry(inputs: &RegistryInputs<'_>) -> Vec<KnownHotkey> {
         "show/dismiss the inline todo card",
     );
     push(
+        inputs.toggles.quit_now.binding().cloned(),
+        "quit_now",
+        "exit jcode immediately",
+    );
+    push(
         inputs.toggles.swarm_panel_focus.binding().cloned(),
         "swarm_panel_focus",
         "focus the swarm panel",
@@ -1053,6 +1058,7 @@ mod tests {
             ("new_terminal", Some(&["new_terminal"])),
             ("open_resume", Some(&["open_resume"])),
             ("queue_toggle", Some(&["queue_mode_toggle"])),
+            ("quit_now", Some(&["quit_now"])),
         ];
 
         let registry = test_inputs_registry(true);
@@ -1134,6 +1140,7 @@ mod tests {
             ("info_widget_toggle", toggles.info_widget.binding()),
             ("swarm_panel_focus", toggles.swarm_panel_focus.binding()),
             ("queue_mode_toggle", toggles.queue_toggle.binding()),
+            ("quit_now", toggles.quit_now.binding()),
         ];
         for (name, binding) in toggle_bindings {
             let Some(binding) = binding else { continue };

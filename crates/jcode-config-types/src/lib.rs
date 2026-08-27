@@ -968,7 +968,8 @@ pub struct KeybindingsConfig {
     pub side_panel_toggle: String,
     /// Toggle copy/selection mode (default: "alt+y")
     pub copy_selection_toggle: String,
-    /// Toggle the diagram pane position (default: "alt+t")
+    /// Toggle the diagram pane position (default: "alt+w"; it used to be
+    /// "alt+t", which now shows the todo card)
     pub diagram_pane_toggle: String,
     /// Toggle typing scroll lock (default: "alt+s")
     pub typing_scroll_lock_toggle: String,
@@ -980,8 +981,11 @@ pub struct KeybindingsConfig {
     /// (default: "ctrl+q"). Set "" to disable.
     pub queue_toggle: String,
     /// Show/dismiss the session todo list as an inline card in the chat
-    /// transcript (default: "alt+x")
+    /// transcript (default: "alt+t"; it used to be "alt+x", which now quits)
     pub todo_card_toggle: String,
+    /// Exit jcode immediately, the same thing `/quit` and `/xx` do
+    /// (default: "alt+x"). Set "" to disable.
+    pub quit_now: String,
     /// Focus/unfocus the inline swarm panel for keyboard navigation (default:
     /// "alt+n"; alt+↑/↓ select, alt+o pops out, alt+shift+p opens the swarm
     /// prompt, esc exits). Active only when `agents.swarm_spawn_mode = "inline"`
@@ -1029,12 +1033,13 @@ impl Default for KeybindingsConfig {
             workspace_right: get("workspace_right", "alt+l"),
             side_panel_toggle: get("side_panel_toggle", "alt+m"),
             copy_selection_toggle: get("copy_selection_toggle", "alt+y"),
-            diagram_pane_toggle: get("diagram_pane_toggle", "alt+t"),
+            diagram_pane_toggle: get("diagram_pane_toggle", "alt+w"),
             typing_scroll_lock_toggle: get("typing_scroll_lock_toggle", "alt+s"),
             diff_mode_cycle: get("diff_mode_cycle", "alt+g"),
             info_widget_toggle: get("info_widget_toggle", "alt+i"),
             queue_toggle: get("queue_toggle", "ctrl+q"),
-            todo_card_toggle: get("todo_card_toggle", "alt+x"),
+            todo_card_toggle: get("todo_card_toggle", "alt+t"),
+            quit_now: get("quit_now", "alt+x"),
             swarm_panel_focus: get("swarm_panel_focus", "alt+n"),
             new_terminal: get("new_terminal", ""),
             open_resume: get(

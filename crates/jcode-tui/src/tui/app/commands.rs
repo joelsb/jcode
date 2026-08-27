@@ -826,6 +826,18 @@ fn handle_subagent_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
+/// `/quit` (and the `/xx` / `/exit` aliases) exit jcode straight away.
+///
+/// This used to be handled only in the remote key path, so a local session
+/// typing `/quit` fell through to skill parsing and got "Unknown skill".
+pub(super) fn handle_quit_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/quit" && trimmed != "/xx" && trimmed != "/exit" {
+        return false;
+    }
+    app.quit_immediately();
+    true
+}
+
 /// `/cancel` (and `/stop`) interrupt the in-flight turn, mirroring Ctrl+C
 /// while processing. The command has long been registered and advertised by
 /// interactive prompts, but had no top-level dispatch, so typing it outside a

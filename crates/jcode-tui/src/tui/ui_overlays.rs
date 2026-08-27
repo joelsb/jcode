@@ -420,6 +420,7 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "Enable visual debugging for TUI issues",
     ));
     lines.push(help_entry("/quit", "Exit jcode"));
+    lines.push(help_entry("/xx", "Exit jcode (alias for /quit)"));
 
     // The sections above are hand-curated for ordering, but they drift as
     // commands are added. Anything registered and not already shown gets listed

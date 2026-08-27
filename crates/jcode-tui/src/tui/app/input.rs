@@ -2303,6 +2303,11 @@ pub(super) fn handle_pre_control_shortcuts(
         app.toggle_todo_card();
         return true;
     }
+    // Immediate exit: no confirming second press, unlike Ctrl+C.
+    if app.toggle_keys.quit_now.matches(code, modifiers) {
+        app.quit_immediately();
+        return true;
+    }
     if app.toggle_keys.queue_toggle.matches(code, modifiers) {
         super::commands::toggle_queue_mode(app);
         return true;

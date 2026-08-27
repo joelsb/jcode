@@ -341,6 +341,15 @@ pub const KEYBINDING_DEFAULTS: &[KeybindingDefault] = &[
         macos: PlatformDefault::dev("ctrl+q"),
         other: PlatformDefault::dev("ctrl+q"),
     },
+    KeybindingDefault {
+        id: "quit_now",
+        description: "Exit jcode immediately (same as /quit or /xx)",
+        // Single-press exit: Ctrl+C still needs a confirming second press, so a
+        // dedicated chord is the fast path. Alt+X was the todo card toggle
+        // before the todo card moved to Alt+T.
+        macos: PlatformDefault::dev("alt+x"),
+        other: PlatformDefault::dev("alt+x"),
+    },
 ];
 
 /// Look up a keybinding action by id.

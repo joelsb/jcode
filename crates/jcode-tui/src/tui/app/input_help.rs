@@ -182,7 +182,9 @@ impl App {
             }
             "version" => "/version\nShow jcode version/build details.",
             "changelog" => "/changelog\nShow recent changes embedded in this build.",
-            "quit" => "/quit\nExit jcode.",
+            "quit" | "xx" | "exit" => {
+                "/quit\nExit jcode.\n\n/xx\nSame thing, fewer keystrokes. /exit also works.\n\nThe quit_now keybinding (default Alt+X) exits immediately too, with no confirming second press."
+            }
             "config" => {
                 "/config\nShow active configuration.\n\n/config init\nCreate default config file.\n\n/config edit\nOpen config in $EDITOR."
             }

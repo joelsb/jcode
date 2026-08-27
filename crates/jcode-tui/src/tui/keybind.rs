@@ -385,6 +385,8 @@ pub struct ToggleKeys {
     pub todo_card: ToggleBinding,
     pub swarm_panel_focus: ToggleBinding,
     pub queue_toggle: ToggleBinding,
+    /// Immediate exit (no confirming second press), the `/quit` / `/xx` chord.
+    pub quit_now: ToggleBinding,
 }
 
 pub fn load_toggle_keys() -> ToggleKeys {
@@ -392,11 +394,12 @@ pub fn load_toggle_keys() -> ToggleKeys {
     ToggleKeys {
         side_panel: ToggleBinding::load(&cfg.keybindings.side_panel_toggle, 'm'),
         copy_selection: ToggleBinding::load(&cfg.keybindings.copy_selection_toggle, 'y'),
-        diagram_pane: ToggleBinding::load(&cfg.keybindings.diagram_pane_toggle, 't'),
+        diagram_pane: ToggleBinding::load(&cfg.keybindings.diagram_pane_toggle, 'w'),
         typing_scroll_lock: ToggleBinding::load(&cfg.keybindings.typing_scroll_lock_toggle, 's'),
         diff_mode_cycle: ToggleBinding::load(&cfg.keybindings.diff_mode_cycle, 'g'),
         info_widget: ToggleBinding::load(&cfg.keybindings.info_widget_toggle, 'i'),
-        todo_card: ToggleBinding::load(&cfg.keybindings.todo_card_toggle, 'x'),
+        todo_card: ToggleBinding::load(&cfg.keybindings.todo_card_toggle, 't'),
+        quit_now: ToggleBinding::load(&cfg.keybindings.quit_now, 'x'),
         swarm_panel_focus: ToggleBinding::load_with_default(
             &cfg.keybindings.swarm_panel_focus,
             swarm_panel_focus_default(),
@@ -474,7 +477,7 @@ pub(crate) fn swarm_panel_focus_key_label() -> String {
 pub(crate) fn todo_card_key_label() -> String {
     let cfg = config();
     let default = KeyBinding {
-        code: KeyCode::Char('x'),
+        code: KeyCode::Char('t'),
         modifiers: KeyModifiers::ALT,
     };
     let default_label = format_binding(&default);

@@ -71,10 +71,16 @@ workspace_right = "alt+l"
 # Pane / mode toggles
 side_panel_toggle = "alt+m"
 copy_selection_toggle = "alt+y"
-diagram_pane_toggle = "alt+t"
+diagram_pane_toggle = "alt+w"
 typing_scroll_lock_toggle = "alt+s"
 diff_mode_cycle = "alt+g"
 info_widget_toggle = "alt+i"
+# Show/dismiss the session todo list as an inline card in the transcript.
+todo_card_toggle = "alt+t"
+
+# Exit jcode immediately, the same thing /quit and /xx do. Unlike Ctrl+C this
+# needs no confirming second press. Set "" to disable.
+quit_now = "alt+x"
 # Focus the inline swarm panel (list of agents this session manages). Press
 # again to cycle agents. While focused: alt+↑/↓ select, alt+o pops the agent
 # out to a new terminal, esc exits. Plain typing still goes to the chat input.

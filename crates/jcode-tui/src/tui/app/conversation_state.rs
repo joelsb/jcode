@@ -639,6 +639,26 @@ impl App {
         false
     }
 
+    /// Exit now, with no confirming second press. Shared by `/quit`, `/xx`,
+    /// and the `quit_now` chord so those three cannot drift apart.
+    ///
+    /// In remote mode the shared server owns session lifecycle persistence, so
+    /// this client must not write the session file over the server's copy (the
+    /// remote `/quit` path has always skipped the save for that reason).
+    pub(crate) fn quit_immediately(&mut self) {
+        crate::telemetry::end_session_with_reason(
+            self.provider.name(),
+            &self.provider.model(),
+            crate::telemetry::SessionEndReason::NormalExit,
+        );
+        if !self.is_remote {
+            self.session.provider_session_id = self.provider_session_id.clone();
+            self.session.mark_closed();
+            let _ = self.session.save();
+        }
+        self.should_quit = true;
+    }
+
     fn collect_missing_tool_outputs_since_last_scan(&mut self) -> Vec<(usize, Vec<String>)> {
         let message_len = self.local_transcript_message_count();
         if self.tool_output_scan_index > message_len {

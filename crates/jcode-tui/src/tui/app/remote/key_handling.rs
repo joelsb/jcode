@@ -451,6 +451,11 @@ async fn handle_remote_key_internal(
         app.toggle_todo_card();
         return Ok(());
     }
+    // Immediate exit: no confirming second press, unlike Ctrl+C.
+    if app.toggle_keys.quit_now.matches(code, modifiers) {
+        app.quit_immediately();
+        return Ok(());
+    }
     if app.toggle_keys.queue_toggle.matches(code, modifiers) {
         app_mod::commands::toggle_queue_mode(app);
         return Ok(());
@@ -995,15 +1000,10 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
-                if trimmed == "/quit" {
-                    crate::telemetry::end_session_with_reason(
-                        app.provider.name(),
-                        &app.provider.model(),
-                        crate::telemetry::SessionEndReason::NormalExit,
-                    );
-                    // In remote mode the shared server owns session lifecycle persistence.
-                    // Exiting this client should not overwrite the server's session file.
-                    app.should_quit = true;
+                // `quit_immediately` keeps the remote rule (the shared server
+                // owns session persistence, so this client must not overwrite
+                // the server's session file on the way out).
+                if app_mod::commands::handle_quit_command(app, trimmed) {
                     return Ok(());
                 }
 
