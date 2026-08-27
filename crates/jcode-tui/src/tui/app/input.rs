@@ -2266,6 +2266,18 @@ pub(super) fn handle_pre_control_shortcuts(
         return true;
     }
 
+    // Immediate exit is tested before every other toggle on purpose. A stale
+    // config.toml that still pins an older action to this chord would otherwise
+    // match first and silently swallow the quit, which is exactly what happened
+    // when the todo card moved off Alt+X: the shipped default changed but the
+    // user's config kept `todo_card_toggle = "alt+x"`, so Alt+X showed a card
+    // instead of exiting. Exit is the least surprising resolution for a chord
+    // the user pressed expecting to leave.
+    if app.toggle_keys.quit_now.matches(code, modifiers) {
+        app.quit_immediately();
+        return true;
+    }
+
     let macos_option_shortcut =
         crate::tui::keybind::shortcut_char_for_macos_option_key(code, modifiers);
     if app.toggle_keys.copy_selection.matches(code, modifiers) {
@@ -2301,11 +2313,6 @@ pub(super) fn handle_pre_control_shortcuts(
     }
     if app.toggle_keys.todo_card.matches(code, modifiers) {
         app.toggle_todo_card();
-        return true;
-    }
-    // Immediate exit: no confirming second press, unlike Ctrl+C.
-    if app.toggle_keys.quit_now.matches(code, modifiers) {
-        app.quit_immediately();
         return true;
     }
     if app.toggle_keys.queue_toggle.matches(code, modifiers) {

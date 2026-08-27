@@ -390,6 +390,14 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    // Tested before every other toggle: a stale config that still pins an older
+    // action to this chord would otherwise match first and swallow the quit.
+    // See the same guard in `input.rs` for the failure this prevents.
+    if app.toggle_keys.quit_now.matches(code, modifiers) {
+        app.quit_immediately();
+        return Ok(());
+    }
+
     if app.toggle_keys.side_panel.matches(code, modifiers) {
         app.toggle_side_panel();
         return Ok(());
@@ -449,11 +457,6 @@ async fn handle_remote_key_internal(
     }
     if app.toggle_keys.todo_card.matches(code, modifiers) {
         app.toggle_todo_card();
-        return Ok(());
-    }
-    // Immediate exit: no confirming second press, unlike Ctrl+C.
-    if app.toggle_keys.quit_now.matches(code, modifiers) {
-        app.quit_immediately();
         return Ok(());
     }
     if app.toggle_keys.queue_toggle.matches(code, modifiers) {

@@ -161,6 +161,50 @@ fn the_diagram_pane_chord_moved_off_alt_t() {
     );
 }
 
+/// The defect that shipped: the compiled-in default moved the todo card off
+/// Alt+X, but an existing `~/.jcode/config.toml` still pinned
+/// `todo_card_toggle = "alt+x"`. The todo card was matched first, so Alt+X
+/// showed a card instead of exiting, and the user saw the feature as broken.
+///
+/// Config wins over defaults by design, so the fix is ordering: quit is tested
+/// before every other toggle. Exit is the least surprising resolution for a
+/// chord the user pressed expecting to leave.
+#[test]
+fn quit_chord_wins_when_a_stale_config_binds_the_same_chord_elsewhere() {
+    with_temp_jcode_home(|| {
+        let config_path = crate::config::Config::path().expect("config path");
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("create config parent");
+        // Exactly the collision a pre-existing config produces.
+        std::fs::write(
+            &config_path,
+            "[keybindings]\ntodo_card_toggle = \"alt+x\"\nquit_now = \"alt+x\"\n",
+        )
+        .expect("write config");
+        crate::config::Config::invalidate_cache();
+
+        let mut app = create_test_app();
+        app.toggle_keys = crate::tui::keybind::load_toggle_keys();
+
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::ALT)
+            .unwrap();
+
+        assert!(
+            app.should_quit,
+            "Alt+X must exit even when a stale config also binds it to the todo card"
+        );
+        assert!(
+            !app.display_messages.iter().any(|m| m.role == "todos"),
+            "the swallowed-quit bug: a todo card appeared instead of exiting"
+        );
+
+        // The cache is process-global and keyed off the temp home that is about
+        // to be deleted; leaving it primed leaks this config into later tests.
+        drop(app);
+        crate::config::Config::invalidate_cache();
+    });
+}
+
 /// `/xx` has to be discoverable: an unregistered command gets no completion and
 /// no `/help` line, which is how a working command stays invisible.
 #[test]
