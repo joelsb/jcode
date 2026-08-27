@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 
 /// Bound on how long a tool call will wait for a not-yet-connected MCP server
 /// to come up before failing with a clean tool error. Keeps a slow/hanging
@@ -56,9 +56,43 @@ pub struct McpManager {
     /// Project directory used to resolve project-local MCP config. `None`
     /// loads only global config and never consults the process working directory.
     project_dir: Option<std::path::PathBuf>,
+    /// Fan-in of every connected server's `tools/list_changed` events, carrying
+    /// the server name. One subscription covers all servers, including ones
+    /// connected later, so the tool registry does not have to re-subscribe.
+    tools_changed: broadcast::Sender<String>,
 }
 
 impl McpManager {
+    /// Subscribe to `notifications/tools/list_changed` from any connected
+    /// server. The payload is the server name; `all_tools()` already reflects
+    /// the new list when the event fires.
+    pub fn subscribe_tools_changed(&self) -> broadcast::Receiver<String> {
+        self.tools_changed.subscribe()
+    }
+
+    /// Forward one server's tool-change events into the manager-level channel.
+    fn watch_handle(&self, server: &str, handle: &McpHandle) {
+        let mut rx = handle.subscribe_tools_changed();
+        let tx = self.tools_changed.clone();
+        let server = server.to_string();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(()) => {
+                        if tx.send(server.clone()).is_err() {
+                            // Nobody is listening; keep watching, a session may
+                            // subscribe later.
+                            continue;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // The handle is gone: the server disconnected.
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     /// Create a new manager in owned in-process mode (used by tests and local harnesses).
     pub fn new() -> Self {
         let project_dir = std::env::current_dir().ok();
@@ -69,6 +103,7 @@ impl McpManager {
             config: McpConfig::load_for_dir(project_dir.as_deref()),
             session_id: "owned".to_string(),
             project_dir,
+            tools_changed: broadcast::channel(16).0,
         }
     }
 
@@ -92,6 +127,7 @@ impl McpManager {
             config: McpConfig::load_for_dir(project_dir.as_deref()),
             session_id,
             project_dir,
+            tools_changed: broadcast::channel(16).0,
         }
     }
 
@@ -104,6 +140,7 @@ impl McpManager {
             config,
             session_id: "owned".to_string(),
             project_dir: None,
+            tools_changed: broadcast::channel(16).0,
         }
     }
 
@@ -146,6 +183,7 @@ impl McpManager {
                 let mut pool_handles = self.pool_handles.write().await;
                 for (name, handle) in all_handles {
                     if shared_names.contains(&name) {
+                        self.watch_handle(&name, &handle);
                         pool_handles.insert(name, handle);
                     }
                 }
@@ -177,6 +215,7 @@ impl McpManager {
             for handle in spawn_handles {
                 match handle.await {
                     Ok((name, Ok(client))) => {
+                        self.watch_handle(&name, &client.handle());
                         let mut clients = self.owned_clients.write().await;
                         clients.insert(name, client);
                         total_successes += 1;
@@ -220,6 +259,7 @@ impl McpManager {
             if let Some(pool) = &self.pool {
                 pool.connect_server(name, config).await?;
                 if let Some(handle) = pool.get_handle(name).await {
+                    self.watch_handle(name, &handle);
                     self.pool_handles
                         .write()
                         .await
@@ -235,6 +275,7 @@ impl McpManager {
                 .await
                 .with_context(|| format!("Failed to connect to MCP server '{}'", name))?;
 
+        self.watch_handle(name, &client.handle());
         self.owned_clients
             .write()
             .await
@@ -290,13 +331,69 @@ impl McpManager {
 
     /// Get list of connected server names
     pub async fn connected_servers(&self) -> Vec<String> {
+        self.reap_dead().await;
         let mut names: Vec<String> = self.pool_handles.read().await.keys().cloned().collect();
         names.extend(self.owned_clients.read().await.keys().cloned());
         names
     }
 
+    /// Drop handles/clients whose child process has died.
+    ///
+    /// A dead handle used to stay in the map forever, so `call_tool` took the
+    /// fast path and returned the same send error for the rest of the daemon's
+    /// life. Evicting makes the server look disconnected, which is true, and
+    /// lets connect-on-first-call respawn it.
+    async fn reap_dead(&self) {
+        if let Some(pool) = &self.pool {
+            pool.reap_dead().await;
+        }
+        {
+            let dead: Vec<String> = self
+                .pool_handles
+                .read()
+                .await
+                .iter()
+                .filter(|(_, handle)| !handle.is_alive())
+                .map(|(name, _)| name.clone())
+                .collect();
+            if !dead.is_empty() {
+                let mut handles = self.pool_handles.write().await;
+                for name in &dead {
+                    handles.remove(name);
+                    crate::logging::warn(&format!(
+                        "MCP: server '{}' is not running (child process exited); \
+                         dropping stale handle so the next call reconnects",
+                        name
+                    ));
+                }
+            }
+        }
+        {
+            let dead: Vec<String> = self
+                .owned_clients
+                .read()
+                .await
+                .iter()
+                .filter(|(_, client)| !client.is_alive())
+                .map(|(name, _)| name.clone())
+                .collect();
+            if !dead.is_empty() {
+                let mut clients = self.owned_clients.write().await;
+                for name in &dead {
+                    clients.remove(name);
+                    crate::logging::warn(&format!(
+                        "MCP: owned server '{}' is not running (child process exited); \
+                         dropping stale client so the next call reconnects",
+                        name
+                    ));
+                }
+            }
+        }
+    }
+
     /// Get all available tools from all connected servers
     pub async fn all_tools(&self) -> Vec<(String, McpToolDef)> {
+        self.reap_dead().await;
         let mut tools = Vec::new();
 
         // Pool handles
@@ -330,6 +427,11 @@ impl McpManager {
         tool: &str,
         arguments: serde_json::Value,
     ) -> Result<ToolCallResult> {
+        // A handle whose child died is a tombstone that would otherwise make
+        // the fast paths below return "not running" forever. Evict first so
+        // connect-on-first-call can respawn the server.
+        self.reap_dead().await;
+
         // Fast path: already connected via pool handle.
         {
             let handles = self.pool_handles.read().await;
@@ -489,6 +591,7 @@ impl McpManager {
 
     /// Check if any servers are connected
     pub async fn has_connections(&self) -> bool {
+        self.reap_dead().await;
         !self.pool_handles.read().await.is_empty() || !self.owned_clients.read().await.is_empty()
     }
 }
@@ -761,5 +864,264 @@ done
 
         manager.disconnect_all().await;
         drop(env_guard);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod dead_server_tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::Duration;
+
+    /// A fake stdio MCP server that records its own PID so a test can kill it.
+    /// Each spawn overwrites the pidfile, so the test can tell a reconnected
+    /// child from the original one.
+    fn write_killable_mcp_server(dir: &std::path::Path, pidfile: &std::path::Path) -> String {
+        let path = dir.join("killable-mcp-server.sh");
+        let script = format!(
+            r##"#!/bin/bash
+echo $$ > "{pidfile}"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | grep -o '[0-9]*' | head -1)
+  case "$line" in
+    *'"initialize"'*)
+      echo '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"killable","version":"0.0.1"}}}}}}'
+      ;;
+    *'"tools/list"'*)
+      echo '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"tools":[{{"name":"ping","description":"ping","inputSchema":{{"type":"object"}}}}]}}}}'
+      ;;
+    *'"tools/call"'*)
+      echo '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"content":[{{"type":"text","text":"pong"}}],"isError":false}}}}'
+      ;;
+  esac
+done
+"##,
+            pidfile = pidfile.display()
+        );
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        drop(file);
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    fn read_pid(pidfile: &std::path::Path) -> i32 {
+        std::fs::read_to_string(pidfile)
+            .expect("pidfile")
+            .trim()
+            .parse()
+            .expect("pid")
+    }
+
+    /// A killed MCP child must not keep serving requests from a tombstone
+    /// handle. The server must stop being reported as connected, and the very
+    /// next tool call must reconnect and succeed against a *new* child.
+    ///
+    /// Assert on the reconnect, not just on the first error: the pre-fix code
+    /// also returned `Err` here, it just never recovered.
+    #[tokio::test]
+    async fn killed_mcp_child_is_evicted_and_the_next_call_reconnects() {
+        let temp = tempfile::tempdir().unwrap();
+        let pidfile = temp.path().join("server.pid");
+        let command = write_killable_mcp_server(temp.path(), &pidfile);
+
+        let mut config = McpConfig::default();
+        config.servers.insert(
+            "killable".to_string(),
+            McpServerConfig {
+                command,
+                args: vec![],
+                env: HashMap::new(),
+                shared: false,
+                transport: None,
+                url: None,
+                headers: std::collections::HashMap::new(),
+                enabled: None,
+                disabled: None,
+            },
+        );
+        let manager = McpManager::with_config(config.clone());
+        let server_config = config.servers.get("killable").unwrap().clone();
+        manager
+            .connect("killable", &server_config)
+            .await
+            .expect("initial connect");
+
+        let first = manager
+            .call_tool("killable", "ping", serde_json::json!({}))
+            .await
+            .expect("first call works");
+        assert!(!first.is_error);
+
+        let first_pid = read_pid(&pidfile);
+        unsafe { libc::kill(first_pid, libc::SIGKILL) };
+
+        // Give the reader task a moment to observe stdout EOF.
+        let mut evicted = false;
+        for _ in 0..100 {
+            if manager.connected_servers().await.is_empty() {
+                evicted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            evicted,
+            "a server whose child was killed must stop being reported as connected"
+        );
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(30),
+            manager.call_tool("killable", "ping", serde_json::json!({})),
+        )
+        .await
+        .expect("second call must not hang")
+        .expect("second call must reconnect and succeed");
+        assert!(!second.is_error);
+
+        let second_pid = read_pid(&pidfile);
+        assert_ne!(
+            first_pid, second_pid,
+            "the second call must be served by a freshly spawned child"
+        );
+
+        // Shut down just this server. `disconnect_all` would flush the global
+        // provenance aggregates, which a concurrently running test owns.
+        manager
+            .disconnect("killable")
+            .await
+            .expect("disconnect the reconnected child");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod list_changed_tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::Duration;
+
+    /// A fake stdio MCP server that starts with one tool, and after
+    /// `expose_extra` is called emits `notifications/tools/list_changed` and
+    /// thereafter lists a second tool. Mirrors what mcp-router does when
+    /// `router_configure` exposes backend tools mid-session.
+    fn write_list_changed_server(dir: &std::path::Path) -> String {
+        let path = dir.join("list-changed-mcp-server.sh");
+        let statefile = dir.join("exposed");
+        let script = format!(
+            r##"#!/bin/bash
+STATE="{state}"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | grep -o '[0-9]*' | head -1)
+  case "$line" in
+    *'"initialize"'*)
+      echo '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{"listChanged":true}}}},"serverInfo":{{"name":"router","version":"0.0.1"}}}}}}'
+      ;;
+    *'"tools/list"'*)
+      if [ -f "$STATE" ]; then
+        echo '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"tools":[{{"name":"expose_extra","description":"expose","inputSchema":{{"type":"object"}}}},{{"name":"check_connection","description":"late","inputSchema":{{"type":"object"}}}}]}}}}'
+      else
+        echo '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"tools":[{{"name":"expose_extra","description":"expose","inputSchema":{{"type":"object"}}}}]}}}}'
+      fi
+      ;;
+    *'"expose_extra"'*)
+      touch "$STATE"
+      echo '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"content":[{{"type":"text","text":"exposed"}}],"isError":false}}}}'
+      echo '{{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}}'
+      ;;
+    *'"tools/call"'*)
+      echo '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"content":[{{"type":"text","text":"ok"}}],"isError":false}}}}'
+      ;;
+  esac
+done
+"##,
+            state = statefile.display()
+        );
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        drop(file);
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    /// A server emitting `notifications/tools/list_changed` must cause jcode to
+    /// re-list its tools, and the newly exposed tool must become callable.
+    ///
+    /// Assert on the *named* tool, never on list length, and assert the
+    /// originally cached tool survives the refresh.
+    #[tokio::test]
+    async fn tools_list_changed_notification_exposes_the_named_new_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = write_list_changed_server(temp.path());
+
+        let mut config = McpConfig::default();
+        config.servers.insert(
+            "router".to_string(),
+            McpServerConfig {
+                command,
+                args: vec![],
+                env: HashMap::new(),
+                shared: false,
+                transport: None,
+                url: None,
+                headers: std::collections::HashMap::new(),
+                enabled: None,
+                disabled: None,
+            },
+        );
+        let manager = McpManager::with_config(config.clone());
+        let server_config = config.servers.get("router").unwrap().clone();
+        manager
+            .connect("router", &server_config)
+            .await
+            .expect("connect");
+
+        let names = |tools: Vec<(String, McpToolDef)>| -> Vec<String> {
+            tools.into_iter().map(|(_, def)| def.name).collect()
+        };
+
+        let before = names(manager.all_tools().await);
+        assert!(before.contains(&"expose_extra".to_string()));
+        assert!(
+            !before.contains(&"check_connection".to_string()),
+            "the late tool must not be visible before it is exposed: {before:?}"
+        );
+
+        let mut changed = manager.subscribe_tools_changed();
+
+        manager
+            .call_tool("router", "expose_extra", serde_json::json!({}))
+            .await
+            .expect("expose_extra");
+
+        let server = tokio::time::timeout(Duration::from_secs(10), changed.recv())
+            .await
+            .expect("a tools/list_changed notification must be delivered")
+            .expect("broadcast alive");
+        assert_eq!(server, "router");
+
+        let after = names(manager.all_tools().await);
+        assert!(
+            after.contains(&"check_connection".to_string()),
+            "the newly exposed tool must be present after list_changed: {after:?}"
+        );
+        assert!(
+            after.contains(&"expose_extra".to_string()),
+            "previously known tools must survive the refresh: {after:?}"
+        );
+
+        // And it must actually be callable, not merely listed.
+        let result = manager
+            .call_tool("router", "check_connection", serde_json::json!({}))
+            .await
+            .expect("the newly exposed tool must be callable");
+        assert!(!result.is_error);
+
+        manager.disconnect("router").await.expect("disconnect");
     }
 }

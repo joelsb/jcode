@@ -221,12 +221,14 @@ impl SharedMcpPool {
 
     /// Get a handle for a specific server
     pub async fn get_handle(&self, name: &str) -> Option<McpHandle> {
+        self.reap_dead().await;
         let handles = self.handles.read().await;
-        handles.get(name).cloned()
+        handles.get(name).filter(|h| h.is_alive()).cloned()
     }
 
     /// Get all available tools from all connected servers
     pub async fn all_tools(&self) -> Vec<(String, McpToolDef)> {
+        self.reap_dead().await;
         let handles = self.handles.read().await;
         let mut tools = Vec::new();
         for (server_name, handle) in handles.iter() {
@@ -239,8 +241,49 @@ impl SharedMcpPool {
 
     /// Get list of connected server names
     pub async fn connected_servers(&self) -> Vec<String> {
+        self.reap_dead().await;
         let handles = self.handles.read().await;
         handles.keys().cloned().collect()
+    }
+
+    /// Drop any handle whose child process has died, so the next connect
+    /// attempt actually respawns it instead of reusing a tombstone.
+    ///
+    /// Without this, a killed MCP child leaves a handle that looks connected
+    /// forever and fails every call in every session sharing the pool.
+    pub(crate) async fn reap_dead(&self) {
+        let dead: Vec<String> = {
+            let handles = self.handles.read().await;
+            handles
+                .iter()
+                .filter(|(_, handle)| !handle.is_alive())
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        if dead.is_empty() {
+            return;
+        }
+
+        {
+            let mut handles = self.handles.write().await;
+            for name in &dead {
+                if handles.get(name).map(|h| !h.is_alive()).unwrap_or(false) {
+                    handles.remove(name);
+                    crate::logging::warn(&format!(
+                        "MCP pool: evicted dead server '{}' (child process exited); \
+                         the next tool call will reconnect",
+                        name
+                    ));
+                }
+            }
+        }
+        {
+            let mut clients = self.clients.lock().await;
+            for name in &dead {
+                // Dropping the client start_kill()s the (already dead) child.
+                clients.remove(name);
+            }
+        }
     }
 
     /// Call a tool on a specific server
@@ -250,9 +293,9 @@ impl SharedMcpPool {
         tool: &str,
         arguments: serde_json::Value,
     ) -> Result<super::protocol::ToolCallResult> {
-        let handles = self.handles.read().await;
-        let handle = handles
-            .get(server)
+        let handle = self
+            .get_handle(server)
+            .await
             .with_context(|| format!("MCP server '{}' not connected", server))?;
         handle.call_tool(tool, arguments).await
     }
@@ -271,6 +314,7 @@ impl SharedMcpPool {
 
     /// Check if any servers are connected
     pub async fn has_connections(&self) -> bool {
+        self.reap_dead().await;
         let handles = self.handles.read().await;
         !handles.is_empty()
     }
@@ -281,6 +325,7 @@ impl SharedMcpPool {
     }
 
     async fn begin_connect(&self, name: &str) -> ConnectAttempt {
+        self.reap_dead().await;
         let mut connecting = self.connecting.lock().await;
         if let Some(notify) = connecting.get(name) {
             return ConnectAttempt::Wait(Arc::clone(notify));
@@ -390,6 +435,7 @@ impl SharedMcpPool {
     }
 
     async fn recent_failure(&self, name: &str) -> Option<FailedConnectRecord> {
+        self.reap_dead().await;
         if self.handles.read().await.contains_key(name) {
             return None;
         }

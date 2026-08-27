@@ -6,10 +6,15 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+
+/// MCP notification methods jcode acts on.
+pub const TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
+pub const RESOURCES_LIST_CHANGED: &str = "notifications/resources/list_changed";
+pub const PROMPTS_LIST_CHANGED: &str = "notifications/prompts/list_changed";
 
 /// Shared communication handle for an MCP server.
 /// Multiple sessions can hold clones of this and send concurrent requests.
@@ -23,11 +28,42 @@ pub struct McpHandle {
     server_info: Arc<std::sync::RwLock<Option<ServerInfo>>>,
     capabilities: Arc<std::sync::RwLock<ServerCapabilities>>,
     tools: Arc<std::sync::RwLock<Vec<McpToolDef>>>,
+    /// Cleared when the child process dies (stdout EOF, read error, or a
+    /// failed stdin write). A handle whose flag is false is a tombstone: it can
+    /// never serve another request, and callers must evict it and reconnect
+    /// instead of returning its errors forever (issue: stale MCP handle).
+    alive: Arc<AtomicBool>,
+    /// Fires after `tools` has been refreshed in response to the server's
+    /// `notifications/tools/list_changed`. Sessions subscribe to re-register
+    /// their tool proxies; see `subscribe_tools_changed`.
+    tools_changed: broadcast::Sender<()>,
 }
 
 impl McpHandle {
+    /// Subscribe to tool-list changes pushed by the server.
+    ///
+    /// The event fires *after* `tools()` already returns the new list, so a
+    /// subscriber can read the handle directly without racing the refresh.
+    pub fn subscribe_tools_changed(&self) -> broadcast::Receiver<()> {
+        self.tools_changed.subscribe()
+    }
+
+    /// Whether the underlying child process is still believed to be running.
+    ///
+    /// This is observed from the I/O tasks, so it needs no `&mut` and works
+    /// from a shared pool handle, unlike `McpClient::is_running`.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
     /// Send a request and wait for response
     pub async fn request(&self, method: &str, params: Option<Value>) -> Result<JsonRpcResponse> {
+        if !self.is_alive() {
+            anyhow::bail!(
+                "MCP server '{}' is not running (child process exited); reconnecting",
+                self.name
+            );
+        }
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
         let request = JsonRpcRequest::new(id, method, params);
 
@@ -38,15 +74,27 @@ impl McpHandle {
         }
 
         let msg = serde_json::to_string(&request)? + "\n";
-        self.writer_tx
-            .send(msg)
-            .await
-            .context("Failed to send request")?;
+        if self.writer_tx.send(msg).await.is_err() {
+            self.pending.lock().await.remove(&id);
+            anyhow::bail!(
+                "MCP server '{}' is not running (child process exited); reconnecting",
+                self.name
+            );
+        }
 
         let response = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
             .await
             .context("Request timeout")?
-            .context("Channel closed")?;
+            .map_err(|_| {
+                if self.is_alive() {
+                    anyhow::anyhow!("MCP server '{}' dropped the response channel", self.name)
+                } else {
+                    anyhow::anyhow!(
+                        "MCP server '{}' is not running (child process exited); reconnecting",
+                        self.name
+                    )
+                }
+            })?;
 
         if let Some(err) = &response.error {
             anyhow::bail!("MCP error {}: {}", err.code, err.message);
@@ -196,8 +244,15 @@ impl McpClient {
             Arc::new(Mutex::new(HashMap::new()));
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(32);
 
+        // Liveness flag shared by the writer task, the reader task and every
+        // handle clone. Either I/O task observing the child going away clears
+        // it, which is what lets the pool evict the tombstone and reconnect.
+        let alive = Arc::new(AtomicBool::new(true));
+
         // Spawn writer task
         let mut stdin = stdin;
+        let writer_alive = Arc::clone(&alive);
+        let writer_name = name.clone();
         tokio::spawn(async move {
             while let Some(msg) = writer_rx.recv().await {
                 if stdin.write_all(msg.as_bytes()).await.is_err() {
@@ -207,11 +262,22 @@ impl McpClient {
                     break;
                 }
             }
+            if writer_alive.swap(false, Ordering::SeqCst) {
+                crate::logging::warn(&format!(
+                    "MCP [{}]: stdin closed; marking server dead",
+                    writer_name
+                ));
+            }
         });
 
         // Spawn reader task
         let pending_clone = Arc::clone(&pending);
         let reader_name = name.clone();
+        let reader_alive = Arc::clone(&alive);
+        // Notifications carry no `id`, so they cannot be routed through
+        // `pending`. They go to a separate handler task, spawned below once
+        // the handle exists (handling one needs to issue a request).
+        let (notif_tx, mut notif_rx) = mpsc::channel::<String>(8);
         let mut reader = BufReader::new(stdout);
         tokio::spawn(async move {
             let mut line = String::new();
@@ -223,7 +289,24 @@ impl McpClient {
                         break;
                     }
                     Ok(_) => {
-                        if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&line) {
+                        // A JSON-RPC message with a `method` and no `id` is a
+                        // notification. It used to fall off the end of the
+                        // id-dispatch branch and be silently dropped, which is
+                        // why `tools/list_changed` never took effect.
+                        let method = serde_json::from_str::<Value>(&line)
+                            .ok()
+                            .filter(|value| value.get("id").map(Value::is_null).unwrap_or(true))
+                            .and_then(|value| {
+                                value.get("method").and_then(Value::as_str).map(String::from)
+                            });
+                        if let Some(method) = method {
+                            crate::logging::debug(&format!(
+                                "MCP [{}] notification: {}",
+                                reader_name, method
+                            ));
+                            let _ = notif_tx.try_send(method);
+                        } else if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&line)
+                        {
                             if let Some(id) = response.id {
                                 let mut pending = pending_clone.lock().await;
                                 if let Some(tx) = pending.remove(&id) {
@@ -246,6 +329,15 @@ impl McpClient {
                     }
                 }
             }
+            if reader_alive.swap(false, Ordering::SeqCst) {
+                crate::logging::warn(&format!(
+                    "MCP [{}]: server process exited; marking connection dead",
+                    reader_name
+                ));
+            }
+            // Fail every in-flight request immediately instead of making each
+            // caller wait out the 30s request timeout.
+            pending_clone.lock().await.clear();
         });
 
         let handle = McpHandle {
@@ -256,7 +348,48 @@ impl McpClient {
             server_info: Arc::new(std::sync::RwLock::new(None)),
             capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
             tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+            alive,
+            tools_changed: broadcast::channel(8).0,
         };
+
+        // Notification handler. Owns a handle clone so it can issue the
+        // `tools/list` that a list_changed notification implies.
+        let notif_handle = handle.clone();
+        tokio::spawn(async move {
+            while let Some(method) = notif_rx.recv().await {
+                match method.as_str() {
+                    TOOLS_LIST_CHANGED => {
+                        match notif_handle.refresh_tools().await {
+                            Ok(()) => {
+                                crate::logging::info(&format!(
+                                    "MCP [{}]: tool list changed; refreshed to {} tool(s)",
+                                    notif_handle.name,
+                                    notif_handle.tools().len()
+                                ));
+                                // Ignore the error when nobody is subscribed.
+                                let _ = notif_handle.tools_changed.send(());
+                            }
+                            Err(err) => {
+                                crate::logging::warn(&format!(
+                                    "MCP [{}]: tools/list_changed refresh failed: {:#}",
+                                    notif_handle.name, err
+                                ));
+                            }
+                        }
+                    }
+                    RESOURCES_LIST_CHANGED | PROMPTS_LIST_CHANGED => {
+                        // jcode exposes neither as session capabilities yet, so
+                        // there is nothing to refresh. Logged, not dropped
+                        // silently, so the next person can see it arrive.
+                        crate::logging::debug(&format!(
+                            "MCP [{}]: ignoring {} (not exposed by jcode)",
+                            notif_handle.name, method
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        });
 
         let mut client = Self { handle, child };
 
@@ -330,6 +463,13 @@ impl McpClient {
             Ok(Some(_)) => false,
             Err(_) => false,
         }
+    }
+
+    /// Whether the connection is still live, observed from the I/O tasks.
+    /// Unlike `is_running` this needs no `&mut`, so it is callable from the
+    /// read-only fast paths in the pool and the manager.
+    pub fn is_alive(&self) -> bool {
+        self.handle.is_alive()
     }
 
     /// Shutdown the server

@@ -1042,6 +1042,73 @@ impl Registry {
 
             // Spawn connection and tool registration in background
             let registry = self.clone();
+
+            // Watch for servers pushing `notifications/tools/list_changed`
+            // (e.g. an MCP router that exposes backend tools on demand).
+            //
+            // Deliberate scope: the re-registered proxies are callable on the
+            // *current* turn, because `execute` resolves names against the live
+            // registry. The tool list advertised to the model in the system
+            // prompt is snapshotted per turn and is therefore only updated on
+            // the *next* turn, which keeps the prompt cache intact for the
+            // running one (#206). Without this, the new tools were never
+            // callable at all, so the model got "Unknown tool" for something a
+            // server had just reported as successfully exposed.
+            {
+                let registry = registry.clone();
+                let mcp_manager = Arc::clone(&mcp_manager);
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let mut rx = mcp_manager.read().await.subscribe_tools_changed();
+                    loop {
+                        let server = match rx.recv().await {
+                            Ok(server) => server,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        };
+
+                        let prefix = format!("mcp__{}__", server);
+                        // Drop the server's old proxies first so tools the
+                        // server removed stop being callable.
+                        registry.unregister_prefix(&prefix).await;
+
+                        let tools =
+                            crate::mcp::create_mcp_tools(Arc::clone(&mcp_manager)).await;
+                        let mut registered = 0usize;
+                        for (name, tool) in tools {
+                            if name.starts_with(&prefix) {
+                                registry.register(name, tool).await;
+                                registered += 1;
+                            }
+                        }
+                        crate::logging::event_info(
+                            "MCP_LIFECYCLE",
+                            vec![
+                                ("phase", "tools_list_changed".to_string()),
+                                ("server", server.clone()),
+                                ("tool_count", registered.to_string()),
+                            ],
+                        );
+
+                        if let Some(ref tx) = event_tx {
+                            let mut counts: std::collections::BTreeMap<String, usize> =
+                                std::collections::BTreeMap::new();
+                            for (server, _) in
+                                mcp_manager.read().await.all_tools().await
+                            {
+                                *counts.entry(server).or_default() += 1;
+                            }
+                            let servers: Vec<String> = counts
+                                .into_iter()
+                                .map(|(name, count)| format!("{}:{}", name, count))
+                                .collect();
+                            let _ =
+                                tx.send(crate::protocol::ServerEvent::McpStatus { servers });
+                        }
+                    }
+                });
+            }
+
             tokio::spawn(async move {
                 let (successes, failures) = {
                     let manager = mcp_manager.write().await;
