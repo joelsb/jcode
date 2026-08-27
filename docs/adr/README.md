@@ -42,3 +42,4 @@ Format: Michael Nygard's ADR template, trimmed to the sections this codebase act
 | [0024](0024-a-cached-token-belongs-to-an-account.md) | A cached OAuth token belongs to an account, not just to a clock, so a rotation reaches every session | Accepted |
 | [0025](0025-ask-the-terminal-in-every-window-where-nothing-else-is-reading.md) | Ask the terminal for its image protocol in every window where nothing else is reading; filter it by what the multiplexer forwards | Accepted |
 | [0026](0026-a-fire-and-forget-child-must-still-be-reaped.md) | A fire-and-forget child must still be reaped, because a zombie costs a process-table slot | Accepted |
+| [0027](0027-anthropic-fast-mode-is-speed-not-service-tier.md) | Anthropic fast mode is the `speed` field, never `service_tier` | Accepted |
