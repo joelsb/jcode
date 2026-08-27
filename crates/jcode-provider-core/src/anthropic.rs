@@ -4,6 +4,12 @@ pub const ANTHROPIC_OAUTH_BETA_HEADERS: &str = "claude-code-20250219,oauth-2025-
 /// Claude Code OAuth beta headers with Anthropic's explicit 1M context beta.
 pub const ANTHROPIC_OAUTH_BETA_HEADERS_1M: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,context-1m-2025-08-07";
 
+/// Beta header value required to opt into Anthropic fast mode.
+///
+/// The API rejects the `speed` request field without it.
+/// See https://platform.claude.com/docs/en/build-with-claude/fast-mode
+pub const ANTHROPIC_FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
+
 /// How a Claude model exposes its 1M-token long-context window.
 ///
 /// These classifications were verified against the live Anthropic API on a
@@ -204,6 +210,26 @@ pub fn anthropic_oauth_beta_headers(model: &str) -> &'static str {
     } else {
         ANTHROPIC_OAUTH_BETA_HEADERS
     }
+}
+
+/// True when `model` supports Anthropic fast mode (the `speed: "fast"` request
+/// field plus the `fast-mode-2026-02-01` beta header).
+///
+/// Fast mode is NOT the `service_tier` parameter. `service_tier` selects
+/// Priority Tier, a capacity commitment affecting availability rather than
+/// speed, which is unsupported on Opus 5 and mutually exclusive with fast
+/// mode. Only Opus 5 and Opus 4.8 support fast mode: Opus 4.7 returns an
+/// error for `speed: "fast"`, and Opus 4.6 silently runs at standard speed
+/// while billing standard rates, so sending it there would quietly charge for
+/// a request that is never fast.
+pub fn anthropic_supports_fast_mode(model: &str) -> bool {
+    matches!(
+        anthropic_strip_1m_suffix(model)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "claude-opus-5" | "claude-opus-4-8"
+    )
 }
 
 /// How a Claude model exposes reasoning effort and thinking on the live
@@ -607,5 +633,30 @@ mod tests {
         // But old/unversioned ids stay conservative.
         assert!(!anthropic_reasoning_caps("claude-haiku-4-5").supports_reasoning_effort());
         assert!(!anthropic_reasoning_caps("claude-instant").supports_reasoning_effort());
+    }
+
+    #[test]
+    fn fast_mode_is_exactly_opus_5_and_opus_4_8() {
+        // Supported per https://platform.claude.com/docs/en/build-with-claude/fast-mode
+        assert!(anthropic_supports_fast_mode("claude-opus-5"));
+        assert!(anthropic_supports_fast_mode("claude-opus-4-8"));
+        // The `[1m]` alias must not change the answer.
+        assert!(anthropic_supports_fast_mode("claude-opus-5[1m]"));
+        assert!(anthropic_supports_fast_mode("claude-opus-4-8[1m]"));
+
+        // Opus 4.7 errors on speed:"fast"; Opus 4.6 silently downgrades and
+        // bills standard rates. Both must be treated as unsupported.
+        assert!(!anthropic_supports_fast_mode("claude-opus-4-7"));
+        assert!(!anthropic_supports_fast_mode("claude-opus-4-6"));
+        assert!(!anthropic_supports_fast_mode("claude-opus-4-5"));
+        assert!(!anthropic_supports_fast_mode("claude-sonnet-5"));
+        assert!(!anthropic_supports_fast_mode("claude-fable-5"));
+        assert!(!anthropic_supports_fast_mode("claude-haiku-4-5"));
+        assert!(!anthropic_supports_fast_mode(""));
+    }
+
+    #[test]
+    fn fast_mode_beta_header_matches_documented_value() {
+        assert_eq!(ANTHROPIC_FAST_MODE_BETA, "fast-mode-2026-02-01");
     }
 }
