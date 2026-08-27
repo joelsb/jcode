@@ -2291,6 +2291,145 @@ async fn read_request_authorization(socket: &mut tokio::net::TcpStream) -> Strin
         .unwrap_or_default()
 }
 
+/// Read one whole HTTP/1.1 request and return `(headers, body)` verbatim.
+///
+/// Needed by the fast-mode end-to-end test, which must assert on what actually
+/// went out on the wire: the `anthropic-beta` header and the JSON body. The
+/// `Authorization`-only reader above cannot answer either question.
+async fn read_full_request(socket: &mut tokio::net::TcpStream) -> (String, String) {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let headers_end = loop {
+        let n = socket.read(&mut tmp).await.unwrap_or(0);
+        if n == 0 {
+            return (String::new(), String::new());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+    };
+    let header_text = String::from_utf8_lossy(&buf[..headers_end]).to_string();
+    let content_length: usize = header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let body_start = headers_end + 4;
+    while buf.len() < body_start + content_length {
+        let n = socket.read(&mut tmp).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    let body = String::from_utf8_lossy(&buf[body_start..]).to_string();
+    (header_text, body)
+}
+
+/// End-to-end: a fast-mode request must carry `speed: "fast"` in the body and
+/// `fast-mode-2026-02-01` in the `anthropic-beta` header, and must NOT carry
+/// `service_tier`, which selects the mutually-exclusive Priority Tier.
+///
+/// This drives `run_stream_with_retries` exactly as production does, against a
+/// local listener standing in for api.anthropic.com, and asserts on the bytes
+/// that actually went out rather than on a serialized struct.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_fast_mode_request_carries_speed_and_beta_header() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+
+    let captured: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_task = Arc::clone(&captured);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let (headers, body) = read_full_request(&mut socket).await;
+            captured_task.lock().unwrap().push((headers, body));
+            let sse = mock_success_sse_body("ok");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n{sse}",
+                len = sse.len(),
+                sse = sse,
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+
+    set_test_api_url_override(Some(format!("http://{addr}/v1/messages")));
+
+    // Build the request the way the provider does with fast mode on.
+    let provider = AnthropicProvider::new();
+    *provider
+        .model
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "claude-opus-5".to_string();
+    provider.set_service_tier("priority").unwrap();
+
+    let mut request = e2e_test_request();
+    request.model = "claude-opus-5".to_string();
+    request.service_tier = None;
+    request.speed = provider.fast_speed_for_model("claude-opus-5");
+    assert_eq!(request.speed.as_deref(), Some("fast"));
+
+    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+    let model_state = Arc::new(std::sync::RwLock::new("claude-opus-5".to_string()));
+    run_stream_with_retries(
+        Client::new(),
+        "fixture-access-claude-1".to_string(),
+        true,
+        request,
+        tx,
+        Arc::new(RwLock::new(None)),
+        "claude-opus-5".to_string(),
+        "test-session".to_string(),
+        model_state,
+        DirectTransportConfig::from_env(),
+    )
+    .await;
+
+    set_test_api_url_override(None);
+    handle.abort();
+    while rx.recv().await.is_some() {}
+
+    let seen = captured.lock().unwrap();
+    let (headers, body) = seen.first().expect("the provider must have sent a request");
+
+    let beta = headers
+        .lines()
+        .find(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("anthropic-beta"))
+        })
+        .expect("request must carry an anthropic-beta header");
+    assert!(
+        beta.contains("fast-mode-2026-02-01"),
+        "beta header must opt into fast mode, got: {beta}"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(body).expect("body must be JSON");
+    assert_eq!(
+        parsed["speed"], "fast",
+        "body must request fast mode: {body}"
+    );
+    assert!(
+        parsed.get("service_tier").is_none(),
+        "fast mode must not send the mutually-exclusive Priority Tier: {body}"
+    );
+    assert_eq!(parsed["model"], "claude-opus-5");
+}
+
 fn mock_429_body() -> String {
     "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"this request would exceed your account's rate limit.\"}}".to_string()
 }

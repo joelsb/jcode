@@ -1343,6 +1343,7 @@ fn log_anthropic_canonical_input(
         "thinking": &request.thinking,
         "output_config": &request.output_config,
         "temperature": request.temperature,
+        "speed": &request.speed,
     });
 
     jcode_provider_core::fingerprint::log_provider_canonical_input(
