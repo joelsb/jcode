@@ -2963,6 +2963,10 @@ impl Provider for MultiProvider {
         self.auto_select_multi_account_for_provider(target);
         Ok(())
     }
+
+    fn activate_provider_for_account_switch(&self, provider: &str) -> Result<Option<String>> {
+        self.activate_provider_for_account_switch_inner(provider)
+    }
 }
 
 /// Get the prompt cache TTL in seconds for a given provider name.

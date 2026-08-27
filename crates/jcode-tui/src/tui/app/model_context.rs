@@ -66,6 +66,40 @@ impl App {
         Ok(self.finalize_model_switch(&active_model))
     }
 
+    /// Route this session onto the provider whose account was just selected.
+    ///
+    /// Picking an account states where work should run, but switching one only
+    /// re-points that provider's credential. A Claude session that switched to
+    /// an OpenAI account therefore stayed on Claude and sent the next turn to
+    /// the account it had just been rate-limited on, immediately after printing
+    /// "Switched to OpenAI account openai-1".
+    ///
+    /// Silent when that provider is already active, so an ordinary
+    /// claude-1 -> claude-2 switch does not announce a redundant model change.
+    pub(super) fn activate_provider_after_account_switch(&mut self, provider_key: &str) {
+        match self
+            .provider
+            .activate_provider_for_account_switch(provider_key)
+        {
+            Ok(None) => {}
+            Ok(Some(active_model)) => {
+                let model = self.finalize_model_switch(&active_model);
+                let provider_name = self.provider.display_name();
+                self.push_display_message(DisplayMessage::system(format!(
+                    "Session switched to {} on model {}.",
+                    provider_name, model
+                )));
+                self.set_status_notice(format!("Provider → {} ({})", provider_name, model));
+            }
+            // The credential switch already succeeded, so this is a notice
+            // rather than a failure of the whole command.
+            Err(error) => self.push_display_message(DisplayMessage::error(format!(
+                "Switched the {} account, but could not route this session to it: {}",
+                provider_key, error
+            ))),
+        }
+    }
+
     pub(super) fn cancel_pending_provider_failover(&mut self, notice: impl Into<String>) {
         let Some(pending) = self.pending_provider_failover.take() else {
             return;

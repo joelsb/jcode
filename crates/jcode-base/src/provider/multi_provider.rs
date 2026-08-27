@@ -2,6 +2,43 @@ use super::*;
 use anyhow::Result;
 
 impl MultiProvider {
+    /// Make `provider` the session's active provider after its credential was
+    /// re-pointed at a different account, returning the model now in force.
+    ///
+    /// Switching an account only changes *which credential* a provider slot
+    /// uses. It says nothing about which slot the next turn is routed to, so
+    /// `/account openai switch openai-1` from a Claude session used to leave the
+    /// session on Claude: the turn went straight back to the rate-limited
+    /// Anthropic account and 429'd again, while the UI had just reported a
+    /// successful switch to OpenAI. Picking an account is a statement about
+    /// where work should run, so activate the provider that owns it.
+    ///
+    /// Returns `Ok(None)` when the provider was already active (nothing to do)
+    /// so callers can stay quiet rather than announce a no-op switch.
+    ///
+    /// Deliberately does *not* run `auto_select_multi_account_for_provider`,
+    /// unlike [`Self::switch_active_provider_to`]. That helper re-picks the
+    /// account by usage probe, which would immediately overrule the account the
+    /// user just chose by hand.
+    pub(super) fn activate_provider_for_account_switch_inner(
+        &self,
+        provider_key: &str,
+    ) -> Result<Option<String>> {
+        let target = Self::parse_provider_hint(provider_key)
+            .ok_or_else(|| anyhow::anyhow!("Unknown provider `{}`", provider_key))?;
+        if self.active_provider() == target {
+            return Ok(None);
+        }
+        if !self.provider_is_configured(target) {
+            anyhow::bail!(
+                "Provider `{}` is not configured in this session",
+                Self::provider_key(target)
+            );
+        }
+        self.set_active_provider(target);
+        Ok(Some(self.model()))
+    }
+
     pub(super) async fn try_same_provider_account_failover(
         &self,
         provider: ActiveProvider,

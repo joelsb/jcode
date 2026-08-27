@@ -456,6 +456,17 @@ pub trait Provider: Send + Sync {
         ))
     }
 
+    /// Route the session to `provider` because the user just picked one of its
+    /// accounts, returning the model now in force, or `None` when that provider
+    /// was already active.
+    ///
+    /// Separate from [`Provider::switch_active_provider_to`] because that call
+    /// also re-picks the account from the usage probe, which would overrule the
+    /// account the user just chose by hand.
+    fn activate_provider_for_account_switch(&self, _provider: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Simple completion that returns text directly (no streaming).
     async fn complete_simple(&self, prompt: &str, system: &str) -> Result<String> {
         use futures::StreamExt;
