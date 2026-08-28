@@ -109,7 +109,7 @@ mod terminal_setup_command;
 mod todos_view;
 mod tui_lifecycle;
 mod tui_lifecycle_runtime;
-mod tui_state;
+pub(crate) mod tui_state;
 mod turn;
 mod turn_memory;
 mod turn_notify;

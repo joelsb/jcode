@@ -1334,6 +1334,22 @@ mod tests {
         assert!(!overscroll_provider_display("anthropic").contains("API"));
     }
 
+    /// An API-key route has no account, so it must never pick up an OAuth
+    /// account label from the shared helper. Getting this wrong would name a
+    /// credential the request does not use.
+    #[test]
+    fn only_oauth_methods_can_carry_an_account_label() {
+        use crate::tui::info_widget::AuthMethod;
+        assert!(overscroll_account_label(AuthMethod::AnthropicApiKey).is_none());
+        assert!(overscroll_account_label(AuthMethod::OpenAIApiKey).is_none());
+        assert!(overscroll_account_label(AuthMethod::ApiKey).is_none());
+        assert!(overscroll_account_label(AuthMethod::OpenRouterApiKey).is_none());
+        assert!(overscroll_account_label(AuthMethod::Unknown).is_none());
+        // Copilot and Gemini are OAuth but single-account: no label to add.
+        assert!(overscroll_account_label(AuthMethod::CopilotOAuth).is_none());
+        assert!(overscroll_account_label(AuthMethod::GeminiOAuth).is_none());
+    }
+
     #[test]
     fn session_history_warning_is_clear_and_occasional() {
         assert!(occasional_session_history_warning(249_999, 0, None, 100, 0).is_none());
@@ -1971,12 +1987,22 @@ pub(super) fn draw_overscroll_status(frame: &mut Frame, app: &dyn TuiState, area
         ));
     }
 
-    // Access method (auth)
+    // Access method (auth), and which account it resolves to when the user has
+    // several. Account failover rotates the whole daemon onto another account
+    // on a rate limit and says so only once, as a status line during the turn;
+    // from then on this bar was the only always-visible place that could have
+    // named the billed account, and it named the provider instead.
     if let Some((label, color)) = overscroll_auth_label(data.auth_method) {
         if !spans.is_empty() {
             spans.push(sep());
         }
         spans.push(Span::styled(label.to_string(), Style::default().fg(color)));
+        if let Some(account) = overscroll_account_label(data.auth_method) {
+            spans.push(Span::styled(
+                format!(" {}", account),
+                Style::default().fg(color),
+            ));
+        }
     }
 
     // Context usage as a rounded bar
@@ -2192,6 +2218,22 @@ fn overscroll_auth_label(
     }
 }
 
+/// Account label to show beside the auth badge, when there is one to show.
+///
+/// Only OAuth has accounts, and only a multi-account provider is ambiguous, so
+/// a single-account user's bar is unchanged. Deliberately keyed off the same
+/// `AuthMethod` the badge uses, so the pair can never disagree: an API-key
+/// route never picks up an OAuth account label.
+fn overscroll_account_label(method: crate::tui::info_widget::AuthMethod) -> Option<String> {
+    use crate::tui::info_widget::AuthMethod;
+    let provider = match method {
+        AuthMethod::AnthropicOAuth => jcode_provider_core::ActiveProvider::Claude,
+        AuthMethod::OpenAIOAuth => jcode_provider_core::ActiveProvider::OpenAI,
+        _ => return None,
+    };
+    crate::tui::app::tui_state::multi_account_label(provider)
+}
+
 fn overscroll_short_reasoning(effort: &str) -> Option<&str> {
     let effort = effort.trim();
     if effort.is_empty() {
@@ -2394,6 +2436,14 @@ fn right_fact_lines(app: &dyn TuiState) -> Vec<RightFactLine> {
             access.push(sep());
         }
         access.push(Span::styled(label.to_string(), right_fact_neutral_style()));
+        // Same account suffix the overscroll bar renders. Both surfaces show
+        // the same facts, so a rotation must not be visible on only one.
+        if let Some(account) = overscroll_account_label(data.auth_method) {
+            access.push(Span::styled(
+                format!(" {}", account),
+                right_fact_neutral_style(),
+            ));
+        }
     }
     if let Some(line) = RightFactLine::new(access) {
         lines.push(line);

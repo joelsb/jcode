@@ -70,7 +70,7 @@ struct WidgetRouteInfo {
 ///
 /// `None` for a single account, where the gauges are unambiguous and the label
 /// would be pure noise on every render.
-fn multi_account_label(provider: jcode_provider_core::ActiveProvider) -> Option<String> {
+pub(crate) fn multi_account_label(provider: jcode_provider_core::ActiveProvider) -> Option<String> {
     let (accounts, active) = match provider {
         jcode_provider_core::ActiveProvider::Claude => (
             crate::auth::claude::list_accounts()
