@@ -2218,20 +2218,13 @@ fn overscroll_auth_label(
     }
 }
 
-/// Account label to show beside the auth badge, when there is one to show.
+/// Account label to show beside the auth badge in this bar.
 ///
-/// Only OAuth has accounts, and only a multi-account provider is ambiguous, so
-/// a single-account user's bar is unchanged. Deliberately keyed off the same
-/// `AuthMethod` the badge uses, so the pair can never disagree: an API-key
-/// route never picks up an OAuth account label.
+/// Thin alias for the shared `auth_account_label`: the status bar, the side
+/// widget and the header must name the same account, so the rule lives in one
+/// place rather than being re-derived per surface.
 fn overscroll_account_label(method: crate::tui::info_widget::AuthMethod) -> Option<String> {
-    use crate::tui::info_widget::AuthMethod;
-    let provider = match method {
-        AuthMethod::AnthropicOAuth => jcode_provider_core::ActiveProvider::Claude,
-        AuthMethod::OpenAIOAuth => jcode_provider_core::ActiveProvider::OpenAI,
-        _ => return None,
-    };
-    crate::tui::app::tui_state::multi_account_label(provider)
+    crate::tui::info_widget::auth_account_label(method)
 }
 
 fn overscroll_short_reasoning(effort: &str) -> Option<&str> {

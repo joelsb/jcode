@@ -3,6 +3,29 @@ use super::{AuthMethod, InfoWidgetData};
 use crate::tui::color_support::rgb;
 use ratatui::prelude::*;
 
+/// Account label to append to an auth badge, when there is one worth showing.
+///
+/// Account failover rotates the whole daemon onto another account on a rate
+/// limit and announces it once, as a transient line during the turn. Every
+/// always-visible surface that shows a credential therefore has to show which
+/// account that credential resolves to, or the user reads "OAuth" and assumes
+/// the account they picked. Investigated 2026-08-28 after spend appeared on a
+/// second Anthropic account with no on-screen trace of the switch.
+///
+/// Keyed off `AuthMethod` rather than looking the provider up separately, so
+/// the badge and the account can never disagree: an API-key route resolves to
+/// no account and gets no label. Single-account providers (Copilot, Gemini, and
+/// an Anthropic user with one login) also get `None`, since there is nothing to
+/// disambiguate and the label would be noise on every frame.
+pub(crate) fn auth_account_label(method: AuthMethod) -> Option<String> {
+    let provider = match method {
+        AuthMethod::AnthropicOAuth => jcode_provider_core::ActiveProvider::Claude,
+        AuthMethod::OpenAIOAuth => jcode_provider_core::ActiveProvider::OpenAI,
+        _ => return None,
+    };
+    crate::tui::app::tui_state::multi_account_label(provider)
+}
+
 pub(super) fn render_model_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Line<'static>> {
     let Some(model) = &data.model else {
         return Vec::new();
@@ -145,10 +168,17 @@ pub(super) fn render_model_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
                 Span::styled(upstream.clone(), Style::default().fg(rgb(200, 180, 100))),
             ]));
         } else {
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!("{} ", icon), Style::default().fg(color)),
                 Span::styled(label, Style::default().fg(rgb(140, 140, 150))),
-            ]));
+            ];
+            if let Some(account) = auth_account_label(data.auth_method) {
+                spans.push(Span::styled(
+                    format!(" {}", account),
+                    Style::default().fg(rgb(140, 140, 150)),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
     }
 
@@ -245,6 +275,12 @@ pub(super) fn render_model_info(data: &InfoWidgetData, inner: Rect) -> Vec<Line<
                 format!("{} {}", icon, label),
                 Style::default().fg(rgb(140, 140, 150)),
             ));
+            if let Some(account) = auth_account_label(data.auth_method) {
+                detail_spans.push(Span::styled(
+                    format!(" {}", account),
+                    Style::default().fg(rgb(140, 140, 150)),
+                ));
+            }
         }
 
         if !detail_spans.is_empty() {
