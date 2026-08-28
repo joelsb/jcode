@@ -3043,6 +3043,68 @@ fn handle_tool_call_details_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
+/// `/images [on|off]` - inline transcript image visibility.
+///
+/// Exists because the keyboard toggle (Alt+Shift+I) is unreachable in macOS
+/// terminals that turn Option+Shift+I into the dead key `ˆ` and swallow it.
+/// The state is persisted in UI preferences, so a user who lands in `off`
+/// stays there across restarts with no keyboard way out; this command is the
+/// way out. Prefer explicit `on`/`off` over a blind toggle so the recovery
+/// path works even when the current state is not obvious on screen.
+pub(super) fn handle_images_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/images" && !trimmed.starts_with("/images ") {
+        return false;
+    }
+
+    let rest = trimmed.strip_prefix("/images").unwrap_or_default().trim();
+
+    if matches!(rest, "" | "show" | "status") {
+        let visible = app.inline_images_visible_state();
+        app.push_display_message(DisplayMessage::system(format!(
+            "Inline images are currently {}.\n\nWhen off, every image in the transcript collapses to a one-line label stub with a `show image` badge and nothing is painted.\n\nUse /images on or /images off to change it. The keyboard toggle is {}, but some macOS terminals swallow it as a dead key.",
+            if visible { "on" } else { "off" },
+            jcode_tui_core::keybind::alt_chord("Shift+I")
+        )));
+        return true;
+    }
+
+    if matches!(rest, "toggle") {
+        app.toggle_inline_images();
+        app.push_display_message(DisplayMessage::system(format!(
+            "Inline images: {}.",
+            if app.inline_images_visible_state() {
+                "on"
+            } else {
+                "off"
+            }
+        )));
+        return true;
+    }
+
+    let Some(visible) = parse_on_off_value(rest) else {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /images (show), /images on, /images off, or /images toggle".to_string(),
+        ));
+        return true;
+    };
+
+    app.set_inline_images_visible(visible);
+    app.set_status_notice(format!(
+        "Inline images: {}",
+        if visible { "on" } else { "off" }
+    ));
+    app.push_display_message(DisplayMessage::system(format!(
+        "Inline images {}. Saved as the default.",
+        if visible {
+            "shown"
+        } else {
+            "hidden (use /images on to bring them back)"
+        }
+    )));
+
+    true
+}
+
 fn handle_show_agentgrep_output_command(app: &mut App, trimmed: &str) -> bool {
     if trimmed != "/show-agentgrep-output" && !trimmed.starts_with("/show-agentgrep-output ") {
         return false;
@@ -3461,6 +3523,10 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
+    if handle_images_command(app, trimmed) {
+        return true;
+    }
+
     if handle_tool_call_details_command(app, trimmed) {
         return true;
     }
@@ -3819,3 +3885,7 @@ pub(super) fn handle_telemetry_command(app: &mut App, trimmed: &str) -> bool {
 #[cfg(test)]
 #[path = "commands_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/images_command.rs"]
+mod images_command_tests;

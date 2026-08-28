@@ -125,6 +125,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     ),
     RegisteredCommand::hidden("/thinking", "Alias for /thinking-display"),
     RegisteredCommand::hidden("/reasoning", "Alias for /thinking-display"),
+    RegisteredCommand::public(
+        "/images",
+        "Show/hide inline transcript images (on|off|toggle)",
+    ),
     RegisteredCommand::public("/cancel", "Cancel the current prompt or operation"),
     RegisteredCommand::public("/clear", "Clear conversation history"),
     RegisteredCommand::public("/cls", "Clear the view only, keeping context"),
@@ -1679,6 +1683,7 @@ impl App {
                 | "/reasoning"
                 | "/thinking"
                 | "/thinking-display"
+                | "/images"
                 | "/config"
                 | "/save"
                 | "/rename"

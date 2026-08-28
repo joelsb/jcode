@@ -279,6 +279,23 @@ pub(crate) fn clear_side_panel_for_new_session(app: &mut App) {
     app.diff_pane_scroll_x = 0;
 }
 
+/// Drop every transcript image belonging to the discarded session.
+///
+/// `remote_side_pane_images` is the client-side image set that inline
+/// rendering draws from. Clearing `display_messages` without clearing it
+/// leaves every old image with no anchor message to attach to, and images
+/// without a resolvable anchor deliberately fall back to the trailing
+/// "unplaced" inline section (`ui_prepare.rs`) so nothing silently
+/// disappears. After `/clear` that safety net inverts: the previous
+/// session's screenshots are re-rendered under every new message, forever,
+/// and they are re-sent to the model as visual context too. Shared by both
+/// `/clear` implementations so they cannot drift apart.
+pub(crate) fn clear_transcript_images_for_new_session(app: &mut App) {
+    app.remote_side_pane_images.clear();
+    app.interleave_images.clear();
+    app.invalidate_side_pane_images_signature();
+}
+
 pub(super) fn reset_current_session(app: &mut App) {
     app.session.mark_closed();
     let _ = app.session.save();
@@ -305,6 +322,7 @@ pub(super) fn reset_current_session(app: &mut App) {
     app.queued_messages.clear();
     app.pasted_contents.clear();
     app.pending_images.clear();
+    clear_transcript_images_for_new_session(app);
     app.active_skill = None;
     app.improve_mode = None;
     let mut session = Session::create(None, None);
@@ -1104,3 +1122,7 @@ pub(super) enum RefactorCommand {
 #[cfg(test)]
 #[path = "tests/issue_605_clear_side_panel.rs"]
 mod issue_605_clear_side_panel_tests;
+
+#[cfg(test)]
+#[path = "tests/clear_drops_transcript_images.rs"]
+mod clear_drops_transcript_images_tests;

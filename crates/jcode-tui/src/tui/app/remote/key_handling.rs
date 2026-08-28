@@ -922,6 +922,14 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
+                // Inline-image visibility is pure client render state (it lives
+                // in the client's UI preferences, not the session), so it must
+                // be handled here rather than forwarded to the server, which
+                // has no notion of it and would answer "unknown command".
+                if app_mod::commands::handle_images_command(app, trimmed) {
+                    return Ok(());
+                }
+
                 if handle_remote_rewind_command(app, remote, trimmed).await? {
                     return Ok(());
                 }
@@ -1657,6 +1665,7 @@ async fn handle_remote_key_internal(
                     app.queued_messages.clear();
                     app.pasted_contents.clear();
                     app.pending_images.clear();
+                    super::super::commands_review::clear_transcript_images_for_new_session(app);
                     app.clear_streaming_render_state();
                     app.clear_live_usage_state();
                     // Full transcript discard: diagrams and side panel pages

@@ -1031,8 +1031,25 @@ impl App {
             "Inline images: ON".to_string()
         } else {
             let alt = jcode_tui_core::keybind::alt_chord("Shift+I");
-            format!("Inline images: hidden ({alt} to show)")
+            format!("Inline images: hidden ({alt} or /images on to show)")
         });
+    }
+
+    /// Set inline-image visibility explicitly (used by `/images on|off`).
+    ///
+    /// The keyboard toggle is Alt+Shift+I, which several macOS terminals
+    /// deliver as the dead key `ˆ` and swallow entirely, so a user who lands
+    /// in the hidden state has no keyboard route back. `/images` is that
+    /// route, and it must not be a blind toggle: the caller says which state
+    /// it wants.
+    pub(super) fn set_inline_images_visible(&mut self, visible: bool) {
+        self.inline_images_visible = visible;
+        super::ui_prefs::save_inline_images_visible(visible);
+    }
+
+    /// Current inline-image visibility, for command status output.
+    pub(super) fn inline_images_visible_state(&self) -> bool {
+        self.inline_images_visible
     }
 
     /// Toggle the per-image inline expand level (Fit <-> Large) for
