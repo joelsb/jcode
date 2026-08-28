@@ -1350,6 +1350,29 @@ mod tests {
         assert!(overscroll_account_label(AuthMethod::GeminiOAuth).is_none());
     }
 
+    /// The provider is hidden only where the account label replaces it. An
+    /// API-key route has no account, so dropping its provider would leave
+    /// "Opus 5 · API key" unable to say whether the key is Anthropic's or
+    /// OpenRouter's - the exact information the provider word carries.
+    #[test]
+    fn provider_is_only_suppressed_when_an_account_names_it() {
+        use crate::tui::info_widget::AuthMethod;
+        // No account -> provider must still be available to render.
+        for method in [
+            AuthMethod::AnthropicApiKey,
+            AuthMethod::OpenAIApiKey,
+            AuthMethod::OpenRouterApiKey,
+            AuthMethod::CopilotOAuth,
+            AuthMethod::GeminiOAuth,
+            AuthMethod::Unknown,
+        ] {
+            assert!(
+                overscroll_account_label(method).is_none(),
+                "{method:?} must not suppress the provider"
+            );
+        }
+    }
+
     #[test]
     fn session_history_warning_is_clear_and_occasional() {
         assert!(occasional_session_history_warning(249_999, 0, None, 100, 0).is_none());
@@ -1924,10 +1947,10 @@ pub(super) fn draw_notification(frame: &mut Frame, app: &dyn TuiState, area: Rec
 }
 
 /// Draw the elastic overscroll status line, revealed below the input when the
-/// user scrolls past the bottom of the transcript. Shows model, provider,
-/// access method, reasoning level, and context usage percentage, with a live
-/// `(overscroll x.x)` countdown pinned to the right so users can see the line
-/// is temporary and rebounds away on its own.
+/// user scrolls past the bottom of the transcript. Shows model, access method
+/// and account, reasoning level, and context usage percentage, with a live
+/// countdown pinned to the right so users can see the line is temporary and
+/// rebounds away on its own.
 pub(super) fn draw_overscroll_status(frame: &mut Frame, app: &dyn TuiState, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -1938,9 +1961,14 @@ pub(super) fn draw_overscroll_status(frame: &mut Frame, app: &dyn TuiState, area
 
     // The countdown is the priority affordance: it explains the line exists and
     // is going away. Build it first so it always gets space on the right edge.
+    //
+    // The number alone carries that: a figure ticking down needs no noun, and
+    // the word "overscroll" cost ~13 columns on every frame of a line whose
+    // whole problem is width. The parenthesised italic styling is what still
+    // reads it as an ephemeral annotation rather than another fact.
     let countdown: Option<Span> = app.chat_overscroll_remaining().map(|secs| {
         Span::styled(
-            format!("(overscroll {:.1})", secs.max(0.0)),
+            format!("({:.1})", secs.max(0.0)),
             Style::default().fg(rgb(150, 150, 165)).italic(),
         )
     });
@@ -1971,13 +1999,25 @@ pub(super) fn draw_overscroll_status(frame: &mut Frame, app: &dyn TuiState, area
         }
     }
 
-    // Provider
+    // Provider, unless the account label already implies it.
+    //
+    // An account label is namespaced by provider (`claude-2`, `openai-1`), so
+    // "OAuth claude-2" cannot mean anything but Anthropic and the provider word
+    // beside it is pure repetition on a line that is short of columns. Where
+    // there is no account - an API key, OpenRouter, Bedrock - the provider is
+    // the only thing distinguishing the routes and is still shown, because
+    // "Opus 5 · API key" would not say whether that key is Anthropic's or
+    // OpenRouter's.
+    let account_label = overscroll_account_label(data.auth_method);
     let provider = data
         .provider_name
         .clone()
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| app.provider_name());
-    if !provider.is_empty() && !overscroll_is_runtime_placeholder(&provider) {
+    if account_label.is_none()
+        && !provider.is_empty()
+        && !overscroll_is_runtime_placeholder(&provider)
+    {
         if !spans.is_empty() {
             spans.push(sep());
         }
@@ -1997,7 +2037,7 @@ pub(super) fn draw_overscroll_status(frame: &mut Frame, app: &dyn TuiState, area
             spans.push(sep());
         }
         spans.push(Span::styled(label.to_string(), Style::default().fg(color)));
-        if let Some(account) = overscroll_account_label(data.auth_method) {
+        if let Some(account) = account_label {
             spans.push(Span::styled(
                 format!(" {}", account),
                 Style::default().fg(color),
@@ -2413,12 +2453,18 @@ fn right_fact_lines(app: &dyn TuiState) -> Vec<RightFactLine> {
     let mut lines = Vec::with_capacity(4);
 
     let mut access = Vec::new();
+    // Provider suppressed when the account names it, exactly as in the
+    // overscroll bar; see the comment there for why an API key still shows it.
+    let account_label = overscroll_account_label(data.auth_method);
     let provider = data
         .provider_name
         .clone()
         .filter(|provider| !provider.trim().is_empty())
         .unwrap_or_else(|| app.provider_name());
-    if !provider.is_empty() && !overscroll_is_runtime_placeholder(&provider) {
+    if account_label.is_none()
+        && !provider.is_empty()
+        && !overscroll_is_runtime_placeholder(&provider)
+    {
         access.push(Span::styled(
             overscroll_provider_display(&provider),
             right_fact_neutral_style(),
@@ -2431,7 +2477,7 @@ fn right_fact_lines(app: &dyn TuiState) -> Vec<RightFactLine> {
         access.push(Span::styled(label.to_string(), right_fact_neutral_style()));
         // Same account suffix the overscroll bar renders. Both surfaces show
         // the same facts, so a rotation must not be visible on only one.
-        if let Some(account) = overscroll_account_label(data.auth_method) {
+        if let Some(account) = account_label {
             access.push(Span::styled(
                 format!(" {}", account),
                 right_fact_neutral_style(),

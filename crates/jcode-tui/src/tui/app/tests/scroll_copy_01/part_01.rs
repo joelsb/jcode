@@ -1133,6 +1133,29 @@ fn test_ctrl_digit_side_panel_preset_in_app() {
     assert_eq!(app.diagram_pane_ratio_target, 100);
 }
 
+/// Whether a rendered frame shows the overscroll countdown.
+///
+/// Matches the countdown's shape, `(<digits>.<digit>)`, not a literal label:
+/// the word "overscroll" was dropped from it to save ~13 columns on a line
+/// whose whole constraint is width, and a test pinned to the old wording would
+/// have failed for a purely cosmetic reason while testing nothing real.
+fn contains_overscroll_countdown(frame: &str) -> bool {
+    let bytes = frame.as_bytes();
+    (0..bytes.len()).any(|start| {
+        if bytes[start] != b'(' {
+            return false;
+        }
+        let rest = &bytes[start + 1..];
+        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 {
+            return false;
+        }
+        matches!(rest.get(digits), Some(b'.'))
+            && rest.get(digits + 1).is_some_and(u8::is_ascii_digit)
+            && matches!(rest.get(digits + 2), Some(b')'))
+    })
+}
+
 #[test]
 fn test_chat_overscroll_reveals_status_line_then_rebounds() {
     let _lock = scroll_render_test_lock();
@@ -1148,12 +1171,13 @@ fn test_chat_overscroll_reveals_status_line_then_rebounds() {
 
     // Pinned to the bottom: no overscroll line yet. (The idle status line now
     // renders its own short ▰▱ context bar, so the overscroll-specific
-    // affordance to assert on is the `(overscroll x.x)` countdown, not the
-    // glyphs alone.)
+    // affordance to assert on is the parenthesised countdown, not the glyphs
+    // alone. The countdown dropped its "overscroll" word to save columns, so
+    // this matches its *shape* - `(1.5)` - rather than a literal label.)
     let pinned = render_and_snap(&app, &mut terminal);
     assert!(!app.chat_overscroll_active(), "should start without overscroll");
     assert!(
-        !pinned.contains("(overscroll"),
+        !contains_overscroll_countdown(&pinned),
         "overscroll countdown should be hidden while pinned: {pinned:?}"
     );
 
@@ -1170,7 +1194,7 @@ fn test_chat_overscroll_reveals_status_line_then_rebounds() {
     );
     let revealed = render_and_snap(&app, &mut terminal);
     assert!(
-        revealed.contains("(overscroll"),
+        contains_overscroll_countdown(&revealed),
         "overscroll status line should show the countdown affordance: {revealed:?}"
     );
 

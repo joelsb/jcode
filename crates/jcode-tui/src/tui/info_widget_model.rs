@@ -243,11 +243,17 @@ pub(super) fn render_model_info(data: &InfoWidgetData, inner: Rect) -> Vec<Line<
     if has_provider || has_auth {
         let mut detail_spans: Vec<Span> = Vec::new();
 
+        // Provider suppressed when the account label names it: `claude-2` is
+        // already provider-namespaced, so "claude · OAuth claude-2" said the
+        // same thing twice. An API-key or OpenRouter route has no account and
+        // keeps the provider, which is the only thing separating those routes.
+        let account_label = auth_account_label(data.auth_method);
         if let Some(provider) = data
             .provider_name
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .filter(|_| account_label.is_none())
         {
             detail_spans.push(Span::styled(
                 provider.to_lowercase(),
@@ -275,7 +281,7 @@ pub(super) fn render_model_info(data: &InfoWidgetData, inner: Rect) -> Vec<Line<
                 format!("{} {}", icon, label),
                 Style::default().fg(rgb(140, 140, 150)),
             ));
-            if let Some(account) = auth_account_label(data.auth_method) {
+            if let Some(account) = account_label {
                 detail_spans.push(Span::styled(
                     format!(" {}", account),
                     Style::default().fg(rgb(140, 140, 150)),
