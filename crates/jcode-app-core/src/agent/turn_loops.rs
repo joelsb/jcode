@@ -793,6 +793,12 @@ impl Agent {
                     output_tokens: self.last_usage.output_tokens,
                     cache_read_input_tokens: self.last_usage.cache_read_input_tokens,
                     cache_creation_input_tokens: self.last_usage.cache_creation_input_tokens,
+                    // Resolved here, per message, because account failover can
+                    // rotate mid-session; the session-level value would be wrong
+                    // for exactly the messages that followed a rotation.
+                    account_label: jcode_base::session::active_account_label_for_provider(
+                        self.provider.name(),
+                    ),
                 });
                 let message_id =
                     self.add_message_ext(Role::Assistant, content_blocks, None, token_usage);

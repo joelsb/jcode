@@ -255,6 +255,19 @@ pub struct StoredTokenUsage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Which authenticated account was billed for **this message**, e.g.
+    /// `claude-1`, `claude-2`, `openai-1`.
+    ///
+    /// Per-message and not per-session on purpose: account failover
+    /// (`prefer_account_failover`) rotates on a rate-limit error *mid-turn*, so
+    /// one session can legitimately bill two accounts. Recording it on the
+    /// session would misattribute exactly the spend that happens once a window
+    /// is exhausted, which is when the number matters most.
+    ///
+    /// `None` for sessions written before this field existed, and for providers
+    /// with no account identity (OpenRouter routes, local models).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1062,5 +1075,61 @@ mod session_search_tests {
         let fenced = session_search_markdown_code_block("contains ``` fence");
         assert!(fenced.starts_with("````text\n"));
         assert!(fenced.ends_with("\n````"));
+    }
+}
+
+#[cfg(test)]
+mod account_attribution_tests {
+    use super::*;
+
+    /// Pulse reads `account_label` out of each message's `token_usage` to bill
+    /// a jcode session to the right account tab. That is a cross-process
+    /// contract over a JSON key name, so it is pinned here: renaming the field
+    /// must fail a test in this repo, not silently misattribute usage in
+    /// another one.
+    #[test]
+    fn account_label_round_trips_under_its_wire_name() {
+        let usage = StoredTokenUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_input_tokens: Some(30),
+            cache_creation_input_tokens: Some(40),
+            account_label: Some("claude-2".to_string()),
+        };
+        let json = serde_json::to_string(&usage).expect("serialize");
+        assert!(
+            json.contains("\"account_label\":\"claude-2\""),
+            "Pulse reads the snake_case key verbatim, got: {json}"
+        );
+
+        let parsed: StoredTokenUsage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.account_label.as_deref(), Some("claude-2"));
+    }
+
+    /// Every session written before the field existed must still load. Failing
+    /// this would make Pulse's entire pre-change history unreadable, not merely
+    /// unattributed.
+    #[test]
+    fn sessions_without_the_field_still_decode() {
+        let legacy = r#"{"input_tokens":1,"output_tokens":2}"#;
+        let parsed: StoredTokenUsage = serde_json::from_str(legacy).expect("legacy decode");
+        assert_eq!(parsed.account_label, None);
+        assert_eq!(parsed.input_tokens, 1);
+    }
+
+    /// A `None` label must not emit the key at all: Pulse treats "absent" as
+    /// unattributed history, and an explicit null would be a third state
+    /// neither side agreed on.
+    #[test]
+    fn absent_label_is_omitted_not_null() {
+        let usage = StoredTokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            account_label: None,
+        };
+        let json = serde_json::to_string(&usage).expect("serialize");
+        assert!(!json.contains("account_label"), "got: {json}");
     }
 }

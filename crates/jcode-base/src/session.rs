@@ -318,6 +318,39 @@ pub fn derive_session_provider_key(provider_name: &str) -> Option<String> {
     Some(fallback.to_string())
 }
 
+/// The account that will be billed for a request issued *right now* against
+/// `provider_name`, e.g. `claude-1`, `claude-2`, `openai-1`.
+///
+/// Resolved per message rather than per session: `prefer_account_failover`
+/// rotates accounts on a rate-limit error mid-turn, so a session's later
+/// messages can bill a different account than its first. Callers record the
+/// result alongside the message's token usage.
+///
+/// Deliberately matches on the provider's **own** name and NOT on
+/// `derive_session_provider_key`. That function answers a different question -
+/// which routing/cache namespace a session belongs to - and it lets
+/// `JCODE_RUNTIME_PROVIDER` override the answer. Routing an Anthropic request
+/// through an OpenAI-compatible endpoint sets that variable to `openai` while
+/// the request still authenticates against, and bills, an Anthropic account.
+/// Going through it labelled real Anthropic usage `openai-1` (observed
+/// 2026-08-27 in session_calf_1787854350087).
+///
+/// `None` when the provider has no account identity of ours (OpenRouter routes,
+/// local models, generic `openai-compatible` endpoints): those are attributable
+/// to a provider but not to one of our accounts, and inventing a label would be
+/// worse than admitting we do not know.
+pub fn active_account_label_for_provider(provider_name: &str) -> Option<String> {
+    match provider_name.trim().to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" | "claude cli" | "claude-oauth" => {
+            crate::auth::claude::active_account_label()
+                .or_else(|| Some(crate::auth::claude::primary_account_label()))
+        }
+        "openai" | "codex" | "openai-oauth" => crate::auth::codex::active_account_label()
+            .or_else(|| Some(crate::auth::codex::primary_account_label())),
+        _ => None,
+    }
+}
+
 impl Session {
     fn session_from_startup_stub(stub: SessionStartupStub) -> Self {
         let mut session = Self::create_with_id(stub.id, stub.parent_id, stub.title);
@@ -1257,7 +1290,15 @@ request in this new forked session, using the inherited conversation only as con
         id
     }
 
-    pub fn append_stored_message(&mut self, message: StoredMessage) {
+    pub fn append_stored_message(&mut self, mut message: StoredMessage) {
+        // Redact credential-shaped strings before the message enters the array
+        // that gets serialised to disk. This is the only chokepoint that sees
+        // the actual bytes: the `post_tool` hook is an observer dispatched after
+        // the fact and cannot rewrite anything, and a `pre_tool` gate sees the
+        // command but not what it will print. The model has already received
+        // the unredacted output for this turn, so redacting here removes the
+        // durable copy without breaking work in flight.
+        redact_stored_message(&mut message);
         self.memory_profile_cache.messages_count += 1;
         self.memory_profile_cache.messages_json_bytes += estimate_json_bytes(&message);
         self.memory_profile_cache
@@ -1652,3 +1693,25 @@ struct RemoteStartupSessionSnapshot {
 #[cfg(test)]
 #[path = "session_tests/mod.rs"]
 mod tests;
+
+/// Strips credentials from every text-bearing block of a message about to be
+/// persisted. Tool results are the realistic source (a command printing an auth
+/// file), but assistant and user text are covered too: a model that echoes a
+/// token back, or a user who pastes one, produces the same durable leak.
+fn redact_stored_message(message: &mut StoredMessage) {
+    for block in &mut message.content {
+        match block {
+            ContentBlock::ToolResult { content, .. } => {
+                if let Some(clean) = jcode_message_types::redaction::redact_credentials(content) {
+                    *content = clean;
+                }
+            }
+            ContentBlock::Text { text, .. } => {
+                if let Some(clean) = jcode_message_types::redaction::redact_credentials(text) {
+                    *text = clean;
+                }
+            }
+            _ => {}
+        }
+    }
+}

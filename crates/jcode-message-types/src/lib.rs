@@ -1,3 +1,6 @@
+#[path = "redaction.rs"]
+pub mod redaction;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     #[serde(default)]
