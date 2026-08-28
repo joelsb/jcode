@@ -58,6 +58,40 @@ struct WidgetRouteInfo {
     is_remote: bool,
 }
 
+/// Active account label for `provider`, but only when the user has more than
+/// one account there.
+///
+/// Names the account the limit gauges describe. Account failover rotates the
+/// whole daemon onto another account on a rate limit, and announces it once as
+/// a transient line during the turn; from then on the gauges silently describe
+/// a different account than the user believes they are on. Investigated on
+/// 2026-08-28 after spend appeared on a second Anthropic account with no
+/// on-screen trace of the switch.
+///
+/// `None` for a single account, where the gauges are unambiguous and the label
+/// would be pure noise on every render.
+fn multi_account_label(provider: jcode_provider_core::ActiveProvider) -> Option<String> {
+    let (accounts, active) = match provider {
+        jcode_provider_core::ActiveProvider::Claude => (
+            crate::auth::claude::list_accounts()
+                .unwrap_or_default()
+                .len(),
+            crate::auth::claude::active_account_label(),
+        ),
+        jcode_provider_core::ActiveProvider::OpenAI => (
+            crate::auth::codex::list_accounts()
+                .unwrap_or_default()
+                .len(),
+            crate::auth::codex::active_account_label(),
+        ),
+        _ => return None,
+    };
+    if accounts < 2 {
+        return None;
+    }
+    active.filter(|label| !label.trim().is_empty())
+}
+
 impl App {
     fn sanitize_remote_model_hint(model: Option<String>) -> Option<String> {
         model
@@ -422,6 +456,7 @@ impl App {
             cache_write_tokens: self.streaming.streaming_cache_creation_tokens,
             output_tps,
             available: true,
+            account_label: None,
         };
 
         match route.provider {
@@ -442,6 +477,7 @@ impl App {
                 cache_write_tokens: None,
                 output_tps,
                 available: display_input_tokens > 0 || display_output_tokens > 0,
+                account_label: None,
             }),
             WidgetProviderKind::Anthropic => {
                 match auth_method {
@@ -470,6 +506,7 @@ impl App {
                     cache_write_tokens: None,
                     output_tps,
                     available: usage.last_error.is_none(),
+                    account_label: multi_account_label(jcode_provider_core::ActiveProvider::Claude),
                 })
             }
             WidgetProviderKind::OpenAI => {
@@ -522,6 +559,7 @@ impl App {
                     cache_write_tokens: None,
                     output_tps,
                     available: openai_usage.has_limits(),
+                    account_label: multi_account_label(jcode_provider_core::ActiveProvider::OpenAI),
                 })
             }
             WidgetProviderKind::Gemini => None,

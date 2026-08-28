@@ -64,6 +64,7 @@ pub(crate) use todos_render::swarm_plan_todos;
 use todos_render::{render_todos_compact, render_todos_expanded, render_todos_widget};
 #[cfg(test)]
 use usage_render::render_usage_pill;
+pub(crate) use usage_render::usage_header_label;
 use usage_render::{render_context_usage_line, render_usage_compact, render_usage_widget};
 
 /// Types of info widgets that can be displayed
@@ -379,6 +380,13 @@ pub struct UsageInfo {
     pub output_tps: Option<f32>,
     /// Whether data was successfully fetched / available to show
     pub available: bool,
+    /// Which account these limits describe, when the provider has several.
+    ///
+    /// `None` with a single account: the gauges can only mean that one, and
+    /// naming it is noise. With two or more, an unnamed gauge is actively
+    /// misleading after an account failover, because the rotation is silent
+    /// once its turn ends.
+    pub account_label: Option<String>,
 }
 
 /// Session-level KV cache telemetry for providers that report cache usage.

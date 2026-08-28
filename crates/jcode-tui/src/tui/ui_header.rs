@@ -486,6 +486,60 @@ fn header_provider_auth_tag(
     }
 }
 
+/// Provider name for the header, replaced by the *active account* label when
+/// the user has more than one account on that provider.
+///
+/// Account failover is silent after the fact: a rate limit on `claude-1`
+/// rotates the whole daemon onto `claude-2` and the switch is announced once,
+/// as a transient status line during the turn. Hours later the only durable
+/// record is `active_anthropic_account` in `auth.json`, so a user reading the
+/// usage gauges has no way to know which account those gauges describe. That
+/// cost a real investigation on 2026-08-28: unexplained spend on a second
+/// account, with the header still reading a generic `oauth:claude`.
+///
+/// Only for OAuth, and only with several accounts configured. An API key has no
+/// account label, and a single-account user gains nothing from seeing `-1`
+/// appended to every render.
+///
+/// Pure so the policy is testable without a credential store: the caller owns
+/// the lookup.
+fn header_provider_display_name(
+    name: &str,
+    auth_tag: &str,
+    account_count: usize,
+    active_account: Option<&str>,
+) -> String {
+    if auth_tag != "oauth" || account_count < 2 {
+        return name.to_string();
+    }
+    match active_account {
+        Some(label) if !label.trim().is_empty() => label.trim().to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Accounts configured for a provider, and which one the next request uses.
+///
+/// Reads the same override the rotation writes, so a daemon-side switch is
+/// reflected here as soon as the client mirrors the event.
+fn header_provider_accounts(name: &str) -> (usize, Option<String>) {
+    match jcode_provider_core::parse_provider_hint(name) {
+        Some(jcode_provider_core::ActiveProvider::Claude) => (
+            crate::auth::claude::list_accounts()
+                .map(|accounts| accounts.len())
+                .unwrap_or(0),
+            crate::auth::claude::active_account_label(),
+        ),
+        Some(jcode_provider_core::ActiveProvider::OpenAI) => (
+            crate::auth::codex::list_accounts()
+                .map(|accounts| accounts.len())
+                .unwrap_or(0),
+            crate::auth::codex::active_account_label(),
+        ),
+        _ => (0, None),
+    }
+}
+
 fn header_provider_label(
     provider_name: &str,
     auth: &AuthStatus,
@@ -497,10 +551,13 @@ fn header_provider_label(
     }
     let name = trimmed.to_lowercase();
     let auth_tag = header_provider_auth_tag(&name, auth, active);
+    let (account_count, active_account) = header_provider_accounts(&name);
+    let display =
+        header_provider_display_name(&name, auth_tag, account_count, active_account.as_deref());
     if auth_tag.is_empty() {
-        name
+        display
     } else {
-        format!("{}:{}", auth_tag, name)
+        format!("{}:{}", auth_tag, display)
     }
 }
 
@@ -1005,6 +1062,58 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::sync::OnceLock;
+
+    /// The whole point of the feature: with two accounts, the header names the
+    /// one that will actually be billed, not the provider family.
+    #[test]
+    fn header_names_the_active_account_when_several_exist() {
+        assert_eq!(
+            header_provider_display_name("claude", "oauth", 2, Some("claude-2")),
+            "claude-2"
+        );
+        assert_eq!(
+            header_provider_display_name("openai", "oauth", 3, Some("openai-1")),
+            "openai-1"
+        );
+    }
+
+    /// One account cannot be ambiguous, so the label would be noise on every
+    /// single render.
+    #[test]
+    fn a_single_account_keeps_the_plain_provider_name() {
+        assert_eq!(
+            header_provider_display_name("claude", "oauth", 1, Some("claude-1")),
+            "claude"
+        );
+        assert_eq!(
+            header_provider_display_name("claude", "oauth", 0, None),
+            "claude"
+        );
+    }
+
+    /// An API key is not an account. Showing an OAuth account label next to a
+    /// key-authenticated request would name the wrong credential entirely.
+    #[test]
+    fn an_api_key_never_borrows_an_oauth_account_label() {
+        assert_eq!(
+            header_provider_display_name("claude", "api-key", 2, Some("claude-2")),
+            "claude"
+        );
+    }
+
+    /// A missing or blank override must degrade to the provider name rather
+    /// than rendering an empty tag like `oauth:`.
+    #[test]
+    fn a_blank_active_label_falls_back_to_the_provider() {
+        assert_eq!(
+            header_provider_display_name("claude", "oauth", 2, None),
+            "claude"
+        );
+        assert_eq!(
+            header_provider_display_name("claude", "oauth", 2, Some("   ")),
+            "claude"
+        );
+    }
 
     struct MockProvider;
 

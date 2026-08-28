@@ -57,7 +57,7 @@ pub(super) fn render_usage_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
                 .map(crate::usage::format_reset_time);
 
             let mut lines = Vec::new();
-            let label = info.provider.label();
+            let label = usage_header_label(info);
             if !label.is_empty() {
                 lines.push(Line::from(vec![Span::styled(
                     format!("{} limits", label),
@@ -104,6 +104,20 @@ pub(super) fn render_usage_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
     }
 }
 
+/// Heading above the limit bars: the account when one is named, otherwise the
+/// provider.
+///
+/// The account replaces the provider rather than sitting beside it. "Anthropic
+/// limits" and "claude-2 limits" answer the same question, and the second
+/// answers it precisely; printing both spends a scarce widget line on a word
+/// the model line already carries.
+pub(crate) fn usage_header_label(info: &UsageInfo) -> String {
+    match info.account_label.as_deref() {
+        Some(account) if !account.trim().is_empty() => account.trim().to_string(),
+        _ => info.provider.label().to_string(),
+    }
+}
+
 pub(super) fn render_usage_compact(info: &UsageInfo, width: u16) -> Vec<Line<'static>> {
     if !info.available {
         return Vec::new();
@@ -135,7 +149,7 @@ pub(super) fn render_usage_compact(info: &UsageInfo, width: u16) -> Vec<Line<'st
         .map(crate::usage::format_reset_time);
 
     let mut lines = Vec::new();
-    let label = info.provider.label();
+    let label = usage_header_label(info);
     if !label.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             format!("{} limits", label),
@@ -298,6 +312,50 @@ mod tests {
         assert!(!text.contains("5-hour"));
         assert!(!text.contains("Weekly"));
         assert_eq!(lines.len(), 2); // Provider label plus one quota bar.
+    }
+
+    /// After an account failover the gauges describe a different account than
+    /// the one the user chose, and nothing else on screen says so.
+    #[test]
+    fn the_heading_names_the_account_when_one_is_known() {
+        let info = UsageInfo {
+            provider: UsageProvider::Anthropic,
+            primary_limit_label: Some("5-hour".to_string()),
+            five_hour: 0.42,
+            available: true,
+            account_label: Some("claude-2".to_string()),
+            ..Default::default()
+        };
+
+        let text = render_usage_compact(&info, 40)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("claude-2 limits"), "got: {text}");
+        assert!(!text.contains("Anthropic limits"), "got: {text}");
+    }
+
+    /// A single-account user sees exactly what they saw before.
+    #[test]
+    fn the_heading_falls_back_to_the_provider_without_an_account() {
+        let info = UsageInfo {
+            provider: UsageProvider::Anthropic,
+            primary_limit_label: Some("5-hour".to_string()),
+            five_hour: 0.42,
+            available: true,
+            account_label: None,
+            ..Default::default()
+        };
+
+        let text = render_usage_compact(&info, 40)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Anthropic limits"), "got: {text}");
     }
 }
 

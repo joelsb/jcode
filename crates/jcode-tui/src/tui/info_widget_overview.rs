@@ -175,7 +175,9 @@ fn compact_usage_height(data: &InfoWidgetData) -> u16 {
         }
         // Subscription-style providers render an optional provider label plus
         // whichever primary, secondary, and Spark windows are actually present.
-        let label = info.provider.label();
+        // Same heading helper the renderer uses, so an account label can
+        // never make the reserved height disagree with what is drawn.
+        let label = super::info_widget::usage_header_label(info);
         let label_line = u16::from(!label.is_empty());
         let primary_line = u16::from(info.primary_limit_label.is_some());
         let secondary_line = u16::from(info.secondary_limit_label.is_some());
