@@ -541,8 +541,10 @@ pub(super) async fn execute_debug_command(
             .trim()
             .to_lowercase();
         let claude_usage = crate::usage::get_sync();
-        let claude_usage_exhausted =
-            claude_usage.five_hour >= 0.99 && claude_usage.seven_day >= 0.99;
+        // Disjunction via `UsageData::exhausted` (ADR-0016): either window being
+        // spent blocks the account. Was a local `&&` copy, which reported
+        // headroom for a weekly-only exhaustion.
+        let claude_usage_exhausted = claude_usage.exhausted();
         let default_model = match provider.as_str() {
             "claude" | "anthropic" => {
                 if claude_usage_exhausted {
