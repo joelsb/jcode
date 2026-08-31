@@ -174,6 +174,29 @@ impl App {
             .provider
             .cross_provider_failover
         {
+            // A new daemon never emits a prompt in automatic mode: it crosses
+            // providers inside `complete_with_failover`. Keep this client-side
+            // path for mixed-version local sessions where an older daemon still
+            // asks the client to perform the switch.
+            crate::config::CrossProviderFailoverMode::Automatic if !self.is_remote => {
+                match self.apply_provider_switch_for_failover(&prompt) {
+                    Ok(active_model) => {
+                        self.push_display_message(DisplayMessage::system(format!(
+                            "⚡ Auto-switched provider: {} → {}.\n\nResending {} on model {}.",
+                            prompt.from_label, prompt.to_label, input_summary, active_model,
+                        )));
+                        self.set_status_notice(format!(
+                            "Provider → {} (retrying)",
+                            prompt.to_label
+                        ));
+                        self.pending_turn = true;
+                    }
+                    Err(error) => self.push_display_message(DisplayMessage::error(format!(
+                        "Failed to switch provider to {}: {}",
+                        prompt.to_label, error
+                    ))),
+                }
+            }
             crate::config::CrossProviderFailoverMode::Manual if !self.is_remote => {
                 self.push_display_message(DisplayMessage::system(manual_message));
                 self.set_status_notice(format!(

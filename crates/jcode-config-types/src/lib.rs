@@ -323,8 +323,11 @@ impl std::fmt::Display for UpdateChannel {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CrossProviderFailoverMode {
-    /// Show a 3-second cancelable countdown, then resend on another provider.
+    /// Automatically resend on the next configured provider after every usable
+    /// account on the current provider is exhausted.
     #[default]
+    Automatic,
+    /// Show a 3-second cancelable countdown, then resend on another provider.
     Countdown,
     /// Do not resend the prompt to another provider automatically.
     Manual,
@@ -333,6 +336,7 @@ pub enum CrossProviderFailoverMode {
 impl CrossProviderFailoverMode {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Automatic => "automatic",
             Self::Manual => "manual",
             Self::Countdown => "countdown",
         }
@@ -341,7 +345,8 @@ impl CrossProviderFailoverMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "manual" => Some(Self::Manual),
-            "countdown" | "auto" | "automatic" => Some(Self::Countdown),
+            "auto" | "automatic" => Some(Self::Automatic),
+            "countdown" => Some(Self::Countdown),
             _ => None,
         }
     }
@@ -1268,7 +1273,7 @@ impl Default for ProviderConfig {
             openai_native_compaction_mode: "auto".to_string(),
             openai_native_compaction_threshold_tokens: 200_000,
             preserve_reasoning_context: true,
-            cross_provider_failover: CrossProviderFailoverMode::Countdown,
+            cross_provider_failover: CrossProviderFailoverMode::Automatic,
             same_provider_account_failover: true,
             copilot_premium: None,
             model_picker_providers: None,

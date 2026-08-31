@@ -653,7 +653,12 @@ impl MultiProvider {
             let label = Self::provider_label(candidate);
             let key = Self::provider_key(candidate);
 
-            if candidate != active && failover_reason.is_some() {
+            if candidate != active
+                && failover_reason.is_some()
+                && Self::cross_provider_failover_requires_prompt(
+                    crate::config::config().provider.cross_provider_failover,
+                )
+            {
                 let prompt = self.build_failover_prompt(
                     active,
                     candidate,
@@ -688,6 +693,19 @@ impl MultiProvider {
                         label,
                         detail
                     ));
+                    // A remembered usage-limit verdict (including either the
+                    // 5-hour or 7-day Anthropic window) is still an account
+                    // failure first. Try every eligible account on this
+                    // provider before crossing providers, exactly as we do for
+                    // a fresh runtime 429 below.
+                    if let Some(stream) = self
+                        .try_same_provider_account_failover(
+                            candidate, messages, tools, mode, &detail, &mut notes,
+                        )
+                        .await?
+                    {
+                        return Ok(stream);
+                    }
                     failover_reason = Some(detail.clone());
                 }
                 notes.push(note);
@@ -703,6 +721,20 @@ impl MultiProvider {
                         label,
                         reason
                     ));
+                    // Preflight usage snapshots and runtime usage errors are
+                    // the same verdict: this account cannot accept the turn.
+                    // Run the same account-first ladder for both. Without this,
+                    // a weekly window caught before the HTTP call skipped every
+                    // alternate account and jumped directly to the provider
+                    // prompt even though another account could have credit.
+                    if let Some(stream) = self
+                        .try_same_provider_account_failover(
+                            candidate, messages, tools, mode, &reason, &mut notes,
+                        )
+                        .await?
+                    {
+                        return Ok(stream);
+                    }
                     failover_reason = Some(reason.clone());
                 }
                 notes.push(note);

@@ -830,13 +830,26 @@ fn display_emoji_defaults_on_and_deserializes_off() {
 }
 
 #[test]
-fn test_provider_failover_defaults_match_new_behavior() {
+fn test_provider_failover_defaults_match_account_first_behavior() {
     let provider = Config::default().provider;
     assert_eq!(
         provider.cross_provider_failover,
-        super::CrossProviderFailoverMode::Countdown
+        super::CrossProviderFailoverMode::Automatic
     );
     assert!(provider.same_provider_account_failover);
+
+    assert_eq!(
+        super::CrossProviderFailoverMode::parse("automatic"),
+        Some(super::CrossProviderFailoverMode::Automatic)
+    );
+    assert_eq!(
+        super::CrossProviderFailoverMode::parse("auto"),
+        Some(super::CrossProviderFailoverMode::Automatic)
+    );
+    assert_eq!(
+        super::CrossProviderFailoverMode::parse("countdown"),
+        Some(super::CrossProviderFailoverMode::Countdown)
+    );
 }
 
 #[test]
