@@ -158,7 +158,10 @@ impl App {
         }
     }
 
-    fn handle_provider_failover_prompt(&mut self, prompt: crate::provider::ProviderFailoverPrompt) {
+    pub(super) fn handle_provider_failover_prompt(
+        &mut self,
+        prompt: crate::provider::ProviderFailoverPrompt,
+    ) {
         let input_summary = Self::format_failover_input_summary(&prompt);
         let manual_message = format!(
             "⚠ {} became unavailable - jcode did not resend your prompt to {} automatically.\n\nReason: {}\n\nRetrying elsewhere would send {}.\n\nTo switch manually now, use /model and pick a model from {}, then resend. {}",

@@ -451,6 +451,92 @@ fn claude_oauth_route(model: &str) -> crate::provider::ModelRoute {
     }
 }
 
+/// A cross-provider control prompt is terminal for the failed route. It must
+/// never enter the generic remote retry scheduler: that simply resends to the
+/// exhausted provider, gets the same marker back, and loops forever while also
+/// exposing the internal JSON in the transcript.
+#[test]
+fn test_remote_provider_failover_prompt_stops_same_route_retry_and_offers_switch() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.is_remote = true;
+    app.remote_provider_name = Some("Anthropic".to_string());
+    app.remote_provider_model = Some("claude-sonnet-4".to_string());
+    app.remote_model_options = vec![
+        claude_oauth_route("claude-sonnet-4"),
+        openai_oauth_route("gpt-5.5"),
+    ];
+    app.rate_limit_pending_message = Some(PendingRemoteMessage {
+        content: "continue the task".to_string(),
+        images: vec![],
+        is_system: false,
+        system_reminder: None,
+        auto_retry: true,
+        retry_attempts: 0,
+        retry_at: None,
+    });
+    app.last_submitted_input = Some("continue the task".to_string());
+    app.is_processing = true;
+    app.status = ProcessingStatus::Streaming;
+
+    let prompt = crate::provider::ProviderFailoverPrompt {
+        from_provider: "claude".to_string(),
+        from_label: "Anthropic".to_string(),
+        to_provider: "openai".to_string(),
+        to_label: "OpenAI".to_string(),
+        reason: "OAuth usage exhausted (runtime-error, 1m ago)".to_string(),
+        estimated_input_chars: 1_290_951,
+        estimated_input_tokens: 322_737,
+    };
+    let marker = failover_error_message(&prompt);
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Error {
+            id: 20,
+            message: marker,
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+
+    assert!(
+        app.rate_limit_pending_message.is_none(),
+        "the exhausted Anthropic route must not be scheduled for retry"
+    );
+    assert!(app.rate_limit_reset.is_none());
+    assert_eq!(app.input, "continue the task", "failed prompt is restored");
+
+    let offer = app
+        .pending_fallback_offer
+        .as_ref()
+        .expect("remote failover should offer the working route");
+    assert_eq!(offer.selection.provider_label, "OpenAI");
+    assert_eq!(
+        offer
+            .remote_resend
+            .as_ref()
+            .expect("failed remote payload must be retained")
+            .content,
+        "continue the task"
+    );
+
+    assert!(
+        app.display_messages()
+            .iter()
+            .all(|message| !message.content.contains("[jcode-provider-failover]")),
+        "internal failover JSON must never be rendered"
+    );
+    assert!(
+        app.display_messages()
+            .iter()
+            .any(|message| message.content.contains("Fallback available")),
+        "user should get the one-key switch action"
+    );
+}
+
 /// The motivating scenario: a remote session's OpenAI OAuth session expires
 /// (token refresh fails, non-retryable), and a working Claude OAuth route
 /// exists. The terminal error should arm a one-keypress fallback offer that

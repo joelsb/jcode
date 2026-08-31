@@ -1270,8 +1270,7 @@ pub(in crate::tui::app) fn handle_server_event(
                     return false;
                 }
             }
-            let is_failover_prompt =
-                crate::provider::parse_failover_prompt_message(&message).is_some();
+            let failover_prompt = crate::provider::parse_failover_prompt_message(&message);
             // Snapshot the failed turn's payload before the cleanup below (and
             // the retry-budget bookkeeping) clears it, so a fallback offer
             // armed at a terminal no-retry point can resend it after the user
@@ -1286,14 +1285,19 @@ pub(in crate::tui::app) fn handle_server_event(
                     raw_input: app.last_submitted_input.clone(),
                 }
             });
-            app.push_display_message(DisplayMessage {
-                role: "error".to_string(),
-                content: message.clone(),
-                tool_calls: vec![],
-                duration_secs: None,
-                title: None,
-                tool_data: None,
-            });
+            // A provider-failover marker is an internal control payload, not a
+            // user-facing provider error. Its structured handler below renders
+            // the useful explanation and switch action without exposing JSON.
+            if failover_prompt.is_none() {
+                app.push_display_message(DisplayMessage {
+                    role: "error".to_string(),
+                    content: message.clone(),
+                    tool_calls: vec![],
+                    duration_secs: None,
+                    title: None,
+                    tool_data: None,
+                });
+            }
             app.is_processing = false;
             app.status = ProcessingStatus::Idle;
             app.stream_message_ended = false;
@@ -1310,6 +1314,24 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             remote.clear_pending();
             remote.reset_call_output_tokens_seen();
+            // The server deliberately stopped before crossing providers and
+            // returned a control prompt asking the client to decide. Remote
+            // handling used to recognize this marker only as a boolean, print
+            // its raw JSON, then fall through to the generic retry scheduler.
+            // That resent the identical turn to the exhausted provider forever
+            // (each retry produced the same failover marker again).
+            //
+            // Stop every same-route retry, restore the failed prompt, render the
+            // normal failover explanation, and arm the existing one-key route
+            // switch with the captured payload so accepting it can resend on the
+            // fallback provider.
+            if let Some(prompt) = failover_prompt {
+                app.clear_pending_remote_retry();
+                app.restore_failed_input_to_box();
+                app.handle_provider_failover_prompt(prompt);
+                app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
+                return false;
+            }
             // Connectivity failures (DNS, connection reset, no route, transient
             // TLS, timeouts) are always transient: the request never reached the
             // provider. Hold the turn and resume when the network recovers,
