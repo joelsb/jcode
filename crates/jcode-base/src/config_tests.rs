@@ -715,17 +715,21 @@ fn config_env_fingerprint_tracks_every_apply_env_override_var() {
     let override_source = include_str!("config/env_overrides.rs");
     let mut missing = Vec::new();
 
+    // `var_os` counts too: a presence-only override still changes the resolved
+    // config, so it must invalidate the cache like any `var` read.
     for line in override_source.lines() {
-        let Some(start) = line.find("std::env::var(\"") else {
-            continue;
-        };
-        let rest = &line[start + "std::env::var(\"".len()..];
-        let Some(end) = rest.find('"') else {
-            continue;
-        };
-        let key = &rest[..end];
-        if !crate::config::CONFIG_ENV_KEYS.contains(&key) {
-            missing.push(key.to_string());
+        for prefix in ["std::env::var(\"", "std::env::var_os(\""] {
+            let Some(start) = line.find(prefix) else {
+                continue;
+            };
+            let rest = &line[start + prefix.len()..];
+            let Some(end) = rest.find('"') else {
+                continue;
+            };
+            let key = &rest[..end];
+            if !crate::config::CONFIG_ENV_KEYS.contains(&key) {
+                missing.push(key.to_string());
+            }
         }
     }
 

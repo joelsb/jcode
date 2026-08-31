@@ -164,6 +164,8 @@ fn spawn_replacement_process_returns_without_waiting_for_child_exit() {
 ///
 /// This asserts the observable OS state (state `Z` in `ps`), not that some
 /// helper was called, because the whole failure mode is invisible in code shape.
+/// It also cross-checks the shipped `platform::process_is_zombie` probe against
+/// `ps`, so a silently-broken probe cannot make every zombie test pass.
 #[cfg(unix)]
 fn process_is_zombie(pid: u32) -> bool {
     let Ok(output) = std::process::Command::new("ps")
@@ -172,9 +174,54 @@ fn process_is_zombie(pid: u32) -> bool {
     else {
         return false;
     };
-    String::from_utf8_lossy(&output.stdout)
+    let ps_says = String::from_utf8_lossy(&output.stdout)
         .trim()
-        .starts_with('Z')
+        .starts_with('Z');
+    assert_eq!(
+        super::process_is_zombie(pid),
+        ps_says,
+        "platform::process_is_zombie disagrees with `ps` for pid {pid}"
+    );
+    ps_says
+}
+
+/// A zombie still answers `kill(pid, 0)`, so `is_process_running` must consult
+/// the process state, not just signal deliverability. A pid-file singleton that
+/// gets this wrong reads its own corpse as alive and never respawns - the macOS
+/// menu bar helper did exactly that after being killed (pid 79587, `<defunct>`).
+#[cfg(unix)]
+#[test]
+fn is_process_running_rejects_a_zombie_that_still_answers_kill_zero() {
+    let mut cmd = std::process::Command::new("true");
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let child = super::spawn_detached(&mut cmd).expect("spawn");
+    let pid = child.id();
+    drop(child); // never waited on -> becomes a zombie
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !process_is_zombie(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        process_is_zombie(pid),
+        "test setup failed: pid {pid} never became a zombie"
+    );
+
+    // The precondition that makes this bug invisible in the first place.
+    assert_eq!(
+        unsafe { libc::kill(pid as i32, 0) },
+        0,
+        "a zombie must still answer kill(pid, 0), otherwise this test proves nothing"
+    );
+
+    assert!(
+        !super::is_process_running(pid),
+        "a zombie must not be reported as running"
+    );
+
+    super::try_reap_child_process(pid).ok();
 }
 
 #[cfg(unix)]

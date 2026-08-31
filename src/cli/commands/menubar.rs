@@ -172,7 +172,9 @@ pub fn ensure_menubar_helper_running() {
     };
     let pid_path = dir.join("menubar.pid");
 
-    // If a recorded helper PID is still alive, do nothing.
+    // If a recorded helper PID is still alive, do nothing. `is_process_running`
+    // rejects zombies, so a helper that died without being reaped no longer
+    // suppresses the respawn forever.
     if let Ok(raw) = std::fs::read_to_string(&pid_path) {
         if let Ok(pid) = raw.trim().parse::<u32>() {
             if crate::platform::is_process_running(pid) {
@@ -202,6 +204,11 @@ pub fn ensure_menubar_helper_running() {
 
     if let Ok(child) = command.spawn() {
         let _ = std::fs::write(&pid_path, child.id().to_string());
+        // `setsid` detaches the session, not the parent-child relationship, so
+        // this process is still the reaper for the helper. Dropping the `Child`
+        // never waits, which is exactly how a killed helper became a `<defunct>`
+        // entry that `kill(pid, 0)` still reported as alive.
+        crate::platform::reap_child_in_background(child);
     }
 }
 

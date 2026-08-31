@@ -244,14 +244,22 @@ pub fn raise_nofile_limit_best_effort(minimum_soft_limit: u64) {
 
 /// Check if a process is running by PID.
 ///
-/// On Unix, uses `kill(pid, 0)` to check without sending a signal.
-/// On Windows, uses OpenProcess to query the process.
+/// On Unix, uses `kill(pid, 0)` to check without sending a signal, then rejects
+/// zombies (see [`process_is_zombie`]). On Windows, uses OpenProcess to query
+/// the process.
+///
+/// The zombie check is load-bearing, not a nicety. `kill(pid, 0)` succeeds on an
+/// exited-but-unreaped child, so a pid-file singleton whose helper died without
+/// being waited on reads its own corpse as "still running" and refuses to
+/// respawn forever. Observed on the macOS menu bar helper: killing it left pid
+/// 79587 as `<defunct>` (its `setsid` parent never reaps), and every later
+/// session silently skipped spawning the indicator.
 pub fn is_process_running(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let result = unsafe { libc::kill(pid as i32, 0) };
         if result == 0 {
-            return true;
+            return !process_is_zombie(pid);
         }
         let err = std::io::Error::last_os_error();
         !matches!(err.raw_os_error(), Some(code) if code == libc::ESRCH)
@@ -334,6 +342,101 @@ pub fn signal_detached_process_group(pid: u32, signal: i32) -> std::io::Result<(
                 Ok(())
             }
         }
+    }
+}
+
+/// Whether `pid` names a zombie: a process that has exited but whose parent has
+/// not reaped it, so it still holds a process-table slot and still answers
+/// `kill(pid, 0)`.
+///
+/// Callers asking "is this still doing work" want `false` here. Only
+/// [`is_process_running`] and its tests should need this directly.
+///
+/// Reads the kernel rather than shelling out to `ps`, because this runs on the
+/// startup path of every session.
+///
+/// macOS uses `sysctl(KERN_PROC_PID)` and reads `p_stat` from the returned
+/// `kinfo_proc`. Not `proc_pidinfo`: that call *refuses zombies*, returning 0
+/// with `ESRCH`, which is indistinguishable from "no such process" and made an
+/// earlier version of this function answer `false` for every zombie. `libc` has
+/// no Apple `kinfo_proc` binding, so the two fields used here are read at fixed
+/// offsets validated against the kernel's own reply (see the pid cross-check).
+///
+/// Linux parses field 3 of `/proc/<pid>/stat`, taking the last `)` so a process
+/// whose name contains parentheses does not shift the fields. Other Unixes have
+/// no cheap portable probe, so they answer `false` and keep the old behavior.
+#[cfg(unix)]
+pub fn process_is_zombie(pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // Layout of the leading fields of `struct kinfo_proc` (verified on
+        // arm64 macOS against `offsetof`, and re-verified at runtime below by
+        // requiring the kernel's own `p_pid` to match the pid we asked for).
+        const KINFO_PROC_SIZE: usize = 648;
+        const P_STAT_OFFSET: usize = 36;
+        const P_PID_OFFSET: usize = 40;
+        /// `SZOMB` from `<sys/proc.h>`; libc has no Apple binding for it.
+        const SZOMB: i8 = 5;
+
+        let mut mib: [libc::c_int; 4] = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            pid as libc::c_int,
+        ];
+        let mut buf = [0u8; KINFO_PROC_SIZE];
+        let mut len = buf.len();
+
+        // SAFETY: `mib` is a 4-element sysctl name, and `buf`/`len` describe a
+        // buffer the kernel fills with at most `len` bytes, updating `len` to
+        // what it wrote. A failed call leaves the zeroed buffer, and the
+        // `written`/pid checks below reject anything short or unexpected.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                4,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || len < P_PID_OFFSET + 4 {
+            return false;
+        }
+
+        // Guard the hardcoded offsets: if this struct ever shifts, the pid we
+        // read back stops matching and we report "not a zombie" (the old,
+        // conservative behavior) rather than acting on a misread byte.
+        let reported_pid = u32::from_ne_bytes([
+            buf[P_PID_OFFSET],
+            buf[P_PID_OFFSET + 1],
+            buf[P_PID_OFFSET + 2],
+            buf[P_PID_OFFSET + 3],
+        ]);
+        if reported_pid != pid {
+            return false;
+        }
+
+        buf[P_STAT_OFFSET] as i8 == SZOMB
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // comm (field 2) is parenthesised and may itself contain ')'.
+        let Some(after_comm) = stat.rfind(')').map(|idx| &stat[idx + 1..]) else {
+            return false;
+        };
+        matches!(after_comm.split_whitespace().next(), Some("Z"))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        false
     }
 }
 
