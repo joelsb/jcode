@@ -64,6 +64,25 @@ fn test_fallback_sequence_includes_all_providers() {
     );
 }
 
+/// Once every account on the active provider is exhausted, automatic mode must
+/// continue into the provider sequence instead of returning the client control
+/// prompt that caused the remote retry loop. Countdown/manual remain explicit
+/// opt-outs for users who want confirmation.
+#[test]
+fn automatic_cross_provider_failover_does_not_stop_for_a_prompt() {
+    use crate::config::CrossProviderFailoverMode;
+
+    assert!(!MultiProvider::cross_provider_failover_requires_prompt(
+        CrossProviderFailoverMode::Automatic
+    ));
+    assert!(MultiProvider::cross_provider_failover_requires_prompt(
+        CrossProviderFailoverMode::Countdown
+    ));
+    assert!(MultiProvider::cross_provider_failover_requires_prompt(
+        CrossProviderFailoverMode::Manual
+    ));
+}
+
 #[test]
 fn test_parse_provider_hint_supports_known_values() {
     assert_eq!(

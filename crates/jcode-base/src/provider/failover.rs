@@ -2,6 +2,17 @@ use super::*;
 use jcode_provider_core::{FailoverDecision, ProviderFailoverPrompt};
 
 impl MultiProvider {
+    /// Whether crossing to another provider must stop for client confirmation.
+    ///
+    /// Automatic mode is the account-first contract: the caller has already
+    /// tried every eligible account on the active provider, so the next
+    /// configured provider is the continuation, not a separate user decision.
+    pub(super) fn cross_provider_failover_requires_prompt(
+        mode: crate::config::CrossProviderFailoverMode,
+    ) -> bool {
+        !matches!(mode, crate::config::CrossProviderFailoverMode::Automatic)
+    }
+
     pub(super) fn provider_is_configured(&self, provider: ActiveProvider) -> bool {
         self.reconcile_auth_if_provider_missing(provider)
     }

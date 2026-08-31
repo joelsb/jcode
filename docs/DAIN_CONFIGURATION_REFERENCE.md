@@ -14,7 +14,7 @@ default_model = "claude-sonnet-5"
 default_provider = "claude"
 default_effort = "high"
 openai_reasoning_effort = "high"
-cross_provider_failover = "countdown"      # auto-switch after 3s on failure
+cross_provider_failover = "automatic"      # after every funded same-provider account is exhausted, switch provider immediately
 same_provider_account_failover = true       # try other accounts on same provider
 prefer_account_failover = true              # DAIN patch: account before model downgrade
 

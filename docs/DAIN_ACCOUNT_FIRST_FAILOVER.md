@@ -131,6 +131,18 @@ Diagnostic, extending Part 4's: switches with **no** restore line and **minutes*
 
 See ADR-0023.
 
+## Part 6 - One Blocked Window, One Automatic Ladder (2026-08-31)
+
+The 5-hour and 7-day Anthropic windows are not different failover events. If either window has no usable capacity, the account cannot accept the request, so both must run the same ladder:
+
+1. Mark the current account unavailable until the reset of the window that blocked it.
+2. Retry the same model on each eligible account on the same provider.
+3. If no funded account remains, retry automatically on the next configured provider.
+
+Two stops violated that contract. A remembered/preflight usage verdict skipped `try_same_provider_account_failover` entirely, even though a fresh runtime 429 entered it. Then, after same-provider options were exhausted, `complete_with_failover` returned a client confirmation marker instead of continuing through the provider sequence. In a remote session the client printed that internal JSON and retried the exhausted provider, producing an infinite loop.
+
+`cross_provider_failover = "automatic"` is now the default and means exactly the ladder above. `countdown` and `manual` remain explicit opt-outs. `auto` parses as `automatic`, not `countdown`.
+
 ## Files Changed
 
 ### Core logic
