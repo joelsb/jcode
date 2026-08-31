@@ -659,9 +659,13 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    /// Whether the active account is blocked by a spent usage window.
+    ///
+    /// Delegates to `UsageData::exhausted`, a disjunction: either the 5-hour or
+    /// the 7-day window being spent blocks the account (ADR-0016). This site
+    /// kept a private `&&` copy, so a weekly-only exhaustion read as headroom.
     fn is_usage_exhausted() -> bool {
-        let usage = jcode_base::usage::get_sync();
-        usage.five_hour >= 0.99 && usage.seven_day >= 0.99
+        jcode_base::usage::get_sync().exhausted()
     }
 
     fn best_available_opus_model(exclude: &str) -> Option<String> {

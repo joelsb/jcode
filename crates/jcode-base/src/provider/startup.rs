@@ -603,13 +603,22 @@ impl MultiProvider {
         }
     }
 
-    /// Check if Anthropic OAuth usage is exhausted (both 5hr and 7d at 100%)
+    /// Whether the active Anthropic account cannot serve a request right now.
+    ///
+    /// Delegates to [`UsageData::exhausted`], which is a **disjunction**: either
+    /// a spent 5-hour window or a spent 7-day window blocks the account. This
+    /// function kept its own `&&` copy of the rule long after ADR-0016 fixed the
+    /// shared one, so an account at 5h=23% / 7d=100% reported headroom here and
+    /// the account-first ladder never started: the turn went straight to the
+    /// cross-provider prompt (or, in a remote session, looped).
+    ///
+    /// Do not re-inline the comparison. One window being spent is the whole
+    /// verdict, and the threshold and window set belong to `UsageData`.
     pub(super) fn is_claude_usage_exhausted(&self) -> bool {
         if !self.has_claude_runtime() {
             return false;
         }
 
-        let usage = crate::usage::get_sync();
-        usage.five_hour >= 0.99 && usage.seven_day >= 0.99
+        crate::usage::get_sync().exhausted()
     }
 }

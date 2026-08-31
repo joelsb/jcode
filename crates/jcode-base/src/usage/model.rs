@@ -588,6 +588,65 @@ mod window_exhaustion_tests {
             "a weekly-blocked account must report the weekly reset, not the sooner 5-hour one"
         );
     }
+    /// No caller may keep its own copy of the exhaustion comparison.
+    ///
+    /// The rule was fixed to a disjunction in ADR-0016, but three private `&&`
+    /// copies survived (`provider/startup.rs`, the Anthropic runtime, the debug
+    /// server command). Each independently reported "headroom" for an account
+    /// blocked by its weekly window, which is exactly the reported failure: the
+    /// account-first ladder never started. Fixing the shared rule did nothing
+    /// for them, so this test fails if a copy reappears.
+    #[test]
+    fn no_caller_reimplements_the_exhaustion_comparison() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates dir")
+            .parent()
+            .expect("repo root");
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![repo.join("crates")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|name| name == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_some_and(|ext| ext == "rs")
+                    && path != std::path::Path::new(file!())
+                    && !path.ends_with("usage/model.rs")
+                {
+                    let Ok(source) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    for (index, line) in source.lines().enumerate() {
+                        let code = line.trim_start();
+                        if code.starts_with("//") || code.starts_with("///") {
+                            continue;
+                        }
+                        if line.contains("five_hour >=") && line.contains("seven_day >=")
+                            || (line.contains("five_hour >=") && line.contains("&&"))
+                        {
+                            offenders.push(format!("{}:{}", path.display(), index + 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these sites reimplement the exhaustion rule instead of calling UsageData::exhausted(); \
+             a private copy silently ignores a weekly-only exhaustion: {offenders:?}"
+        );
+    }
 }
 
 #[cfg(test)]
