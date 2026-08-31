@@ -525,6 +525,72 @@ impl AccountUsageProbe {
 }
 
 #[cfg(test)]
+mod window_exhaustion_tests {
+    use super::UsageData;
+
+    /// A spent weekly window and a spent 5-hour window are the same fact: the
+    /// account has no credits and cannot serve the turn. Anything downstream
+    /// (rotate to the next funded account, then cross providers) keys off this
+    /// one verdict, so weekly must never be a weaker signal than 5-hour.
+    ///
+    /// This is the rule a conjunction broke once already (ADR-0016): an account
+    /// at 5h=100%/7d=49% reported headroom and rotation kept reselecting it.
+    #[test]
+    fn either_spent_window_exhausts_the_account_identically() {
+        let five_hour_only = UsageData {
+            five_hour: 1.0,
+            seven_day: 0.01,
+            ..Default::default()
+        };
+        let weekly_only = UsageData {
+            five_hour: 0.23,
+            seven_day: 1.0,
+            ..Default::default()
+        };
+        let headroom = UsageData {
+            five_hour: 0.77,
+            seven_day: 0.5,
+            ..Default::default()
+        };
+
+        assert!(five_hour_only.exhausted(), "a spent 5-hour window blocks");
+        assert!(
+            weekly_only.exhausted(),
+            "a spent weekly window blocks exactly like a spent 5-hour window"
+        );
+        assert_eq!(
+            five_hour_only.exhausted(),
+            weekly_only.exhausted(),
+            "neither window may be treated as the weaker signal"
+        );
+        assert!(
+            !headroom.exhausted(),
+            "an account with capacity in both windows must stay in rotation"
+        );
+    }
+
+    /// The reset time is only meaningful paired with the window that blocked.
+    /// Reporting the 5-hour reset for a weekly-blocked account promises
+    /// recovery hours early, which is what makes a caller reselect it.
+    #[test]
+    fn the_blocking_window_owns_the_reset_it_reports() {
+        let weekly_only = UsageData {
+            five_hour: 0.23,
+            seven_day: 1.0,
+            five_hour_resets_at: Some("2026-08-31T17:40:00Z".to_string()),
+            seven_day_resets_at: Some("2026-09-05T02:00:00Z".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            weekly_only.blocking_reset_at().as_deref(),
+            Some("2026-09-05T02:00:00Z"),
+            "a weekly-blocked account must report the weekly reset, not the sooner 5-hour one"
+        );
+    }
+}
+
+#[cfg(test)]
 mod mark_stale_tests {
     use super::UsageData;
 
