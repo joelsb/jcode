@@ -53,7 +53,7 @@ Failover order: sorted by usage (least-used first). `same_provider_account_failo
 | `[provider]` | Default model/provider, reasoning effort, failover |
 | `[providers.<name>]` | Named profiles (OmniRoute, etc.) |
 | `[display]` | Theme, diff mode, layout |
-| `[features]` | Memory, swarm, mermaid |
+| `[features]` | Memory, swarm, mermaid, macOS menu bar indicator (`menubar`) |
 | `[keybindings]` | All keyboard shortcuts |
 | `[agents]` | Swarm config, concurrency |
 | `[hooks]` | Shell commands at tool/session boundaries |

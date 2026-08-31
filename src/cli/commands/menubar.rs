@@ -154,8 +154,10 @@ pub fn ensure_menubar_helper_running() {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
-    // Allow users to opt out entirely.
-    if std::env::var_os("JCODE_NO_MENUBAR").is_some() {
+    // Allow users to opt out entirely: `features.menubar = false` in
+    // config.toml, or the `JCODE_NO_MENUBAR` / `JCODE_MENUBAR` env vars (both
+    // fold into the same config field, see `config/env_overrides.rs`).
+    if !crate::config::config().features.menubar {
         return;
     }
 

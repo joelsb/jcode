@@ -329,6 +329,17 @@ impl Config {
                 self.features.check_updates = parsed;
             }
         }
+        // The historical opt-out was presence-only, and the helper re-execs
+        // itself with `JCODE_NO_MENUBAR=1` set so the child never spawns a
+        // second helper. Keep both forms folding into the config field.
+        if std::env::var_os("JCODE_NO_MENUBAR").is_some() {
+            self.features.menubar = false;
+        }
+        if let Ok(v) = std::env::var("JCODE_MENUBAR") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.features.menubar = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_AUTO_POKE") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.features.auto_poke = parsed;

@@ -1104,6 +1104,10 @@ pub struct FeatureConfig {
     /// that something in the harness silently invalidated the prefix cache
     /// (default: true).
     pub kv_cache_miss_notices: bool,
+    /// Show the macOS menu bar session-count indicator (default: true).
+    /// Set to false for the persistent equivalent of `JCODE_NO_MENUBAR=1`.
+    /// No effect off macOS, where the indicator never runs.
+    pub menubar: bool,
     /// Update channel: "stable" (releases only) or "main" (latest commits)
     pub update_channel: UpdateChannel,
 }
@@ -1119,6 +1123,7 @@ impl Default for FeatureConfig {
             message_timestamps: true,
             persist_memory_injections: false,
             kv_cache_miss_notices: true,
+            menubar: true,
             update_channel: UpdateChannel::default(),
         }
     }

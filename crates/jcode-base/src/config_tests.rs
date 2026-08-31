@@ -73,6 +73,47 @@ fn mermaid_environment_override_uses_standard_boolean_values() {
 }
 
 #[test]
+fn menubar_feature_defaults_on_and_parses_false() {
+    assert!(Config::default().features.menubar);
+
+    let cfg: Config =
+        toml::from_str("[features]\nmenubar = false\n").expect("features.menubar should parse");
+    assert!(!cfg.features.menubar);
+}
+
+/// The historical opt-out was the mere *presence* of `JCODE_NO_MENUBAR`, and
+/// the helper spawns itself with that var set so the child never re-spawns.
+/// Both must keep working now that the decision lives in config.
+#[test]
+fn menubar_environment_overrides_cover_legacy_and_explicit_forms() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_no = std::env::var_os("JCODE_NO_MENUBAR");
+    let prev_yes = std::env::var_os("JCODE_MENUBAR");
+
+    crate::env::remove_var("JCODE_MENUBAR");
+    crate::env::set_var("JCODE_NO_MENUBAR", "1");
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+    assert!(!cfg.features.menubar, "presence of JCODE_NO_MENUBAR disables");
+
+    crate::env::remove_var("JCODE_NO_MENUBAR");
+    crate::env::set_var("JCODE_MENUBAR", "off");
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+    assert!(!cfg.features.menubar, "JCODE_MENUBAR=off disables");
+
+    // An explicit re-enable must beat a config file that turned it off.
+    crate::env::set_var("JCODE_MENUBAR", "on");
+    let mut cfg: Config =
+        toml::from_str("[features]\nmenubar = false\n").expect("features.menubar should parse");
+    cfg.apply_env_overrides();
+    assert!(cfg.features.menubar, "JCODE_MENUBAR=on overrides config");
+
+    restore_env_var("JCODE_NO_MENUBAR", prev_no);
+    restore_env_var("JCODE_MENUBAR", prev_yes);
+}
+
+#[test]
 fn auto_poke_feature_defaults_on_and_parses_false() {
     assert!(Config::default().features.auto_poke);
 
