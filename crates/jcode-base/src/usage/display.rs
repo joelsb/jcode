@@ -125,6 +125,13 @@ fn parse_reset_timestamp(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc
     }
 }
 
+/// Parse a provider reset timestamp, for callers outside this module that need
+/// the instant rather than a formatted string (e.g. sizing a rate-limit
+/// cooldown from the reset it will actually clear at).
+pub fn parse_reset_at(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    parse_reset_timestamp(timestamp)
+}
+
 pub(super) fn usage_reset_passed<'a>(
     timestamps: impl IntoIterator<Item = Option<&'a str>>,
 ) -> bool {

@@ -266,6 +266,21 @@ impl UiActivity {
     }
 }
 
+/// The daemon moved this process onto a different Anthropic OAuth account
+/// because the previous one was rate limited.
+#[derive(Clone, Debug)]
+pub struct AnthropicAccountRotated {
+    /// Account label now serving requests.
+    pub label: String,
+    /// Account the request was on before, when known.
+    pub previous_label: Option<String>,
+    /// True when this is the give-up path putting the original account back
+    /// because every candidate was rate limited, not a move onto a working
+    /// account. Consumers word these two cases very differently: one is
+    /// "carrying on elsewhere", the other is "out of options".
+    pub restored: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct GitStatusCompleted {
     pub session_id: String,
@@ -426,6 +441,8 @@ pub enum BusEvent {
     ModelRefreshCompleted(ModelRefreshCompleted),
     /// UI-visible runtime activity from auth/catalog/background operations.
     UiActivity(UiActivity),
+    /// Anthropic OAuth account rotated mid-request after a rate limit
+    AnthropicAccountRotated(AnthropicAccountRotated),
     /// Local git status command completed off the UI thread
     GitStatusCompleted(GitStatusCompleted),
     /// Update check status from background thread
@@ -542,6 +559,37 @@ impl Bus {
             .clone()
     }
 
+    pub fn publish_anthropic_account_rotated(
+        &self,
+        label: impl Into<String>,
+        previous_label: Option<String>,
+    ) {
+        self.publish_anthropic_account_change(label, previous_label, false);
+    }
+
+    /// Announce the give-up path: every candidate account was rate limited, so
+    /// the override went back to where the request found it.
+    pub fn publish_anthropic_account_restored(
+        &self,
+        label: impl Into<String>,
+        previous_label: Option<String>,
+    ) {
+        self.publish_anthropic_account_change(label, previous_label, true);
+    }
+
+    fn publish_anthropic_account_change(
+        &self,
+        label: impl Into<String>,
+        previous_label: Option<String>,
+        restored: bool,
+    ) {
+        self.publish(BusEvent::AnthropicAccountRotated(AnthropicAccountRotated {
+            label: label.into(),
+            previous_label,
+            restored,
+        }));
+    }
+
     pub fn publish_models_updated(&self) {
         // A models-updated publish means some provider catalog changed
         // out-of-band. Invalidate memoized route catalogs so the next render
@@ -641,5 +689,50 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod account_rotation_bus_tests {
+    use super::{Bus, BusEvent};
+
+    #[test]
+    fn publishing_a_rotation_reaches_subscribers_with_both_labels() {
+        let bus = Bus::new();
+        let mut rx = bus.subscribe();
+
+        bus.publish_anthropic_account_rotated("claude-2", Some("claude-1".to_string()));
+
+        match rx.try_recv() {
+            Ok(BusEvent::AnthropicAccountRotated(rotated)) => {
+                assert_eq!(rotated.label, "claude-2");
+                assert_eq!(rotated.previous_label.as_deref(), Some("claude-1"));
+                assert!(
+                    !rotated.restored,
+                    "landing on a working account is not the give-up path"
+                );
+            }
+            other => panic!("expected an AnthropicAccountRotated event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restoring_the_original_account_is_flagged_as_a_restore() {
+        let bus = Bus::new();
+        let mut rx = bus.subscribe();
+
+        bus.publish_anthropic_account_restored("claude-1", Some("claude-2".to_string()));
+
+        match rx.try_recv() {
+            Ok(BusEvent::AnthropicAccountRotated(rotated)) => {
+                assert!(
+                    rotated.restored,
+                    "the exhausted-every-account path must not read as a successful switch"
+                );
+                assert_eq!(rotated.label, "claude-1");
+                assert_eq!(rotated.previous_label.as_deref(), Some("claude-2"));
+            }
+            other => panic!("expected an AnthropicAccountRotated event, got {other:?}"),
+        }
     }
 }

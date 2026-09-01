@@ -323,6 +323,9 @@ impl std::fmt::Display for UpdateChannel {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CrossProviderFailoverMode {
+    /// Automatically resend on the next configured provider after every usable
+    /// account on the current provider is exhausted.
+    Automatic,
     /// Show a 3-second cancelable countdown, then resend on another provider.
     #[default]
     Countdown,
@@ -333,6 +336,7 @@ pub enum CrossProviderFailoverMode {
 impl CrossProviderFailoverMode {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Automatic => "automatic",
             Self::Manual => "manual",
             Self::Countdown => "countdown",
         }
@@ -341,7 +345,8 @@ impl CrossProviderFailoverMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "manual" => Some(Self::Manual),
-            "countdown" | "auto" | "automatic" => Some(Self::Countdown),
+            "auto" | "automatic" => Some(Self::Automatic),
+            "countdown" => Some(Self::Countdown),
             _ => None,
         }
     }
@@ -1234,6 +1239,11 @@ pub struct ProviderConfig {
     /// Whether jcode should automatically try another account on the same provider
     /// before falling back to a different provider.
     pub same_provider_account_failover: bool,
+    /// When true (default) and the error is a rate limit, skip same-provider
+    /// model downgrades in the fallback picker so account failover can try the
+    /// same model on a different account first. Only effective when
+    /// `same_provider_account_failover` is also true.
+    pub prefer_account_failover: bool,
     /// Copilot premium request mode: "normal", "one", or "zero"
     /// "zero" means all requests are free (no premium requests consumed)
     pub copilot_premium: Option<String>,
@@ -1270,6 +1280,7 @@ impl Default for ProviderConfig {
             preserve_reasoning_context: true,
             cross_provider_failover: CrossProviderFailoverMode::Countdown,
             same_provider_account_failover: true,
+            prefer_account_failover: true,
             copilot_premium: None,
             model_picker_providers: None,
             stream_idle_timeout_secs: 180,

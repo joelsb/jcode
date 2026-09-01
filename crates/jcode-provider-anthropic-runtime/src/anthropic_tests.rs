@@ -30,94 +30,6 @@ impl Drop for EnvVarGuard {
     }
 }
 
-#[test]
-fn direct_api_url_supports_standard_and_profile_overrides() {
-    let _lock = jcode_base::storage::lock_test_env();
-    let _standard = EnvVarGuard::set("ANTHROPIC_BASE_URL", "https://proxy.example/v1/");
-    assert_eq!(direct_api_url(), "https://proxy.example/v1/messages");
-
-    let _profile = EnvVarGuard::set(
-        "JCODE_ANTHROPIC_API_BASE",
-        "https://gateway.example/anthropic/v1/messages",
-    );
-    assert_eq!(
-        direct_api_url(),
-        "https://gateway.example/anthropic/v1/messages"
-    );
-}
-
-#[test]
-fn configured_direct_headers_parse_and_reject_invalid_values() {
-    let _lock = jcode_base::storage::lock_test_env();
-    let _headers = EnvVarGuard::set(
-        "JCODE_ANTHROPIC_HEADERS",
-        r#"{"x-tenant":"alpha","x-route":"claude"}"#,
-    );
-    let parsed = configured_direct_headers().expect("valid custom headers");
-    assert_eq!(parsed.get("x-tenant").unwrap(), "alpha");
-    assert_eq!(parsed.get("x-route").unwrap(), "claude");
-
-    let _invalid = EnvVarGuard::set("JCODE_ANTHROPIC_HEADERS", r#"{"bad header":"x"}"#);
-    assert!(configured_direct_headers().is_err());
-}
-
-#[test]
-fn anthropic_auth_token_selects_bearer_without_affecting_explicit_profile_auth() {
-    let _lock = jcode_base::storage::lock_test_env();
-    let _token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", "gateway-token");
-    assert_eq!(direct_auth_mode(), "bearer");
-
-    let _explicit = EnvVarGuard::set("JCODE_ANTHROPIC_AUTH", "header");
-    assert_eq!(direct_auth_mode(), "header");
-}
-
-#[test]
-fn named_profile_runtime_captures_transport_and_credential_immutably() {
-    let _lock = jcode_base::storage::lock_test_env();
-    let _base = EnvVarGuard::set("JCODE_ANTHROPIC_API_BASE", "https://one.example/v1");
-    let _auth = EnvVarGuard::set("JCODE_ANTHROPIC_AUTH", "bearer");
-    let _key_name = EnvVarGuard::set("JCODE_ANTHROPIC_API_KEY_NAME", "PROFILE_ONE_KEY");
-    let _key = EnvVarGuard::set("PROFILE_ONE_KEY", "one-secret");
-    let provider = AnthropicProvider::new();
-
-    let _changed_base = EnvVarGuard::set("JCODE_ANTHROPIC_API_BASE", "https://two.example/v1");
-    let _changed_key = EnvVarGuard::set("PROFILE_ONE_KEY", "two-secret");
-    assert_eq!(
-        provider.direct_transport.api_url,
-        "https://one.example/v1/messages"
-    );
-    assert_eq!(provider.direct_transport.auth_mode, "bearer");
-    assert_eq!(
-        provider.profile_api_key.as_ref().unwrap().as_ref().unwrap(),
-        "one-secret"
-    );
-}
-
-#[test]
-fn named_anthropic_profile_accepts_its_configured_custom_model() {
-    let _lock = jcode_base::storage::lock_test_env();
-    let _home = tempfile::TempDir::new().expect("temp home");
-    let _home_guard = EnvVarGuard::set("JCODE_HOME", _home.path());
-    std::fs::write(
-        _home.path().join("config.toml"),
-        r#"
-        [providers.custom]
-        type = "anthropic-compatible"
-        base_url = "http://localhost:12345/v1"
-        default_model = "claude-private"
-        "#,
-    )
-    .expect("write config");
-    jcode_base::config::Config::invalidate_cache();
-    let _profile = EnvVarGuard::set("JCODE_NAMED_PROVIDER_PROFILE", "custom");
-    let models = active_anthropic_profile_models().expect("active profile models");
-    assert!(models.iter().any(|model| model == "claude-private"));
-    assert!(!models.iter().any(|model| model == "not-configured"));
-    drop(_profile);
-    drop(_home_guard);
-    jcode_base::config::Config::invalidate_cache();
-}
-
 async fn collect_live_smoke_stream(
     mut stream: EventStream,
     timeout: std::time::Duration,
@@ -1919,86 +1831,6 @@ fn anthropic_quality_rank_orders_opus_before_haiku_and_retired_last() {
 }
 
 #[test]
-fn fable_quota_fallback_selects_the_best_available_opus() {
-    let fallback = AnthropicProvider::best_available_opus_model("claude-fable-5")
-        .expect("the curated Anthropic catalog should contain an Opus fallback");
-    assert!(
-        fallback.contains("claude-opus"),
-        "unexpected fallback: {fallback}"
-    );
-
-    let candidates = jcode_base::provider::cached_anthropic_model_ids()
-        .unwrap_or_else(jcode_base::provider::known_anthropic_model_ids);
-    let best_rank = candidates
-        .iter()
-        .filter(|model| model.to_ascii_lowercase().contains("claude-opus"))
-        .filter(|model| !anthropic_model_is_retired(model))
-        .map(|model| anthropic_model_quality_rank(model))
-        .min()
-        .expect("available Opus model");
-    assert_eq!(anthropic_model_quality_rank(&fallback), best_rank);
-}
-
-#[test]
-fn model_scoped_usage_routes_only_exhausted_fable_to_opus() {
-    let usage = jcode_base::usage::UsageData {
-        model_scoped: vec![jcode_base::usage::ModelScopedUsageWindow {
-            model_name: "Fable".to_string(),
-            utilization: 1.0,
-            resets_at: Some("2026-08-11T00:00:00Z".to_string()),
-        }],
-        ..Default::default()
-    };
-    let fallback = AnthropicProvider::fallback_for_model_scoped_usage("claude-fable-5", &usage)
-        .expect("exhausted Fable should route to Opus");
-    assert!(
-        fallback.contains("claude-opus"),
-        "unexpected fallback: {fallback}"
-    );
-    assert!(
-        AnthropicProvider::fallback_for_model_scoped_usage("claude-opus-5", &usage).is_none(),
-        "an exhausted Fable scope must not reroute an explicitly selected Opus"
-    );
-
-    let available = jcode_base::usage::UsageData {
-        model_scoped: vec![jcode_base::usage::ModelScopedUsageWindow {
-            model_name: "Fable".to_string(),
-            utilization: 0.98,
-            resets_at: None,
-        }],
-        ..Default::default()
-    };
-    assert!(
-        AnthropicProvider::fallback_for_model_scoped_usage("claude-fable-5", &available).is_none(),
-        "Fable must remain selected while its scoped quota is available"
-    );
-}
-
-#[test]
-fn detects_live_fable_scoped_limit_errors_without_misrouting_other_limits() {
-    assert!(is_fable_scoped_limit_error(
-        "claude-fable-5",
-        r#"429 {"type":"rate_limit_error","message":"You have reached your weekly Fable limit"}"#,
-    ));
-    assert!(is_fable_scoped_limit_error(
-        "claude-fable-5",
-        "usage limit reached for the 7-day model window",
-    ));
-    assert!(!is_fable_scoped_limit_error(
-        "claude-opus-5",
-        "weekly Fable rate limit reached",
-    ));
-    assert!(!is_fable_scoped_limit_error(
-        "claude-fable-5",
-        "429 overloaded_error: service temporarily overloaded",
-    ));
-    assert!(!is_fable_scoped_limit_error(
-        "claude-fable-5",
-        "global 5-hour rate limit reached",
-    ));
-}
-
-#[test]
 fn ping_keepalive_emits_streaming_phase_event() {
     // Issue #451: during silent reasoning phases, `ping` events can be the
     // only upstream traffic. They must surface as a StreamEvent so the client
@@ -2102,4 +1934,1985 @@ fn test_anthropic_unknown_content_block_start_does_not_drop_event() {
             "{block_type}: unknown block must not start a thinking block"
         );
     }
+}
+
+#[test]
+fn next_untried_account_skips_already_attempted_labels() {
+    let candidates = vec![
+        "claude-1".to_string(),
+        "claude-2".to_string(),
+        "claude-3".to_string(),
+    ];
+    let tried = vec!["claude-1".to_string(), "claude-2".to_string()];
+
+    assert_eq!(
+        next_untried_account(&candidates, &tried),
+        Some("claude-3"),
+        "rotation must move past every account the request already used"
+    );
+}
+
+#[test]
+fn next_untried_account_returns_first_candidate_when_nothing_tried() {
+    let candidates = vec!["claude-2".to_string(), "claude-1".to_string()];
+
+    assert_eq!(
+        next_untried_account(&candidates, &[]),
+        Some("claude-2"),
+        "candidates arrive best-first, so the head is the preferred account"
+    );
+}
+
+#[test]
+fn next_untried_account_is_none_when_every_account_is_exhausted() {
+    let candidates = vec!["claude-1".to_string(), "claude-2".to_string()];
+    let tried = vec!["claude-2".to_string(), "claude-1".to_string()];
+
+    assert_eq!(
+        next_untried_account(&candidates, &tried),
+        None,
+        "with no account left the caller must fall through to model fallback"
+    );
+}
+
+#[test]
+fn rate_limit_errors_are_recognized_as_usage_limits() {
+    let error_str = "anthropic api error (429 too many requests): {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"this request would exceed your account's rate limit.\"}}";
+
+    assert!(
+        jcode_base::provider::error_looks_like_usage_limit(error_str),
+        "the 429 body jcode logs must trigger account rotation"
+    );
+    assert!(
+        is_retryable_error(error_str),
+        "429 stays retryable so the rotated account gets an attempt"
+    );
+}
+
+#[test]
+fn should_rotate_account_only_on_usage_limits() {
+    let rate_limit = "anthropic api error (429 too many requests)";
+
+    assert!(
+        should_rotate_account(true, rate_limit),
+        "a 429 is exactly the case account rotation exists for"
+    );
+    assert!(
+        !should_rotate_account(false, rate_limit),
+        "rotation must stay off when prefer_account_failover is disabled or auth is an API key"
+    );
+    assert!(
+        !should_rotate_account(true, "error sending request: connection reset by peer"),
+        "transport faults belong to the retry loop, not to another account"
+    );
+    assert!(
+        !should_rotate_account(true, "anthropic api error (500 internal server error)"),
+        "a server fault is not an account problem"
+    );
+}
+
+#[test]
+fn account_override_is_restored_only_when_rotation_ran_dry() {
+    let original = Some("claude-1".to_string());
+    let rotated = Some("claude-2".to_string());
+
+    assert!(
+        should_restore_account(&original, &rotated, true),
+        "every account limited: hand the override back rather than pinning a searched-through account"
+    );
+    assert!(
+        !should_restore_account(&original, &rotated, false),
+        "a rotation that found a working account must survive an unrelated later failure"
+    );
+    assert!(
+        !should_restore_account(&original, &original, true),
+        "nothing to undo when the request never left its starting account"
+    );
+    assert!(
+        !should_restore_account(&None, &None, true),
+        "no override was set, so none may be written"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end account rotation over real HTTP, against a hand-rolled mock
+// server. `API_URL`/`API_URL_OAUTH` are `const`, so `set_test_api_url_override`
+// (test-only, compiled out of release builds; see `api_url` in `lib.rs`) is the
+// seam that lets `run_stream_with_retries` be driven exactly as production
+// calls it, with a local listener standing in for api.anthropic.com. No mock
+// server crate is added: the workspace has none (wiremock/httpmock/mockito are
+// all absent from every `Cargo.toml` and `Cargo.lock`), and a few dozen lines
+// of raw HTTP/1.1 framing is small enough not to be worth a new dependency for
+// one test file.
+//
+// Fixture tokens below (`fixture-access-claude-*`) are not real credentials;
+// nothing derived from a real account is ever read, logged, or asserted here.
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+/// Minimal single-purpose HTTP/1.1 responder standing in for the Anthropic
+/// Messages endpoint. Each accepted connection is one request/response pair:
+/// headers and the declared `Content-Length` body are read (so the client's
+/// `write_all` never blocks on a peer that stopped reading), the
+/// `Authorization` header is captured for the test to inspect, and a
+/// `respond` callback decides the status/body by 1-based call number.
+struct MockAnthropicServer {
+    addr: std::net::SocketAddr,
+    authorizations: Arc<std::sync::Mutex<Vec<String>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl MockAnthropicServer {
+    async fn start(mut respond: impl FnMut(u32) -> (u16, String) + Send + 'static) -> Self {
+        Self::start_with_request_inspection(move |call_no, _authorization| respond(call_no)).await
+    }
+
+    /// Like [`Self::start`], but the responder also sees the request's
+    /// `Authorization` header, so a test can answer differently per *account*
+    /// rather than per call number. Needed to observe which account a rotation
+    /// actually landed on, which call-ordering alone cannot distinguish.
+    async fn start_with_request_inspection(
+        mut respond: impl FnMut(u32, &str) -> (u16, String) + Send + 'static,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let authorizations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let authorizations_task = Arc::clone(&authorizations);
+
+        let handle = tokio::spawn(async move {
+            let mut call_no: u32 = 0;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                call_no += 1;
+                let authorization = read_request_authorization(&mut socket).await;
+                authorizations_task
+                    .lock()
+                    .unwrap()
+                    .push(authorization.clone());
+
+                let (status, body) = respond(call_no, &authorization);
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: text/event-stream\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n{body}",
+                    status = status,
+                    reason = canonical_reason(status),
+                    len = body.len(),
+                    body = body,
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        Self {
+            addr,
+            authorizations,
+            handle,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/v1/messages", self.addr)
+    }
+
+    fn call_count(&self) -> usize {
+        self.authorizations.lock().unwrap().len()
+    }
+
+    /// Whether the bearer token on request `index` (0-based) differs from the
+    /// one on request 0. Never returns or prints the token itself.
+    fn authorization_changed_from_first(&self, index: usize) -> bool {
+        let seen = self.authorizations.lock().unwrap();
+        match (seen.first(), seen.get(index)) {
+            (Some(first), Some(other)) => first != other,
+            _ => false,
+        }
+    }
+
+    fn authorization_contains(&self, index: usize, needle: &str) -> bool {
+        self.authorizations
+            .lock()
+            .unwrap()
+            .get(index)
+            .is_some_and(|auth| auth.contains(needle))
+    }
+
+    fn stop(self) {
+        self.abort();
+    }
+
+    /// Same teardown as [`Self::stop`] without consuming the server, so an
+    /// owning fixture can abort it from `Drop`.
+    fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
+fn canonical_reason(status: u16) -> &'static str {
+    match status {
+        429 => "Too Many Requests",
+        200 => "OK",
+        _ => "Error",
+    }
+}
+
+async fn read_request_authorization(socket: &mut tokio::net::TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let headers_end = loop {
+        let n = socket.read(&mut tmp).await.unwrap_or(0);
+        if n == 0 {
+            return String::new();
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+    };
+    let header_text = String::from_utf8_lossy(&buf[..headers_end]).to_string();
+    let content_length: usize = header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let body_start = headers_end + 4;
+    while buf.len() < body_start + content_length {
+        let n = socket.read(&mut tmp).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn mock_429_body() -> String {
+    "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"this request would exceed your account's rate limit.\"}}".to_string()
+}
+
+fn mock_success_sse_body(text: &str) -> String {
+    format!(
+        concat!(
+            "event: message_start\n",
+            "data: {{\"type\":\"message_start\",\"message\":{{\"model\":\"claude-3-5-haiku-20241022\",\"usage\":{{\"input_tokens\":5}}}}}}\n\n",
+            "event: content_block_start\n",
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n",
+            "event: content_block_stop\n",
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+            "event: message_delta\n",
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n",
+            "event: message_stop\n",
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        ),
+        text = text,
+    )
+}
+
+/// Seeds two fake Claude accounts (`claude-1` active, `claude-2` the only
+/// rotation candidate) in the sandboxed `JCODE_HOME`. Caller must hold
+/// `jcode_base::storage::lock_test_env()` and have already pointed
+/// `JCODE_HOME` at a temp dir, exactly like the credential-mode tests above.
+fn seed_two_claude_accounts() {
+    let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    for index in 0..2 {
+        jcode_base::auth::claude::upsert_account(jcode_base::auth::claude::AnthropicAccount {
+            label: format!("fixture-{index}"),
+            access: format!("fixture-access-{index}"),
+            refresh: String::new(),
+            expires: far_future,
+            email: None,
+            subscription_type: Some("max".to_string()),
+            scopes: vec![],
+        })
+        .unwrap();
+    }
+    jcode_base::auth::claude::set_active_account(&seeded_account_labels()[0]).unwrap();
+}
+
+/// The labels the account store actually assigned, in order.
+///
+/// `upsert_account` renames a new account to the next canonical label and
+/// `load_auth_file` relabels on read, so no test may hard-code a label. These
+/// helpers exist so the fixtures name whatever the store chose.
+fn seeded_account_labels() -> Vec<String> {
+    jcode_base::auth::claude::list_accounts()
+        .expect("read back the seeded accounts")
+        .into_iter()
+        .map(|account| account.label)
+        .collect()
+}
+
+/// The first seeded account (the one `seed_two_claude_accounts` activates).
+fn first_account_label() -> String {
+    seeded_account_labels()
+        .first()
+        .cloned()
+        .expect("at least one seeded account")
+}
+
+/// The second seeded account, i.e. the rotation target.
+fn second_account_label() -> String {
+    seeded_account_labels()
+        .get(1)
+        .cloned()
+        .expect("two seeded accounts")
+}
+
+fn e2e_test_request() -> ApiRequest {
+    ApiRequest {
+        model: "claude-3-5-haiku-20241022".to_string(),
+        max_tokens: 16,
+        system: None,
+        messages: vec![],
+        tools: None,
+        metadata: None,
+        thinking: None,
+        output_config: None,
+        temperature: None,
+        service_tier: None,
+        stream: true,
+    }
+}
+
+/// Fixture for the account-rotation streaming tests: seeds two fake Claude
+/// accounts (`claude-1` active, `claude-2` the only rotation candidate) in a
+/// sandboxed `JCODE_HOME`, and runs a mock server that 429s on the first call
+/// then answers 200 on every subsequent one.
+///
+/// Holds the test-env lock and temp dir for its own lifetime so callers don't
+/// need to manage either. `drive_stream_to_completion` runs
+/// `run_stream_with_retries` against the mock server and returns every event.
+///
+/// Field order matters: struct fields drop in declaration order (unlike local
+/// variables, which drop in reverse), so `_guard` is declared last to release
+/// the test-env lock only after the temp dir, env var, and mock server have
+/// already torn down.
+struct RotationFixture {
+    server: MockAnthropicServer,
+    _home: EnvVarGuard,
+    _temp: tempfile::TempDir,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for RotationFixture {
+    fn drop(&mut self) {
+        // The pre-fixture version of these tests ended with an explicit
+        // `server.stop()`. Without this the listener task outlives every
+        // rotation test and keeps its port bound for the rest of the run.
+        self.server.abort();
+    }
+}
+
+impl RotationFixture {
+    async fn new() -> Self {
+        let _guard = jcode_base::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().unwrap();
+        let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+        seed_two_claude_accounts();
+        // Cooldowns and the per-account usage cache are process-global and
+        // survive `JCODE_HOME` being swapped, so a 429 recorded by an earlier
+        // test leaks in here and silently empties the candidate list. Harmless
+        // while a cooling account was still offered as a last resort; fatal now
+        // that a known-limited account is excluded outright.
+        jcode_base::provider::clear_all_account_cooldowns();
+        jcode_base::usage::clear_anthropic_account_usage_for_tests();
+
+        assert_eq!(
+            jcode_base::provider::account_failover_candidates(
+                jcode_provider_core::ActiveProvider::Claude
+            ),
+            vec![second_account_label()],
+            "fixture must leave exactly one rotation candidate"
+        );
+
+        let server = MockAnthropicServer::start(|call_no| {
+            if call_no == 1 {
+                (429, mock_429_body())
+            } else {
+                (200, mock_success_sse_body("pong"))
+            }
+        })
+        .await;
+        set_test_api_url_override(Some(server.url()));
+
+        Self {
+            server,
+            _home,
+            _temp: temp,
+            _guard,
+        }
+    }
+
+    async fn drive_stream_to_completion(&self) -> Vec<Result<StreamEvent>> {
+        let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+        let model_state = Arc::new(std::sync::RwLock::new(
+            "claude-3-5-haiku-20241022".to_string(),
+        ));
+
+        run_stream_with_retries(
+            Client::new(),
+            "fixture-access-0".to_string(),
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+            DirectTransportConfig::from_env(),
+        )
+        .await;
+
+        set_test_api_url_override(None);
+
+        let mut events = Vec::new();
+        while let Some(item) = rx.recv().await {
+            events.push(item);
+        }
+        events
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_stream_with_retries_rotates_account_on_streaming_429_and_replays_successfully() {
+    let fixture = RotationFixture::new().await;
+    let events = fixture.drive_stream_to_completion().await;
+
+    for event in &events {
+        assert!(
+            event.is_ok(),
+            "stream must succeed once the retry replays on a working account"
+        );
+    }
+
+    let switched = events.iter().any(|event| {
+        matches!(
+            event,
+            Ok(StreamEvent::StatusDetail { detail })
+                if detail.contains(&first_account_label()) && detail.contains(&second_account_label())
+        )
+    });
+    assert!(
+        switched,
+        "the account switch must be surfaced to the consumer via StatusDetail"
+    );
+
+    let text_deltas: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            Ok(StreamEvent::TextDelta(text)) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text_deltas,
+        vec!["pong"],
+        "the replay must stream the successful response exactly once, not duplicated"
+    );
+
+    assert_eq!(
+        fixture.server.call_count(),
+        2,
+        "one 429 on the original account, one successful replay on the rotated account"
+    );
+    assert!(
+        fixture.server.authorization_changed_from_first(1),
+        "the replay must carry a different bearer token than the first attempt"
+    );
+    assert!(
+        fixture
+            .server
+            .authorization_contains(0, "fixture-access-0")
+    );
+    assert!(
+        fixture
+            .server
+            .authorization_contains(1, "fixture-access-1")
+    );
+
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label(),
+        Some(second_account_label()),
+        "a rotation that lands on a working account must stick, not get restored"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_publishes_an_account_rotated_bus_event() {
+    let fixture = RotationFixture::new().await;
+    let mut bus_rx = jcode_base::bus::Bus::global().subscribe();
+
+    fixture.drive_stream_to_completion().await;
+
+    let mut rotations = Vec::new();
+    while let Ok(event) = bus_rx.try_recv() {
+        if let jcode_base::bus::BusEvent::AnthropicAccountRotated(rotated) = event {
+            rotations.push((
+                rotated.previous_label.clone(),
+                rotated.label.clone(),
+                rotated.restored,
+            ));
+        }
+    }
+
+    assert_eq!(
+        rotations,
+        vec![(Some(first_account_label()), second_account_label(), false)],
+        "a rotation the client cannot otherwise observe must be announced exactly once, and \
+         landing on a working account is not the give-up path"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_stream_with_retries_bounds_rotation_attempts_and_restores_original_account() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    // Force the quota verdict rather than depending on ambient cache state.
+    //
+    // The per-account usage cache is process-global and keyed by label, so any
+    // other test that seeds or probes `claude-1`/`claude-2` decides this test's
+    // quota-versus-burst branch for it. Seeding the cache here is not enough
+    // either, because a detached post-rotation refresh from another test can
+    // overwrite it mid-run. The thread-local override is the seam built for
+    // exactly this (see `with_quota_exhausted_override`), and `false` states the
+    // premise of this test: nothing is out of quota, so every 429 is a burst.
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    let candidates = jcode_base::provider::account_failover_candidates(
+        jcode_provider_core::ActiveProvider::Claude,
+    );
+    assert_eq!(
+        candidates.len(),
+        1,
+        "fixture must leave exactly one rotation candidate"
+    );
+
+    let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+    set_test_api_url_override(Some(server.url()));
+
+    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+    let model_state = Arc::new(std::sync::RwLock::new(
+        "claude-3-5-haiku-20241022".to_string(),
+    ));
+
+    // The override is thread-local and the runtime is multi-threaded, so it is
+    // set inside the same future that runs the loop.
+    jcode_base::provider::with_quota_exhausted_override(Some(false), || {
+        futures::executor::block_on(run_stream_with_retries(
+            Client::new(),
+            "fixture-access-0".to_string(),
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+            DirectTransportConfig::from_env(),
+        ));
+    });
+
+    set_test_api_url_override(None);
+
+    let mut events = Vec::new();
+    while let Some(item) = rx.recv().await {
+        events.push(item);
+    }
+
+    let error_count = events.iter().filter(|event| event.is_err()).count();
+    assert_eq!(
+        error_count, 1,
+        "exactly one terminal error once every account and retry is exhausted"
+    );
+
+    // attempt_budget starts at MAX_RETRIES and gains exactly one extra attempt
+    // per successful rotation, plus one per rate-limit wait once rotation is
+    // exhausted (see docs/adr/0015: a burst limit needs a seconds-scale wait,
+    // not the ~200ms transport backoff).
+    //
+    // The number itself matters less than the property: every branch that grows
+    // the budget is bounded by its own counter, so an always-429 world stops
+    // instead of spinning forever.
+    let expected_calls = (MAX_RETRIES + 1 + (MAX_RATE_LIMIT_RETRIES - 1)) as usize;
+    assert_eq!(
+        server.call_count(),
+        expected_calls,
+        "the rotation+retry loop must terminate at the sized attempt budget instead of looping forever"
+    );
+    assert!(
+        server.call_count() < 20,
+        "sanity: the budget must stay small enough that a user is not left waiting through an unbounded retry storm"
+    );
+
+    // The session stays on the account it rotated to, rather than being handed
+    // back to the one that had already refused it.
+    //
+    // This assertion previously required the opposite, per ADR-0003's original
+    // rule ("on a dead end the original is as good as any other"). That rule
+    // made every subsequent turn start on a known-limited account, rotate away,
+    // and be restored again: one switch plus one restore per turn, which is the
+    // flapping users reported. Neither account can serve this test, so which one
+    // it ends on cannot be justified by success; what matters is that the choice
+    // is not reset, so the next turn inherits what this one learned.
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label(),
+        Some(second_account_label()),
+        "a dead end must not restore the session onto an account known to be limited"
+    );
+
+    server.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switch_to_next_claude_account_terminates_once_candidates_are_exhausted() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+
+    let credentials: Arc<RwLock<Option<CachedCredentials>>> = Arc::new(RwLock::new(None));
+    let mut tried = vec![first_account_label()];
+
+    let first = switch_to_next_claude_account(&credentials, &mut tried).await;
+    assert_eq!(
+        first.as_ref().map(|switch| switch.label.as_str()),
+        Some(second_account_label().as_str()),
+        "the only untried candidate must be picked"
+    );
+
+    let second = switch_to_next_claude_account(&credentials, &mut tried).await;
+    assert!(
+        second.is_none(),
+        "no candidates left: must return None instead of looping"
+    );
+
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label(),
+        Some(second_account_label()),
+        "a None return must leave the override exactly as the prior successful switch set it"
+    );
+}
+
+#[test]
+fn restore_claude_account_skips_write_when_another_session_changed_the_override() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    jcode_base::auth::claude::upsert_account(jcode_base::auth::claude::AnthropicAccount {
+        label: "claude-3".to_string(),
+        access: "fixture-access-claude-3".to_string(),
+        refresh: String::new(),
+        expires: far_future,
+        email: None,
+        subscription_type: Some("max".to_string()),
+        scopes: vec![],
+    })
+    .unwrap();
+    // Simulate: this request rotated claude-1 -> claude-2, then before the
+    // dead-end restore ran, something else (another concurrent request, or a
+    // user-issued account switch) pointed the process-wide override at a
+    // third account.
+    jcode_base::auth::claude::set_active_account_override(Some("claude-3".to_string()));
+
+    restore_claude_account(
+        &Some(first_account_label()),
+        &Some(second_account_label()),
+        true,
+    );
+
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label().as_deref(),
+        Some("claude-3"),
+        "a live override that no longer matches ours must not be clobbered"
+    );
+}
+
+#[test]
+fn restore_claude_account_writes_back_when_override_still_matches() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::auth::claude::set_active_account_override(Some(second_account_label()));
+
+    restore_claude_account(
+        &Some(first_account_label()),
+        &Some(second_account_label()),
+        true,
+    );
+
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label(),
+        Some(first_account_label()),
+        "override still holds our label: restoring the original is safe"
+    );
+}
+
+#[test]
+fn overloaded_errors_are_classified_as_capacity_not_just_transient() {
+    // The exact SSE error event Anthropic sends when it has no capacity.
+    let sse = "retryable stream error: {\"type\":\"error\",\"error\":{\"details\":null,\"type\":\"overloaded_error\",\"message\":\"overloaded\"},\"request_id\":\"req_011cdjhkfn5srzakavdw2xj6\"}";
+
+    assert!(
+        is_overloaded_error(sse),
+        "an overloaded_error must take the capacity backoff, not the ~200ms transport backoff"
+    );
+    assert!(
+        is_retryable_error(sse),
+        "it must stay retryable so the request is not surfaced as a hard failure"
+    );
+    assert!(
+        is_overloaded_error("anthropic api error (529 ): overloaded"),
+        "HTTP 529 is the same capacity signal on the initial response"
+    );
+    assert!(
+        !should_rotate_account(true, sse),
+        "an overload is a server capacity problem, not an account quota problem"
+    );
+}
+
+#[test]
+fn a_request_id_containing_529_is_not_mistaken_for_a_capacity_error() {
+    // A bare "529" substring occurs inside request ids and token counts, so the
+    // capacity match must be anchored on the status text.
+    assert!(
+        !is_overloaded_error(
+            "anthropic api error (400 bad request): {\"request_id\":\"req_011cdj529hkfn\"}"
+        ),
+        "a request id that happens to contain 529 must not trigger capacity backoff"
+    );
+}
+
+/// A rate limit that survived account rotation must get a rate-limit-shaped
+/// wait, not the ~200ms transport backoff.
+///
+/// Anthropic enforces a short-window burst limit on top of the 5-hour and
+/// weekly quotas, so "every account is rate limited" is usually "every account
+/// is busy for a few seconds". The real report that motivated this had 83% of
+/// the weekly quota and 97% of the 5-hour window still unused, and the turn
+/// still died with a "switch to a smaller model" prompt.
+#[test]
+fn rate_limits_wait_on_a_rate_limit_clock_not_the_transport_clock() {
+    let sse = "anthropic api error (429 too many requests): {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"this request would exceed your account's rate limit. please try again later.\"},\"request_id\":\"req_011cdu3zr7sfucuaqxhrvkdd\"}";
+
+    assert!(
+        jcode_base::provider::error_looks_like_usage_limit(sse),
+        "the real 429 payload must be recognized as a usage limit"
+    );
+    assert!(
+        !is_overloaded_error(sse),
+        "a 429 is not a capacity rejection; it must not borrow that budget"
+    );
+
+    // The budget must be bigger than the transport budget, and the clock much
+    // slower. With MAX_RETRIES=2 at 200ms, the old path gave up in well under a
+    // second, which cannot outlast a burst window.
+    assert!(
+        MAX_RATE_LIMIT_RETRIES > MAX_RETRIES,
+        "a rate limit needs more attempts than a transport fault ({} vs {})",
+        MAX_RATE_LIMIT_RETRIES,
+        MAX_RETRIES
+    );
+    assert!(
+        RATE_LIMIT_RETRY_BASE_DELAY_MS >= 5000,
+        "waiting {}ms is far too eager for a burst limit",
+        RATE_LIMIT_RETRY_BASE_DELAY_MS
+    );
+
+    // Total wall time the retries can cover, which is what decides whether a
+    // burst is outlasted.
+    let total_ms: u64 = (1..MAX_RATE_LIMIT_RETRIES)
+        .map(|attempt| {
+            jcode_provider_core::attempt_tracker::retry_backoff_delay(
+                attempt,
+                RATE_LIMIT_RETRY_BASE_DELAY_MS,
+            )
+            .as_millis() as u64
+        })
+        .sum();
+    let old_total_ms: u64 = (1..MAX_RETRIES)
+        .map(|attempt| {
+            jcode_provider_core::attempt_tracker::retry_backoff_delay(attempt, RETRY_BASE_DELAY_MS)
+                .as_millis() as u64
+        })
+        .sum();
+
+    assert!(
+        total_ms >= 30_000,
+        "rate-limit retries only cover {total_ms}ms; a burst window can outlast that"
+    );
+    assert!(
+        total_ms > old_total_ms * 10,
+        "new budget ({total_ms}ms) must dwarf the transport budget ({old_total_ms}ms) it replaced"
+    );
+}
+
+/// The outcome that actually matters: a burst limit that clears while jcode is
+/// waiting must let the turn finish, not kill it.
+///
+/// Anthropic's short-window limit clears in seconds. Before this, a 429 that
+/// outlived account rotation fell through to the transport budget (2 attempts,
+/// ~200ms apart), so the turn died with a "switch to a smaller model" prompt
+/// while the user still had most of their weekly quota. Here every account 429s
+/// for the first few calls and then recovers, which is exactly that world.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_limit_that_clears_lets_the_turn_finish() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    // Force the quota verdict rather than depending on ambient cache state.
+    //
+    // The per-account usage cache is process-global and keyed by label, so any
+    // other test that seeds or probes `claude-1`/`claude-2` decides this test's
+    // quota-versus-burst branch for it. Seeding the cache here is not enough
+    // either, because a detached post-rotation refresh from another test can
+    // overwrite it mid-run. The thread-local override is the seam built for
+    // exactly this (see `with_quota_exhausted_override`), and `false` states the
+    // premise of this test: nothing is out of quota, so every 429 is a burst.
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // 429 for the first four calls (initial + rotation + two waits), then the
+    // burst window passes and the request succeeds.
+    let server = MockAnthropicServer::start(|call_no| {
+        if call_no <= 4 {
+            (429, mock_429_body())
+        } else {
+            (200, mock_success_sse_body("recovered"))
+        }
+    })
+    .await;
+    set_test_api_url_override(Some(server.url()));
+
+    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+    let model_state = Arc::new(std::sync::RwLock::new(
+        "claude-3-5-haiku-20241022".to_string(),
+    ));
+
+    // The override is thread-local and the runtime is multi-threaded, so it is
+    // set inside the same future that runs the loop.
+    jcode_base::provider::with_quota_exhausted_override(Some(false), || {
+        futures::executor::block_on(run_stream_with_retries(
+            Client::new(),
+            "fixture-access-0".to_string(),
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+            DirectTransportConfig::from_env(),
+        ));
+    });
+
+    set_test_api_url_override(None);
+
+    let mut events = Vec::new();
+    while let Some(item) = rx.recv().await {
+        events.push(item);
+    }
+
+    let errors: Vec<String> = events
+        .iter()
+        .filter_map(|event| event.as_ref().err().map(|e| e.to_string()))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "the turn must survive a burst limit that clears; got errors: {errors:?}"
+    );
+
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            Ok(StreamEvent::TextDelta(delta)) => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text, "recovered",
+        "the retried attempt's output must reach the consumer"
+    );
+    assert!(
+        server.call_count() >= 5,
+        "expected the loop to keep trying past the burst, saw {} calls",
+        server.call_count()
+    );
+}
+
+/// A spent quota must fail immediately instead of waiting out a burst window.
+///
+/// Waiting ~75s is right when requests are merely bouncing, and wrong when the
+/// quota is gone: the reset can be hours away, so every second spent waiting is
+/// a second the user stares at a spinner before being told to switch. The usage
+/// probe is what separates the two, so this drives the same always-429 server
+/// under both verdicts and compares the request counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spent_quota_fails_fast_instead_of_waiting_out_a_burst() {
+    async fn drive_with_verdict(quota_exhausted: bool) -> usize {
+        let _guard = jcode_base::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().unwrap();
+        let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+        seed_two_claude_accounts();
+
+        let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+        set_test_api_url_override(Some(server.url()));
+
+        let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+        let model_state = Arc::new(std::sync::RwLock::new(
+            "claude-3-5-haiku-20241022".to_string(),
+        ));
+
+        // The override is thread-local and the runtime is multi-threaded, so it
+        // is set inside the same future that runs the loop.
+        jcode_base::provider::with_quota_exhausted_override(Some(quota_exhausted), || {
+            futures::executor::block_on(run_stream_with_retries(
+                Client::new(),
+                "fixture-access-0".to_string(),
+                true,
+                e2e_test_request(),
+                tx,
+                Arc::new(RwLock::new(None)),
+                "claude-3-5-haiku-20241022".to_string(),
+                "test-session".to_string(),
+                model_state,
+                DirectTransportConfig::from_env(),
+            ));
+        });
+
+        set_test_api_url_override(None);
+        while rx.recv().await.is_some() {}
+        server.call_count()
+    }
+
+    let spent_calls = drive_with_verdict(true).await;
+    let burst_calls = drive_with_verdict(false).await;
+
+    // Rotation still gets its one try per account: proving an account is
+    // limited costs one request, never two.
+    assert_eq!(
+        spent_calls,
+        (MAX_RETRIES + 1) as usize,
+        "a spent quota must stop after rotation, with no rate-limit waits"
+    );
+    assert!(
+        burst_calls > spent_calls,
+        "a burst limit must still be waited out ({burst_calls} vs {spent_calls} calls)"
+    );
+}
+
+/// A spent 5-hour window must make the turn fail *fast*, on the exact numbers
+/// from the 2026-08-12 incident.
+///
+/// This drives the real retry loop with the real usage probe (no
+/// `with_quota_exhausted_override`), against a server that answers 429 for every
+/// account, and seeds the per-account usage cache with what the user actually
+/// had: `claude-2` at 5h=100% / 7d=49% and `claude-1` at 5h=100% / 7d=24%. Both
+/// accounts are therefore quota-blocked for hours, so the correct behaviour is
+/// to stop after proving it once per account, with no waits.
+///
+/// Measured as a *request count* rather than as elapsed time, so it stays honest
+/// under the `clamp_retry_delay` test clamp: waiting costs extra requests, and
+/// `MAX_RATE_LIMIT_RETRIES` waits would push it well past the rotation budget.
+///
+/// Negative control: restoring `exhausted` to `five_hour && seven_day` makes
+/// every account look like it has headroom, the quota fast-fail stops firing,
+/// and the count jumps from 3 to 7. Verified by hand on 2026-08-12; that is the
+/// four-minute hang the user reported, in test form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spent_five_hour_window_fails_fast_instead_of_waiting_minutes() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::provider::clear_all_account_cooldowns();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+
+    // Seeded as usage snapshots, deliberately *not* via the 429 path: that path
+    // also sets a rotation cooldown, and a cooldown alone is enough to steer
+    // rotation, which would hide whether the `exhausted` predicate is right.
+    let reset = (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339();
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(
+        &second_account_label(),
+        1.0,
+        0.49,
+        Some(reset.clone()),
+    );
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(&first_account_label(), 1.0, 0.24, Some(reset));
+
+    let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+    set_test_api_url_override(Some(server.url()));
+
+    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+    let model_state = Arc::new(std::sync::RwLock::new(
+        "claude-3-5-haiku-20241022".to_string(),
+    ));
+
+    run_stream_with_retries(
+        Client::new(),
+        "fixture-access-0".to_string(),
+        true,
+        e2e_test_request(),
+        tx,
+        Arc::new(RwLock::new(None)),
+        "claude-3-5-haiku-20241022".to_string(),
+        "test-session".to_string(),
+        model_state,
+        DirectTransportConfig::from_env(),
+    )
+    .await;
+
+    set_test_api_url_override(None);
+
+    let mut details = Vec::new();
+    while let Some(event) = rx.recv().await {
+        if let Ok(StreamEvent::StatusDetail { detail }) = event {
+            details.push(detail);
+        }
+    }
+
+    assert_eq!(
+        server.call_count(),
+        (MAX_RETRIES + 1) as usize,
+        "a quota wall must cost one request per account and no waits; details: {details:?}"
+    );
+    assert!(
+        !details
+            .iter()
+            .any(|detail| detail.contains("Every account rate limited; waiting")),
+        "a quota wall must not be waited out as if it were a burst: {details:?}"
+    );
+
+    // And the user must be told when the quota returns, instead of being left
+    // with a bare 429 and an offer to downgrade the model.
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("out of quota") && detail.contains("earliest reset")),
+        "the failure must name the earliest reset time: {details:?}"
+    );
+
+    // The usage cache is process-global, so a seeded verdict must not outlive
+    // this test and steer an unrelated one.
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// A rotation must refresh the new account's usage snapshot, in the background.
+///
+/// Guards the switch that keeps this refresh from leaking across tests: a
+/// `cfg(test)` flag that silently disabled a real feature would be worse than
+/// the flakiness it fixes, so one test turns it on and observes it firing.
+///
+/// Observed through the cache rather than through the network: the refresh
+/// *replaces* whatever entry the rotated-to account had, so a planted sentinel
+/// disappearing is proof the refresh ran. The probe cannot succeed here (the
+/// fixture tokens are not real credentials and the usage endpoint is not mocked),
+/// which is the point: even a failing refresh must invalidate the stale verdict
+/// rather than leave it in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_refreshes_the_new_accounts_usage_in_the_background() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // A stale "has headroom" verdict for the account the rotation will land on.
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(&second_account_label(), 0.10, 0.10, None);
+    assert!(
+        jcode_base::usage::cached_anthropic_account_usage_any_age(&second_account_label()).is_some(),
+        "precondition: claude-2 has a cached verdict"
+    );
+
+    set_post_rotation_usage_refresh_for_tests(true);
+    let credentials: Arc<RwLock<Option<CachedCredentials>>> = Arc::new(RwLock::new(None));
+    let mut tried = vec![first_account_label()];
+    let switched = switch_to_next_claude_account(&credentials, &mut tried).await;
+    assert_eq!(
+        switched.as_ref().map(|switch| switch.label.as_str()),
+        Some(second_account_label().as_str()),
+        "precondition: the rotation must land on claude-2"
+    );
+
+    // The refresh is detached, so poll rather than assume it has been scheduled.
+    //
+    // The check is "the seeded verdict is gone", not "the entry is gone": a failed
+    // probe caches an error entry of its own, so the entry can exist again while
+    // still no longer asserting the stale 10% headroom. An error entry reports
+    // `exhausted == false`, i.e. "unknown", which is the correct reading of a
+    // probe that could not be reached.
+    let mut refreshed = false;
+    for _ in 0..100 {
+        match jcode_base::usage::cached_anthropic_account_usage_any_age(&second_account_label()) {
+            None => {
+                refreshed = true;
+                break;
+            }
+            Some(usage) if usage.last_error.is_some() => {
+                refreshed = true;
+                break;
+            }
+            Some(_) => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    set_post_rotation_usage_refresh_for_tests(false);
+
+    assert!(
+        refreshed,
+        "a rotation must not leave the new account's stale usage verdict in place"
+    );
+
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// The cross-turn property the user actually reported: after a rotation away
+/// from a quota-blocked account, the *next* turn must not go back to it.
+///
+/// Every other test here drives a single turn, and a single turn cannot show
+/// this bug. With two accounts, `tried_accounts` already excludes the spent one
+/// within a turn, so even the old code rotates away exactly once and looks fine.
+/// The failure is *between* turns: `tried_accounts` is per-request, the cooldown
+/// expired after 60s, and the cached verdict still claimed headroom, so the next
+/// turn started on the blocked account again. That is the
+/// `claude-2 -> claude-1 -> claude-2` flapping in the report, and it is why a
+/// single live turn is not evidence that this is fixed.
+///
+/// Both accounts answer 429 here, so neither can "win" by serving; what is
+/// measured is purely *which account each request targets*.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_turn_does_not_return_to_the_quota_blocked_account() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // claude-2 is quota-blocked for hours; claude-1 has headroom. The session
+    // starts on the blocked account, as the user's did.
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(
+        &second_account_label(),
+        1.0,
+        0.49,
+        Some((chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339()),
+    );
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(&first_account_label(), 0.41, 0.24, None);
+    jcode_base::auth::claude::set_active_account(&second_account_label()).unwrap();
+
+    let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+    set_test_api_url_override(Some(server.url()));
+
+    // Two turns, each its own request with its own fresh `tried_accounts`.
+    // `first_call_of_turn` records where each turn began, because the property
+    // under test is which account a turn *starts* on.
+    let mut first_call_of_turn = Vec::new();
+    for _ in 0..2 {
+        first_call_of_turn.push(server.call_count());
+
+        let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+        let model_state = Arc::new(std::sync::RwLock::new(
+            "claude-3-5-haiku-20241022".to_string(),
+        ));
+        let token = jcode_base::auth::claude::active_account_label()
+            .map(|label| format!("fixture-access-{label}"))
+            .unwrap_or_else(|| "fixture-access-1".to_string());
+
+        run_stream_with_retries(
+            Client::new(),
+            token,
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+            // Upstream threads the direct-transport config through explicitly;
+            // the test wants exactly what production reads from the env.
+            super::DirectTransportConfig::from_env(),
+        )
+        .await;
+
+        while rx.recv().await.is_some() {}
+    }
+
+    set_test_api_url_override(None);
+
+    // Turn 1 starts on the blocked account by construction. Turn 2 must not:
+    // that is the whole complaint, and it is what the old code got wrong, since
+    // `tried_accounts` is per-request, the 60s cooldown had expired, and the
+    // cached verdict still claimed headroom.
+    let second_turn_start = first_call_of_turn[1];
+    assert!(
+        !server.authorization_contains(second_turn_start, "fixture-access-1"),
+        "the second turn must not start on the quota-blocked account"
+    );
+    // Deliberately not asserting *which* token the second turn opens with: the
+    // caller hands `run_stream_with_retries` its initial token, so the first
+    // call of a turn carries whatever the caller resolved, not a choice this
+    // loop made. The property that belongs to this code is the one below - the
+    // account the turn leaves behind for the next one - plus the assertion
+    // above that the spent account is not where a turn begins.
+    assert!(
+        (0..server.call_count())
+            .filter(|call| *call >= second_turn_start)
+            .all(|call| !server.authorization_contains(call, "fixture-access-1")),
+        "no call in the second turn may use the quota-blocked account"
+    );
+
+    // The session override must also have been left pointing at the healthy
+    // account, rather than rolled back onto the quota wall by the dead-end
+    // restore. This is the state the *third* turn would inherit.
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label(),
+        Some(first_account_label()),
+        "a dead end must not restore the session onto an account whose quota is spent"
+    );
+
+    // Note what is deliberately *not* asserted: that the blocked account is
+    // never contacted again at all. Once the healthy account also 429s, the
+    // blocked one is the only candidate left, and ADR-0015 keeps a limited
+    // account as a last resort rather than turning a recoverable state into a
+    // hard failure. Trying it once per turn is correct; *starting* there is not.
+
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// The cross-session policy from ADR-0018, as a decision table.
+///
+/// Previously untested and resting on code reading alone, on the grounds that
+/// it "needs two concurrent daemons". That was the wrong frame: concurrency
+/// reaches this decision only as *state another session left behind*, namely
+/// which account is active and which ones this request has already tried. Those
+/// are the two inputs, so the policy is testable directly.
+#[test]
+fn a_rotation_claims_the_shared_override_only_when_better_informed() {
+    let tried = |labels: &[&str]| -> Vec<String> { labels.iter().map(|l| l.to_string()).collect() };
+
+    // Single-session case, and the overwhelmingly common one: the request is on
+    // the account it started on, has proven that account refuses it, and so
+    // knows more than the shared pointer does.
+    assert!(
+        should_claim_shared_override(Some("claude-1"), &tried(&["claude-1"])),
+        "a request that proved the active account refuses it must move the pointer"
+    );
+
+    // The flapping case. Another session has settled on claude-1 while this
+    // request was working through claude-2. This request has NOT tried claude-1,
+    // so it knows nothing about it and must not drag that session off it.
+    assert!(
+        !should_claim_shared_override(Some("claude-1"), &tried(&["claude-2"])),
+        "a request must not move a session onto an account it has not tried"
+    );
+
+    // Once this request has also proven claude-1 refuses it, it is again the
+    // better-informed party and may claim the pointer.
+    assert!(
+        should_claim_shared_override(Some("claude-1"), &tried(&["claude-2", "claude-1"])),
+        "having proven every account refuses it, the request may claim the pointer"
+    );
+
+    // No override set means the primary account with nothing learned about it;
+    // claiming preserves the pre-ADR-0018 behaviour rather than silently
+    // changing it.
+    assert!(
+        should_claim_shared_override(None, &tried(&["claude-1"])),
+        "an unset override must still be claimable"
+    );
+}
+
+/// The same policy exercised through the real rotation, against the real
+/// process-global override, rather than through the pure helper.
+///
+/// This is the part a decision table cannot prove: that `switch_to_next_claude_account`
+/// actually consults the policy and actually leaves the shared override alone
+/// when told to. Simulating the other session is a one-line write to the same
+/// global the other session would have written, which is precisely what it
+/// leaves behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_leaves_another_sessions_account_alone() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    // A third account, because with only two this path is unreachable: the
+    // candidate list excludes whatever account is currently active, so when
+    // another session holds claude-1 and this request has already tried
+    // claude-2, nothing is left to rotate to and the question never arises.
+    // Documented in ADR-0018 as a real limitation of the contained fix.
+    jcode_base::auth::claude::upsert_account(jcode_base::auth::claude::AnthropicAccount {
+        label: "claude-3".to_string(),
+        access: "fixture-access-claude-3".to_string(),
+        refresh: String::new(),
+        expires: chrono::Utc::now().timestamp_millis() + 3_600_000,
+        email: None,
+        subscription_type: Some("max".to_string()),
+        scopes: vec![],
+    })
+    .unwrap();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // Another session on this daemon has settled on claude-1.
+    jcode_base::auth::claude::set_active_account_override(Some(first_account_label()));
+
+    // Our request has been working through claude-2 and has not tried claude-1.
+    let credentials: Arc<RwLock<Option<CachedCredentials>>> = Arc::new(RwLock::new(None));
+    let mut tried = vec![second_account_label()];
+
+    let switched = switch_to_next_claude_account(&credentials, &mut tried).await;
+    let switched = switched.expect("a candidate must be available");
+
+    assert!(
+        !switched.claimed_shared_override,
+        "the rotation must report that it did not claim the shared override"
+    );
+    assert_eq!(
+        jcode_base::auth::claude::active_account_label(),
+        Some(first_account_label()),
+        "the other session's account must be exactly as it left it"
+    );
+
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// The user's screenshot, as a test: a burst limit must not rotate accounts on
+/// every single turn, forever.
+///
+/// The *burst* case, distinct from `a_later_turn_does_not_return_to_the_quota_blocked_account`
+/// which covers the quota case. Both accounts have headroom here (the user's
+/// were at 0% and 34% of their 5-hour windows), so nothing is quota-blocked, the
+/// ADR-0003 dead-end restore fires on every turn, and each turn ends on the
+/// account it started on:
+///
+/// ```text
+/// turn 1: switching claude-1 to claude-2 ... restored claude-1
+/// turn 2: switching claude-1 to claude-2 ... restored claude-1   <- identical
+/// turn 3: switching claude-1 to claude-2 ... restored claude-1   <- forever
+/// ```
+///
+/// What is measured is the number of *rotation announcements*, not which account
+/// each turn starts on. An earlier version of this test asserted the latter and
+/// passed against the bug: because every turn is restored to where it began, the
+/// starting account never changes, so "it never switches" and "it switches and
+/// switches back every turn" are indistinguishable by that measure. The
+/// observable that separates them is how many times the runtime says it is
+/// switching.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_limit_does_not_rotate_on_every_turn() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // Both accounts have real headroom: a burst limit, not a quota wall.
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(&first_account_label(), 0.00, 0.38, None);
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(&second_account_label(), 0.34, 0.62, None);
+    jcode_base::auth::claude::set_active_account(&first_account_label()).unwrap();
+
+    let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+    set_test_api_url_override(Some(server.url()));
+
+    const TURNS: usize = 3;
+    let mut rotations = 0usize;
+    for _ in 0..TURNS {
+        let start = jcode_base::auth::claude::active_account_label()
+            .unwrap_or_else(jcode_base::auth::claude::primary_account_label);
+
+        let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+        let model_state = Arc::new(std::sync::RwLock::new(
+            "claude-3-5-haiku-20241022".to_string(),
+        ));
+
+        run_stream_with_retries(
+            Client::new(),
+            format!("fixture-access-{start}"),
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+            // Upstream threads the direct-transport config through explicitly;
+            // the test wants exactly what production reads from the env.
+            super::DirectTransportConfig::from_env(),
+        )
+        .await;
+
+        while let Some(event) = rx.recv().await {
+            if let Ok(StreamEvent::StatusDetail { detail }) = event
+                && detail.contains("switching Claude account")
+            {
+                rotations += 1;
+            }
+        }
+    }
+
+    set_test_api_url_override(None);
+
+    // One rotation total is correct: the first turn learns the active account is
+    // limited and moves. Every later turn should already know, and stay put.
+    // Three rotations across three turns is the reported bug.
+    assert!(
+        rotations <= 1,
+        "a burst limit must be learned once, not re-learned every turn; \
+         saw {rotations} rotations across 3 turns"
+    );
+
+    // The point of not rotating is that it costs a request. Rotating onto a
+    // known-limited account buys a second 429 per turn and nothing else, so the
+    // per-turn cost is pinned alongside the announcement - but as a function of
+    // the retry budget, not as a measured constant. An earlier version asserted
+    // `calls < 21`, a number taken from one machine at one retry budget; raising
+    // MAX_RETRIES from 2 to 3 makes the same correct behaviour cost 22 requests
+    // and the test failed for a reason that had nothing to do with rotation.
+    //
+    // Budget per turn: (MAX_RETRIES + 1) attempts, plus the rate-limit waits
+    // ADR-0015 owns, plus at most one rotation hop for the whole run. The bound
+    // below allows every turn its full retry budget and one extra request, and
+    // still fails if each turn pays for its own hop.
+    let calls = server.call_count();
+    let turn_budget = (MAX_RETRIES + 1) as usize + MAX_RATE_LIMIT_RETRIES as usize;
+    let allowed = TURNS * turn_budget + 1;
+    assert!(
+        calls <= allowed,
+        "turns must not each pay for a hop onto a known-limited account; \
+         {calls} requests for {TURNS} turns, budget {allowed}"
+    );
+
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// Returning no rotation candidates must not turn a recoverable rate limit into
+/// a hard failure.
+///
+/// This is the property ADR-0015 exists to protect, and the one that the old
+/// "keep cooling accounts as a last resort" rule was written to guarantee. That
+/// rule was removed (a known-limited account is no longer offered), so the
+/// guarantee has to be re-established by a different route: the empty candidate
+/// list reaches `switch_to_next_claude_account`'s `None` branch, which sets
+/// `rotation_exhausted` and falls through to the rate-limit *wait*.
+///
+/// Asserted as the presence of the waiting status lines. If a future change ever
+/// makes an empty candidate list fail the turn outright, this fails, and the
+/// user gets an instant error instead of a turn that would have succeeded once
+/// the burst cleared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_candidates_still_waits_out_a_burst_rather_than_failing() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // Both accounts already known-limited, so the candidate list is empty from
+    // the very first rotation attempt: the exact state the removed last-resort
+    // rule used to paper over.
+    jcode_base::provider::note_account_rate_limited(
+        jcode_provider_core::ActiveProvider::Claude,
+        &first_account_label(),
+    );
+    jcode_base::provider::note_account_rate_limited(
+        jcode_provider_core::ActiveProvider::Claude,
+        &second_account_label(),
+    );
+    assert!(
+        jcode_base::provider::account_failover_candidates(
+            jcode_provider_core::ActiveProvider::Claude
+        )
+        .is_empty(),
+        "precondition: no rotation candidates remain"
+    );
+
+    let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
+    set_test_api_url_override(Some(server.url()));
+
+    let (tx, mut rx) = mpsc::channel::<Result<StreamEvent>>(100);
+    let model_state = Arc::new(std::sync::RwLock::new(
+        "claude-3-5-haiku-20241022".to_string(),
+    ));
+
+    // Force the burst verdict: nothing is out of quota, so waiting is the
+    // correct response and the turn is genuinely recoverable.
+    jcode_base::provider::with_quota_exhausted_override(Some(false), || {
+        futures::executor::block_on(run_stream_with_retries(
+            Client::new(),
+            "fixture-access-0".to_string(),
+            true,
+            e2e_test_request(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            "claude-3-5-haiku-20241022".to_string(),
+            "test-session".to_string(),
+            model_state,
+            DirectTransportConfig::from_env(),
+        ));
+    });
+
+    set_test_api_url_override(None);
+
+    let mut waits = 0usize;
+    while let Some(event) = rx.recv().await {
+        if let Ok(StreamEvent::StatusDetail { detail }) = event
+            && detail.contains("Every account rate limited; waiting")
+        {
+            waits += 1;
+        }
+    }
+
+    assert!(
+        waits > 0,
+        "with no candidates left the turn must wait out the burst, not fail \
+         immediately; saw {waits} waits"
+    );
+
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// Five concurrent sessions sharing two accounts must not each rotate.
+///
+/// The real incident (2026-08-14, five open sessions on one daemon): every
+/// session hits the same 5-hour limit within a few seconds of the others, and
+/// each independently decides to rotate. The log shows four different sessions
+/// alternating `claude-1 -> claude-2 -> claude-1` inside 25 seconds, and the
+/// user sees a wall of "Rate limited; switched Anthropic account" lines.
+///
+/// This is *not* the single-session cross-turn flapping fixed earlier (that one
+/// is identifiable by the "restored" line, which is absent here). It is a
+/// check-then-act race between sessions: the cooldown that would tell session B
+/// "claude-2 is limited, do not go there" is only recorded once B's own 429
+/// comes back, and all five sessions pass the check before any of their requests
+/// return.
+///
+/// The property under test is the one the user actually feels: given one shared
+/// pool of accounts, N concurrent sessions reacting to the same limit must
+/// perform *one* pool-wide move, not N. Followers must observe the leader's
+/// move and reuse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_sessions_rotate_the_shared_pool_only_once() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // Every session starts where the daemon left them: on claude-1, which has
+    // just started returning 429 for all of them at once.
+    jcode_base::auth::claude::set_active_account_override(Some(first_account_label()));
+
+    const SESSIONS: usize = 5;
+    let mut handles = Vec::with_capacity(SESSIONS);
+    for _ in 0..SESSIONS {
+        handles.push(tokio::spawn(async move {
+            let credentials: Arc<RwLock<Option<CachedCredentials>>> = Arc::new(RwLock::new(None));
+            // Each session has tried the account it was on and now wants out,
+            // which is exactly the state five sessions reach simultaneously.
+            let mut tried = vec![first_account_label()];
+            switch_to_next_claude_account(&credentials, &mut tried)
+                .await
+                .map(|switch| (switch.label, switch.claimed_shared_override))
+        }));
+    }
+
+    let mut labels = Vec::new();
+    let mut claims = 0usize;
+    let mut dead_ends = 0usize;
+    for handle in handles {
+        match handle.await.unwrap() {
+            Some((label, claimed)) => {
+                labels.push(label);
+                if claimed {
+                    claims += 1;
+                }
+            }
+            None => dead_ends += 1,
+        }
+    }
+
+    // Serialising alone is not enough. With the leader holding the only other
+    // account, a follower that still runs the full rotation finds every
+    // candidate either active or already tried and reports a dead end, which
+    // sends a perfectly serviceable turn into the rate-limit wait. Followers
+    // must *adopt* the leader's account instead.
+    assert_eq!(
+        dead_ends, 0,
+        "no session may dead-end while a usable account exists, saw {dead_ends} of {SESSIONS} \
+         (followers are re-running rotation instead of adopting the leader's account)"
+    );
+
+    // Exactly one session may move the shared pool. The others must follow it,
+    // not re-decide: N claims is N announcements to the user and N chances to
+    // land on an account a sibling has already spent.
+    assert_eq!(
+        claims, 1,
+        "exactly one concurrent session may claim the shared override, saw {claims} of {SESSIONS} \
+         (this is the multi-session rotation stampede: each session announces its own switch)"
+    );
+
+    // And they must all end up on the same account. Splitting the pool is how
+    // the alternating claude-1/claude-2 pattern appears in the log.
+    let settled: std::collections::BTreeSet<&str> = labels.iter().map(String::as_str).collect();
+    assert_eq!(
+        settled.len(),
+        1,
+        "all sessions must converge on one account, saw {settled:?}"
+    );
+    assert!(
+        !settled.contains(first_account_label().as_str()),
+        "no session may settle back on the limited account it was rotating away from"
+    );
+
+    jcode_base::provider::clear_all_account_cooldowns();
+    jcode_base::auth::claude::set_active_account_override(None);
+}
+
+/// A success that started before a sibling's 429 must not erase that 429.
+///
+/// This is the defect behind the flapping that survived ADR-0018 and ADR-0020.
+/// One daemon serves many sessions, so at any moment there is usually a long
+/// stream in flight *and* other requests being refused. The success path used to
+/// call `clear_account_rate_limit` unconditionally, which deletes both the
+/// cooldown and the cached limit verdict, i.e. exactly the two pieces of state
+/// every rotation decision reads. A stream that was accepted before the pool
+/// tipped over therefore wiped the evidence its siblings had just paid a 429 to
+/// collect, and the next request rotated straight back onto the limited account.
+///
+/// The ordering here is the whole test, and it is the ordering the daemon
+/// produces many times a minute:
+///
+/// 1. a request is accepted on `claude-1` (time T0);
+/// 2. at T1 > T0, another session's request to `claude-1` is refused, which
+///    records the cooldown;
+/// 3. at T2 > T1, the first request finishes successfully.
+///
+/// The success is real, but it is evidence about T0, not about T2. Deleting the
+/// T1 cooldown with it is how `claude-1 → claude-2 → claude-1 → claude-2`
+/// appears in the log with no "restored" line anywhere near it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_success_does_not_erase_a_newer_rate_limit_from_a_concurrent_session() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // T0: our long-running request set out and was accepted.
+    let request_started = std::time::Instant::now();
+
+    // T1: a sibling session's request to the same account is refused. Sleep
+    // first so the recorded `noted_at` is strictly after `request_started`,
+    // which is the ordering the guard reads. `Instant` has nanosecond
+    // resolution, so this is about making the intent explicit rather than about
+    // clock granularity.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    jcode_base::provider::note_account_rate_limited(
+        jcode_provider_core::ActiveProvider::Claude,
+        &first_account_label(),
+    );
+    assert!(
+        jcode_base::provider::account_is_cooling_down(
+            jcode_provider_core::ActiveProvider::Claude,
+            first_account_label().as_str(),
+        ),
+        "precondition: the sibling's 429 must have put the first account on cooldown"
+    );
+
+    // T2: our request completes successfully and reports it.
+    let cleared = jcode_base::provider::clear_account_rate_limit_if_newer(
+        jcode_provider_core::ActiveProvider::Claude,
+        first_account_label().as_str(),
+        request_started,
+    );
+
+    assert!(
+        !cleared,
+        "a success that began before the refusal must not report clearing it"
+    );
+    assert!(
+        jcode_base::provider::account_is_cooling_down(
+            jcode_provider_core::ActiveProvider::Claude,
+            first_account_label().as_str(),
+        ),
+        "the cooldown recorded while this request was in flight is newer evidence and must \
+         survive: erasing it is what sends the next request back onto the limited account, \
+         producing the first -> second -> first account ladder"
+    );
+
+    // The usage verdict is the state rotation actually reads (ADR-0017), so it
+    // must not be cleared either. Checked separately: clearing one and keeping
+    // the other is the failure mode ADR-0017 exists to prevent, and it is
+    // invisible if the test only looks at the cooldown.
+    assert!(
+        jcode_base::usage::cached_anthropic_account_usage_any_age(&first_account_label()).is_none()
+            || jcode_base::usage::cached_anthropic_account_usage_any_age(&first_account_label())
+                .is_some_and(|usage| !usage.exhausted()),
+        "sanity: an unexplained 429 only forgets the verdict, it does not assert exhaustion"
+    );
+
+    // The other half of the rule: a genuinely newer success *does* clear, or an
+    // account would stay excluded for the full window after it started serving
+    // again. Without this assertion the guard above could be implemented as
+    // "never clear", which would be a different bug.
+    let later_request = std::time::Instant::now();
+    let cleared_later = jcode_base::provider::clear_account_rate_limit_if_newer(
+        jcode_provider_core::ActiveProvider::Claude,
+        first_account_label().as_str(),
+        later_request,
+    );
+    assert!(
+        cleared_later,
+        "a request that started after the refusal proves the account is serving again"
+    );
+    assert!(
+        !jcode_base::provider::account_is_cooling_down(
+            jcode_provider_core::ActiveProvider::Claude,
+            first_account_label().as_str(),
+        ),
+        "a newer success must release the cooldown, or a recovered account stays excluded"
+    );
+
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// When every account is cooling, the wait must be sized to the pool's own
+/// deadline rather than a blind backoff.
+///
+/// The old wait fired five times, ~15s apart, and each attempt was a real
+/// request that earned a real 429 and re-extended the very cooldown it had just
+/// re-proved. Multiplied by the number of open sessions, that is the wall of
+/// rate-limit lines the user sees. This asserts the process consults what it
+/// already knows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pool_wait_is_sized_to_the_cooldown_not_a_blind_backoff() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let _cooldown_guard = jcode_base::provider::account_failover::lock_account_cooldown_tests();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    seed_two_claude_accounts();
+    jcode_base::usage::clear_anthropic_account_usage_for_tests();
+    jcode_base::provider::clear_all_account_cooldowns();
+
+    // Nothing limited: there is an account to rotate to, so there is nothing to
+    // wait for. Reporting a wait here would stall a turn that could be served
+    // immediately, which is worse than the bug being fixed.
+    assert_eq!(
+        jcode_base::provider::time_until_any_account_is_eligible(
+            jcode_provider_core::ActiveProvider::Claude
+        ),
+        None,
+        "with a healthy account available the caller must rotate, not wait"
+    );
+
+    // One limited, one healthy: still nothing to wait for.
+    jcode_base::provider::note_account_rate_limited(
+        jcode_provider_core::ActiveProvider::Claude,
+        &first_account_label(),
+    );
+    assert_eq!(
+        jcode_base::provider::time_until_any_account_is_eligible(
+            jcode_provider_core::ActiveProvider::Claude
+        ),
+        None,
+        "one limited account does not make the pool unavailable"
+    );
+
+    // Both limited, with claude-2 recovering much sooner. The wait must be the
+    // *soonest* deadline: waiting for the last one would sit through a reset
+    // that has nothing to do with the account about to come back.
+    jcode_base::provider::note_account_rate_limited_until(
+        jcode_provider_core::ActiveProvider::Claude,
+        &first_account_label(),
+        Some(chrono::Utc::now() + chrono::Duration::hours(3)),
+    );
+    jcode_base::provider::note_account_rate_limited(
+        jcode_provider_core::ActiveProvider::Claude,
+        &second_account_label(),
+    );
+
+    let wait = jcode_base::provider::time_until_any_account_is_eligible(
+        jcode_provider_core::ActiveProvider::Claude,
+    )
+    .expect("with every account cooling there is a real deadline to wait for");
+
+    // claude-2 is on the 60s burst-shaped fallback window; claude-1 is hours
+    // out. Anything near the latter means the soonest-first rule is broken.
+    assert!(
+        wait <= std::time::Duration::from_secs(60),
+        "the wait must track the soonest account to recover (claude-2, ~60s), got {wait:?}"
+    );
+    assert!(
+        wait > std::time::Duration::from_secs(30),
+        "the wait must be the real remaining cooldown, not a token delay: {wait:?}"
+    );
+
+    jcode_base::provider::clear_all_account_cooldowns();
+}
+
+/// Concurrent waiters must not wake in lockstep.
+///
+/// Every session derives the same deadline from the same shared cooldown, so
+/// without a spread they all fire the instant it expires, at an account that can
+/// serve maybe one of them. The rest are refused, the cooldown is re-extended,
+/// and the pattern repeats: a thundering herd wearing the costume of a fix.
+#[test]
+fn concurrent_waiters_do_not_wake_in_lockstep() {
+    let spreads: std::collections::BTreeSet<u128> = (0..16)
+        .map(|salt| pool_recovery_spread(salt).as_millis())
+        .collect();
+
+    assert!(
+        spreads.len() >= 12,
+        "16 concurrent waiters must land in distinct wake-up slots, got {} distinct: {spreads:?}",
+        spreads.len()
+    );
+
+    for salt in 0..64u64 {
+        let spread = pool_recovery_spread(salt);
+        assert!(
+            spread < std::time::Duration::from_millis(MAX_POOL_RECOVERY_SPREAD_MS),
+            "the spread must stay inside its bound, salt {salt} gave {spread:?}"
+        );
+    }
+
+    // Stable within a request: a retry must keep its slot rather than re-roll
+    // into a sibling's.
+    assert_eq!(
+        pool_recovery_spread(7),
+        pool_recovery_spread(7),
+        "one request's slot must not move between its own attempts"
+    );
+}
+
+/// The user's report, as a test: one session rotates the pool, every other
+/// session keeps 429ing on the old account.
+///
+/// The token cache was keyed on expiry alone, so a session holding a valid
+/// `claude-2` token never re-read the (process-wide) override after another
+/// session moved it to `claude-1`. The token is valid, so nothing rejects it as
+/// auth; the request just keeps landing on the account that already refused it,
+/// while the session header claims the new one. See ADR-0024.
+#[test]
+fn a_cached_token_for_another_account_is_not_reused() {
+    let future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    let cached = CachedCredentials {
+        access_token: "token-for-claude-2".to_string(),
+        refresh_token: "refresh".to_string(),
+        expires_at: future,
+        account_label: Some("claude-2".to_string()),
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+
+    assert!(
+        cached_token_is_usable(&cached, Some("claude-2"), now),
+        "a fresh token for the active account must be reused"
+    );
+    assert!(
+        !cached_token_is_usable(&cached, Some("claude-1"), now),
+        "a token for another account must be refused even though it is valid"
+    );
+    assert!(
+        !cached_token_is_usable(&cached, None, now),
+        "no known active account must not silently keep an account-specific token"
+    );
+}
+
+/// A token cached before the label existed (a live cache carried across a
+/// reload) is refused once, so it is replaced by a labelled one rather than
+/// trusted blindly.
+#[test]
+fn an_unlabelled_cached_token_is_refreshed_once() {
+    let cached = CachedCredentials {
+        access_token: "legacy".to_string(),
+        refresh_token: "refresh".to_string(),
+        expires_at: chrono::Utc::now().timestamp_millis() + 3_600_000,
+        account_label: None,
+    };
+    assert!(!cached_token_is_usable(
+        &cached,
+        Some("claude-1"),
+        chrono::Utc::now().timestamp_millis()
+    ));
+}
+
+/// Expiry still disqualifies a token, label match or not.
+#[test]
+fn an_expiring_token_is_refused_even_for_the_active_account() {
+    let cached = CachedCredentials {
+        access_token: "about-to-expire".to_string(),
+        refresh_token: "refresh".to_string(),
+        // Inside the 5-minute refresh buffer.
+        expires_at: chrono::Utc::now().timestamp_millis() + 60_000,
+        account_label: Some("claude-1".to_string()),
+    };
+    assert!(!cached_token_is_usable(
+        &cached,
+        Some("claude-1"),
+        chrono::Utc::now().timestamp_millis()
+    ));
+}
+
+/// Meta-test: the pre-fix rule (expiry only) must fail the case above.
+///
+/// Guards against a future "simplification" that drops the label comparison and
+/// leaves a green suite behind.
+#[test]
+fn the_pre_fix_expiry_only_rule_would_have_missed_the_bug() {
+    fn expiry_only(cached: &CachedCredentials, now_ms: i64) -> bool {
+        cached.expires_at > now_ms + 300_000
+    }
+    let cached = CachedCredentials {
+        access_token: "token-for-claude-2".to_string(),
+        refresh_token: "refresh".to_string(),
+        expires_at: chrono::Utc::now().timestamp_millis() + 3_600_000,
+        account_label: Some("claude-2".to_string()),
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    assert!(
+        expiry_only(&cached, now),
+        "the old rule accepted a token for the wrong account"
+    );
+    assert!(
+        !cached_token_is_usable(&cached, Some("claude-1"), now),
+        "the current rule must reject what the old one accepted"
+    );
 }

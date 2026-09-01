@@ -2,6 +2,103 @@ use super::*;
 use anyhow::Result;
 
 impl MultiProvider {
+    /// Make `provider` the session's active provider after its credential was
+    /// re-pointed at a different account, returning the model now in force.
+    ///
+    /// Switching an account only changes *which credential* a provider slot
+    /// uses. It says nothing about which slot the next turn is routed to, so
+    /// `/account openai switch openai-1` from a Claude session used to leave the
+    /// session on Claude: the turn went straight back to the rate-limited
+    /// Anthropic account and 429'd again, while the UI had just reported a
+    /// successful switch to OpenAI. Picking an account is a statement about
+    /// where work should run, so activate the provider that owns it.
+    ///
+    /// Returns `Ok(None)` when the provider was already active (nothing to do)
+    /// so callers can stay quiet rather than announce a no-op switch.
+    ///
+    /// Deliberately does *not* run `auto_select_multi_account_for_provider`,
+    /// unlike [`Self::switch_active_provider_to`]. That helper re-picks the
+    /// account by usage probe, which would immediately overrule the account the
+    /// user just chose by hand.
+    pub(super) fn activate_provider_for_account_switch_inner(
+        &self,
+        provider_key: &str,
+    ) -> Result<Option<String>> {
+        let target = Self::parse_provider_hint(provider_key)
+            .ok_or_else(|| anyhow::anyhow!("Unknown provider `{}`", provider_key))?;
+        if self.active_provider() == target {
+            return Ok(None);
+        }
+        if !self.provider_is_configured(target) {
+            anyhow::bail!(
+                "Provider `{}` is not configured in this session",
+                Self::provider_key(target)
+            );
+        }
+        self.set_active_provider(target);
+        Ok(Some(self.model()))
+    }
+
+    /// Run the account ladder for `candidate`, whether or not the session is
+    /// currently on it, and adopt the provider when a different one serves.
+    ///
+    /// The rule is "every account of a provider before the next provider", and
+    /// the loop only honoured half of it: the ladder ran solely
+    /// for the provider the session started on (`if candidate == active`). Once
+    /// the sequence crossed into another multi-account provider it tried exactly
+    /// one account - whichever `auth.json` last recorded as active - and, if
+    /// that one was spent, walked past a funded sibling to the next provider,
+    /// eventually reporting "No tokens/providers left".
+    ///
+    /// Observed shape of the bug, from the test that reproduces it: the very
+    /// error that gave up also said "Another Anthropic account has headroom:
+    /// `claude-2`. Use `/account switch claude-2`" - jcode knew the answer and
+    /// asked the user to type it.
+    ///
+    /// Adopting the provider on success is not cosmetic. The stream is about to
+    /// be served by `candidate`, so leaving `active` pointing at the provider
+    /// that just refused would make the next turn start the whole ladder again
+    /// from the spent account.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn try_account_failover_for_candidate(
+        &self,
+        candidate: ActiveProvider,
+        active: ActiveProvider,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        mode: CompletionMode<'_>,
+        reason: &str,
+        notes: &mut Vec<String>,
+    ) -> Result<Option<EventStream>> {
+        let Some(stream) = self
+            .try_same_provider_account_failover(candidate, messages, tools, mode, reason, notes)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        if candidate != active {
+            self.set_active_provider(candidate);
+            let from_label = Self::provider_label(active);
+            let to_label = Self::provider_label(candidate);
+            crate::logging::info(&format!(
+                "{}: switched from {} to {} on an alternate account",
+                mode.switch_log_prefix(),
+                from_label,
+                to_label
+            ));
+            self.startup_notices
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(format!(
+                    "⚡ Auto-fallback: {} unavailable, switched to {}",
+                    from_label, to_label
+                ));
+        }
+
+        Ok(Some(stream))
+    }
+
     pub(super) async fn try_same_provider_account_failover(
         &self,
         provider: ActiveProvider,

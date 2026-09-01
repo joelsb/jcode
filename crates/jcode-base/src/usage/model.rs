@@ -85,6 +85,53 @@ impl UsageData {
         })
     }
 
+    /// Utilization at or above which Anthropic refuses further requests on a
+    /// window. Not 1.0: the reported ratio is rounded, and a window displayed
+    /// as 100% has already started refusing.
+    pub const EXHAUSTED_RATIO: f32 = 0.99;
+
+    /// Whether *any* window is spent, and so the account cannot serve a request
+    /// until that window resets.
+    ///
+    /// Anthropic applies the 5-hour and 7-day limits independently and blocks a
+    /// request when **either** is full, so this is a disjunction. It read
+    /// `five_hour >= 0.99 && seven_day >= 0.99` until 2026-08-12, which made an
+    /// account at 5h=100% / 7d=49% report as having headroom: rotation kept
+    /// selecting the blocked account, the "every account is exhausted"
+    /// fast-fail never fired, and a turn spent ~4 minutes waiting out a limit
+    /// that could not clear for hours. See ADR-0016.
+    pub fn exhausted(&self) -> bool {
+        self.five_hour >= Self::EXHAUSTED_RATIO || self.seven_day >= Self::EXHAUSTED_RATIO
+    }
+
+    /// When the window that is actually blocking will reset.
+    ///
+    /// The reset time only means something when paired with the window it
+    /// belongs to. Reporting the 5-hour reset for an account blocked by its
+    /// 7-day window would promise recovery hours before it can happen, so this
+    /// picks the reset of a spent window, preferring the sooner of the two when
+    /// both are spent, and falls back to whatever reset is known otherwise.
+    pub fn blocking_reset_at(&self) -> Option<String> {
+        let five_hour_spent = self.five_hour >= Self::EXHAUSTED_RATIO;
+        let seven_day_spent = self.seven_day >= Self::EXHAUSTED_RATIO;
+
+        match (five_hour_spent, seven_day_spent) {
+            // Both spent: the account is usable again only once the later one
+            // clears, but the sooner reset is the honest "check back at" time,
+            // and `usage_reset_passed` re-probes from there.
+            (true, true) => self
+                .five_hour_resets_at
+                .clone()
+                .or_else(|| self.seven_day_resets_at.clone()),
+            (true, false) => self.five_hour_resets_at.clone(),
+            (false, true) => self.seven_day_resets_at.clone(),
+            (false, false) => self
+                .five_hour_resets_at
+                .clone()
+                .or_else(|| self.seven_day_resets_at.clone()),
+        }
+    }
+
     /// Check if data is stale and should be refreshed
     pub fn is_stale(&self) -> bool {
         if usage_reset_passed([
@@ -111,6 +158,15 @@ impl UsageData {
             }
             None => true,
         }
+    }
+
+    /// Drop the freshness stamp so the next `get`/`get_sync` refetches.
+    ///
+    /// `UsageData` carries no account identity and the cache is global, so a
+    /// snapshot taken before an account switch is not stale by time but is
+    /// wrong by account. Callers that change the active account must call this.
+    pub fn mark_stale(&mut self) {
+        self.fetched_at = None;
     }
 
     /// Check if the last error was a rate limit (429)
@@ -217,6 +273,15 @@ impl OpenAIUsageData {
         }
     }
 
+    /// Whether *any* reported window is spent.
+    ///
+    /// Same disjunction as [`UsageData::exhausted`] and for the same reason: a
+    /// provider refuses the request as soon as one window fills, so requiring
+    /// every window to be full reports a blocked account as usable. See
+    /// ADR-0016.
+    ///
+    /// Only windows the provider actually reported are considered, so a missing
+    /// window is not read as either full or free.
     pub fn exhausted(&self) -> bool {
         if self.hard_limit_reached {
             return true;
@@ -226,11 +291,33 @@ impl OpenAIUsageData {
             return false;
         }
 
-        let mut windows = [self.five_hour.as_ref(), self.seven_day.as_ref()]
+        [self.five_hour.as_ref(), self.seven_day.as_ref()]
             .into_iter()
             .flatten()
-            .peekable();
-        windows.peek().is_some() && windows.all(|window| window.usage_ratio >= 0.99)
+            .any(|window| window.usage_ratio >= UsageData::EXHAUSTED_RATIO)
+    }
+
+    /// When the window that is actually blocking will reset, preferring a spent
+    /// window's reset over an unspent one's. Same reasoning as
+    /// [`UsageData::blocking_reset_at`].
+    pub fn blocking_reset_at(&self) -> Option<String> {
+        let windows = [
+            self.five_hour.as_ref(),
+            self.seven_day.as_ref(),
+            self.spark.as_ref(),
+        ];
+
+        windows
+            .into_iter()
+            .flatten()
+            .filter(|window| window.usage_ratio >= UsageData::EXHAUSTED_RATIO)
+            .find_map(|window| window.resets_at.clone())
+            .or_else(|| {
+                windows
+                    .into_iter()
+                    .flatten()
+                    .find_map(|window| window.resets_at.clone())
+            })
     }
 
     pub fn diagnostic_fields(&self) -> String {
@@ -406,12 +493,23 @@ impl AccountUsageProbe {
     }
 
     pub fn all_accounts_exhausted(&self) -> bool {
-        self.has_multiple_accounts()
-            && self
-                .accounts
-                .iter()
-                .filter(|account| account.error.is_none())
-                .all(|account| account.exhausted)
+        if !self.has_multiple_accounts() {
+            return false;
+        }
+        let mut probed = self
+            .accounts
+            .iter()
+            .filter(|account| account.error.is_none())
+            .peekable();
+        // No account could be probed, so nothing is known. `all()` is vacuously
+        // true on an empty set, which used to turn "the usage endpoint is
+        // unreachable" into "every account is exhausted": the most pessimistic
+        // possible reading of no evidence, and it drives both the startup
+        // warning and the retry loop's fast-fail path.
+        if probed.peek().is_none() {
+            return false;
+        }
+        probed.all(|account| account.exhausted)
     }
 
     pub fn switch_guidance(&self) -> Option<String> {
@@ -423,5 +521,155 @@ impl AccountUsageProbe {
             alternative.summary(),
             self.provider.switch_command(&alternative.label)
         ))
+    }
+}
+
+#[cfg(test)]
+mod window_exhaustion_tests {
+    use super::UsageData;
+
+    /// A spent weekly window and a spent 5-hour window are the same fact: the
+    /// account has no credits and cannot serve the turn. Anything downstream
+    /// (rotate to the next funded account, then cross providers) keys off this
+    /// one verdict, so weekly must never be a weaker signal than 5-hour.
+    ///
+    /// This is the rule a conjunction broke once already (ADR-0016): an account
+    /// at 5h=100%/7d=49% reported headroom and rotation kept reselecting it.
+    #[test]
+    fn either_spent_window_exhausts_the_account_identically() {
+        let five_hour_only = UsageData {
+            five_hour: 1.0,
+            seven_day: 0.01,
+            ..Default::default()
+        };
+        let weekly_only = UsageData {
+            five_hour: 0.23,
+            seven_day: 1.0,
+            ..Default::default()
+        };
+        let headroom = UsageData {
+            five_hour: 0.77,
+            seven_day: 0.5,
+            ..Default::default()
+        };
+
+        assert!(five_hour_only.exhausted(), "a spent 5-hour window blocks");
+        assert!(
+            weekly_only.exhausted(),
+            "a spent weekly window blocks exactly like a spent 5-hour window"
+        );
+        assert_eq!(
+            five_hour_only.exhausted(),
+            weekly_only.exhausted(),
+            "neither window may be treated as the weaker signal"
+        );
+        assert!(
+            !headroom.exhausted(),
+            "an account with capacity in both windows must stay in rotation"
+        );
+    }
+
+    /// The reset time is only meaningful paired with the window that blocked.
+    /// Reporting the 5-hour reset for a weekly-blocked account promises
+    /// recovery hours early, which is what makes a caller reselect it.
+    #[test]
+    fn the_blocking_window_owns_the_reset_it_reports() {
+        let weekly_only = UsageData {
+            five_hour: 0.23,
+            seven_day: 1.0,
+            five_hour_resets_at: Some("2026-08-31T17:40:00Z".to_string()),
+            seven_day_resets_at: Some("2026-09-05T02:00:00Z".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            weekly_only.blocking_reset_at().as_deref(),
+            Some("2026-09-05T02:00:00Z"),
+            "a weekly-blocked account must report the weekly reset, not the sooner 5-hour one"
+        );
+    }
+    /// No caller may keep its own copy of the exhaustion comparison.
+    ///
+    /// The rule was fixed to a disjunction in ADR-0016, but three private `&&`
+    /// copies survived (`provider/startup.rs`, the Anthropic runtime, the debug
+    /// server command). Each independently reported "headroom" for an account
+    /// blocked by its weekly window, which is exactly the reported failure: the
+    /// account-first ladder never started. Fixing the shared rule did nothing
+    /// for them, so this test fails if a copy reappears.
+    #[test]
+    fn no_caller_reimplements_the_exhaustion_comparison() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates dir")
+            .parent()
+            .expect("repo root");
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![repo.join("crates")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|name| name == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_some_and(|ext| ext == "rs")
+                    && path != std::path::Path::new(file!())
+                    && !path.ends_with("usage/model.rs")
+                {
+                    let Ok(source) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    for (index, line) in source.lines().enumerate() {
+                        let code = line.trim_start();
+                        if code.starts_with("//") || code.starts_with("///") {
+                            continue;
+                        }
+                        if line.contains("five_hour >=") && line.contains("seven_day >=")
+                            || (line.contains("five_hour >=") && line.contains("&&"))
+                        {
+                            offenders.push(format!("{}:{}", path.display(), index + 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these sites reimplement the exhaustion rule instead of calling UsageData::exhausted(); \
+             a private copy silently ignores a weekly-only exhaustion: {offenders:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mark_stale_tests {
+    use super::UsageData;
+
+    #[test]
+    fn mark_stale_forces_the_next_read_to_refetch() {
+        let mut usage = UsageData {
+            five_hour: 0.42,
+            fetched_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        };
+        assert!(
+            !usage.is_stale(),
+            "a just-fetched snapshot is fresh, which is why an account switch must invalidate it explicitly"
+        );
+
+        usage.mark_stale();
+
+        assert!(
+            usage.is_stale(),
+            "after an account switch the cached numbers belong to the previous account and must not be served"
+        );
     }
 }

@@ -1026,6 +1026,7 @@ impl App {
                 )));
                 // Keep account-sensitive UI state in sync immediately.
                 crate::auth::AuthStatus::invalidate_cache();
+                self.activate_provider_after_account_switch("claude");
                 self.context_limit = self.provider.context_window() as u64;
                 self.context_warning_shown = false;
             }
@@ -1098,6 +1099,7 @@ impl App {
                     label
                 )));
                 crate::auth::AuthStatus::invalidate_cache();
+                self.activate_provider_after_account_switch("openai");
                 self.context_limit = self.provider.context_window() as u64;
                 self.context_warning_shown = false;
             }

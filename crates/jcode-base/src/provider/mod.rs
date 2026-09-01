@@ -1,5 +1,5 @@
 mod accessors;
-mod account_failover;
+pub mod account_failover;
 pub mod activation;
 pub mod anthropic;
 pub mod antigravity;
@@ -45,6 +45,18 @@ use registry::ProviderRegistry;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
+pub use account_failover::account_failover_candidates;
+pub use account_failover::all_accounts_quota_exhausted;
+pub use account_failover::earliest_account_reset;
+pub use account_failover::error_looks_like_usage_limit;
+pub use account_failover::prefer_account_failover_enabled;
+pub use account_failover::with_quota_exhausted_override;
+pub use account_failover::{
+    account_is_cooling_down, clear_account_cooldown, clear_account_rate_limit,
+    clear_account_rate_limit_if_newer, clear_all_account_cooldowns, note_account_rate_limited,
+    note_account_rate_limited_until, note_account_rate_limited_with_reset,
+    time_until_any_account_is_eligible,
+};
 pub use catalog_routes::{
     append_simplified_anthropic_model_routes, remote_current_openai_compatible_route_for_model,
     remote_model_is_server_copilot_only, remote_model_routes_fallback,
@@ -641,7 +653,12 @@ impl MultiProvider {
             let label = Self::provider_label(candidate);
             let key = Self::provider_key(candidate);
 
-            if candidate != active && failover_reason.is_some() {
+            if candidate != active
+                && failover_reason.is_some()
+                && Self::cross_provider_failover_requires_prompt(
+                    crate::config::config().provider.cross_provider_failover,
+                )
+            {
                 let prompt = self.build_failover_prompt(
                     active,
                     candidate,
@@ -676,6 +693,21 @@ impl MultiProvider {
                         label,
                         detail
                     ));
+                }
+                // A remembered usage-limit verdict (including either the
+                // 5-hour or 7-day Anthropic window) is still an account
+                // failure first. Try every eligible account on this
+                // provider before moving on, exactly as we do for a fresh
+                // runtime 429 below.
+                if let Some(stream) = self
+                    .try_account_failover_for_candidate(
+                        candidate, active, messages, tools, mode, &detail, &mut notes,
+                    )
+                    .await?
+                {
+                    return Ok(stream);
+                }
+                if candidate == active {
                     failover_reason = Some(detail.clone());
                 }
                 notes.push(note);
@@ -691,6 +723,22 @@ impl MultiProvider {
                         label,
                         reason
                     ));
+                }
+                // Preflight usage snapshots and runtime usage errors are
+                // the same verdict: this account cannot accept the turn.
+                // Run the same account-first ladder for both. Without this,
+                // a weekly window caught before the HTTP call skipped every
+                // alternate account and jumped directly to the provider
+                // prompt even though another account could have credit.
+                if let Some(stream) = self
+                    .try_account_failover_for_candidate(
+                        candidate, active, messages, tools, mode, &reason, &mut notes,
+                    )
+                    .await?
+                {
+                    return Ok(stream);
+                }
+                if candidate == active {
                     failover_reason = Some(reason.clone());
                 }
                 notes.push(note);
@@ -760,12 +808,11 @@ impl MultiProvider {
                         if decision.should_mark_provider_unavailable() {
                             record_provider_unavailable_for_account(key, &summary);
                         }
-                        if candidate == active
-                            && let Some(stream) = self
-                                .try_same_provider_account_failover(
-                                    candidate, messages, tools, mode, &summary, &mut notes,
-                                )
-                                .await?
+                        if let Some(stream) = self
+                            .try_account_failover_for_candidate(
+                                candidate, active, messages, tools, mode, &summary, &mut notes,
+                            )
+                            .await?
                         {
                             return Ok(stream);
                         }
@@ -2950,6 +2997,10 @@ impl Provider for MultiProvider {
         self.set_active_provider(target);
         self.auto_select_multi_account_for_provider(target);
         Ok(())
+    }
+
+    fn activate_provider_for_account_switch(&self, provider: &str) -> Result<Option<String>> {
+        self.activate_provider_for_account_switch_inner(provider)
     }
 }
 

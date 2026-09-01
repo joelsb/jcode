@@ -833,3 +833,248 @@ fn anthropic_model_scoped_exhaustion_matches_display_name_to_catalog_id() {
     };
     assert!(!below_limit.model_scoped_exhausted("claude-fable-5"));
 }
+
+/// The retry loop's fast-fail decision, expressed on the probe.
+///
+/// A 429 alone cannot distinguish "burst limited for a few seconds" from
+/// "quota spent until the reset". The first is worth waiting out (ADR-0015),
+/// the second is pure delay because the reset can be hours away. The
+/// `exhausted` flags are what separate them, so this pins the exact split the
+/// retry loop depends on.
+#[test]
+fn exhaustion_separates_a_spent_quota_from_a_burst_limit() {
+    let snapshot = |label: &str, exhausted: bool, error: Option<&str>| AccountUsageSnapshot {
+        label: label.to_string(),
+        email: None,
+        exhausted,
+        primary_label: None,
+        five_hour_ratio: Some(if exhausted { 1.0 } else { 0.1 }),
+        secondary_label: None,
+        seven_day_ratio: Some(if exhausted { 1.0 } else { 0.1 }),
+        resets_at: None,
+        error: error.map(str::to_string),
+    };
+
+    // The reported case: both accounts 429 but neither quota is spent. This is
+    // a burst limit, and the loop must be willing to wait it out.
+    let burst = AccountUsageProbe {
+        provider: MultiAccountProviderKind::Anthropic,
+        current_label: "claude-1".to_string(),
+        accounts: vec![
+            snapshot("claude-1", false, None),
+            snapshot("claude-2", false, None),
+        ],
+    };
+    assert!(
+        !burst.all_accounts_exhausted(),
+        "headroom on both accounts must not read as exhaustion, or a recoverable \
+         burst would fail instantly"
+    );
+
+    // Genuinely out of quota: waiting cannot help.
+    let spent = AccountUsageProbe {
+        provider: MultiAccountProviderKind::Anthropic,
+        current_label: "claude-1".to_string(),
+        accounts: vec![
+            snapshot("claude-1", true, None),
+            snapshot("claude-2", true, None),
+        ],
+    };
+    assert!(
+        spent.all_accounts_exhausted(),
+        "every account spent must read as exhaustion so the turn fails fast"
+    );
+
+    // One account still has room: rotation handles this, not waiting.
+    let mixed = AccountUsageProbe {
+        provider: MultiAccountProviderKind::Anthropic,
+        current_label: "claude-1".to_string(),
+        accounts: vec![
+            snapshot("claude-1", true, None),
+            snapshot("claude-2", false, None),
+        ],
+    };
+    assert!(
+        !mixed.all_accounts_exhausted(),
+        "a usable account left means the loop must not give up"
+    );
+
+    // An account that failed to probe carries no information, so the verdict
+    // rests on the ones that answered.
+    let erroring = AccountUsageProbe {
+        provider: MultiAccountProviderKind::Anthropic,
+        current_label: "claude-1".to_string(),
+        accounts: vec![
+            snapshot("claude-1", true, None),
+            snapshot("claude-2", false, Some("probe failed")),
+        ],
+    };
+    assert!(
+        erroring.all_accounts_exhausted(),
+        "with the only probed account spent, exhaustion is the honest verdict"
+    );
+
+    // But when *nothing* could be probed, the answer is "unknown", not
+    // "exhausted". `all()` is vacuously true on an empty set, so filtering the
+    // errors out first used to turn an unreachable usage endpoint into "every
+    // account is exhausted", which fails turns that would have succeeded.
+    let nothing_probed = AccountUsageProbe {
+        provider: MultiAccountProviderKind::Anthropic,
+        current_label: "claude-1".to_string(),
+        accounts: vec![
+            snapshot("claude-1", false, Some("probe failed")),
+            snapshot("claude-2", false, Some("probe failed")),
+        ],
+    };
+    assert!(
+        !nothing_probed.all_accounts_exhausted(),
+        "no evidence must not read as exhaustion"
+    );
+}
+
+/// A single spent window blocks the account, so `exhausted` must be a
+/// disjunction over the windows and not a conjunction.
+///
+/// The reported numbers here are the ones from the incident on 2026-08-12:
+/// `claude-2` sat at 5h=100% with 7d=49% and was refusing every request for
+/// nearly three hours, while jcode reported it as having headroom, kept rotating
+/// into it, and spent ~4 minutes per turn waiting out a "burst" that was a quota
+/// wall. Negative control: restoring `&&` fails this test.
+#[test]
+fn one_spent_window_is_enough_to_exhaust_an_account() {
+    let five_hour_spent = UsageData {
+        five_hour: 1.0,
+        five_hour_resets_at: Some("2026-08-12T13:20:00Z".to_string()),
+        seven_day: 0.49,
+        seven_day_resets_at: Some("2026-08-15T00:00:00Z".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        five_hour_spent.exhausted(),
+        "5h=100% blocks every request, whatever the weekly window says"
+    );
+    assert_eq!(
+        five_hour_spent.blocking_reset_at().as_deref(),
+        Some("2026-08-12T13:20:00Z"),
+        "the reset reported must belong to the window that is actually blocking"
+    );
+
+    let seven_day_spent = UsageData {
+        five_hour: 0.10,
+        five_hour_resets_at: Some("2026-08-12T13:20:00Z".to_string()),
+        seven_day: 1.0,
+        seven_day_resets_at: Some("2026-08-15T00:00:00Z".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        seven_day_spent.exhausted(),
+        "a spent weekly window blocks requests even with a fresh 5h window"
+    );
+    assert_eq!(
+        seven_day_spent.blocking_reset_at().as_deref(),
+        Some("2026-08-15T00:00:00Z"),
+        "reporting the 5h reset here would promise recovery days early"
+    );
+
+    // The healthy account from the same incident must stay usable.
+    let healthy = UsageData {
+        five_hour: 0.41,
+        seven_day: 0.24,
+        ..Default::default()
+    };
+    assert!(
+        !healthy.exhausted(),
+        "an account with headroom in both windows must not be sidelined"
+    );
+}
+
+/// The snapshot the rotation decision reads must carry the same verdict.
+#[test]
+fn an_account_snapshot_reports_a_single_spent_window_as_exhausted() {
+    let usage = UsageData {
+        five_hour: 1.0,
+        five_hour_resets_at: Some("2026-08-12T13:20:00Z".to_string()),
+        seven_day: 0.49,
+        ..Default::default()
+    };
+
+    let snapshot = anthropic_snapshot_from_usage("claude-2".to_string(), None, &usage);
+    assert!(
+        snapshot.exhausted,
+        "the rotation candidate filter reads this field: 5h=100% must exclude the account"
+    );
+    assert_eq!(snapshot.resets_at.as_deref(), Some("2026-08-12T13:20:00Z"));
+}
+
+/// A 429 must correct the per-account cache the rotation decision reads.
+///
+/// This is the cache that nothing could invalidate: no account switch, no 429,
+/// nothing, so a "has headroom" snapshot outlived the limit that disproved it for
+/// up to 15 minutes. Negative control: drop the
+/// `note_anthropic_account_rate_limited` call and the final assertion fails.
+#[test]
+fn a_429_corrects_the_per_account_usage_cache() {
+    // Plant exactly the wrong verdict the incident was decided on.
+    let stale_headroom = UsageData {
+        five_hour: 0.10,
+        seven_day: 0.20,
+        fetched_at: Some(Instant::now()),
+        ..Default::default()
+    };
+    store_anthropic_usage(
+        anthropic_usage_cache_key("", Some("claude-cachetest")),
+        stale_headroom,
+    );
+
+    let planted = cached_anthropic_account_usage("claude-cachetest")
+        .expect("the planted snapshot must be readable by label");
+    assert!(
+        !planted.exhausted(),
+        "precondition: the planted snapshot claims headroom"
+    );
+
+    // A 429 naming a reset three hours out.
+    note_anthropic_account_rate_limited(
+        "claude-cachetest",
+        Some((chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339()),
+    );
+
+    let corrected = cached_anthropic_account_usage("claude-cachetest")
+        .expect("the limit evidence must be cached");
+    assert!(
+        corrected.exhausted(),
+        "after a 429 the cache must report the account as limited, not as having headroom"
+    );
+
+    // An explicit invalidation must forget it entirely, so a later probe decides.
+    invalidate_anthropic_account_usage("claude-cachetest");
+    assert!(
+        cached_anthropic_account_usage("claude-cachetest").is_none(),
+        "invalidation must remove the entry, not leave a stale verdict behind"
+    );
+}
+
+/// A 429 with no reset time must only *forget* the stale verdict, never assert
+/// exhaustion.
+///
+/// An unexplained 429 may be a burst that clears in seconds. Writing it as a
+/// spent window whose `last_error` mentions a rate limit would attract the 900s
+/// `RATE_LIMIT_BACKOFF` TTL and sideline a recovered account for 15 minutes.
+#[test]
+fn a_429_without_a_reset_only_forgets_the_stale_verdict() {
+    store_anthropic_usage(
+        anthropic_usage_cache_key("", Some("claude-bursttest")),
+        UsageData {
+            five_hour: 0.10,
+            fetched_at: Some(Instant::now()),
+            ..Default::default()
+        },
+    );
+
+    note_anthropic_account_rate_limited("claude-bursttest", None);
+
+    assert!(
+        cached_anthropic_account_usage("claude-bursttest").is_none(),
+        "an unexplained 429 must clear the entry rather than claim a spent quota"
+    );
+}

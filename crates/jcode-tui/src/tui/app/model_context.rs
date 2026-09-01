@@ -66,6 +66,40 @@ impl App {
         Ok(self.finalize_model_switch(&active_model))
     }
 
+    /// Route this session onto the provider whose account was just selected.
+    ///
+    /// Picking an account states where work should run, but switching one only
+    /// re-points that provider's credential. A Claude session that switched to
+    /// an OpenAI account therefore stayed on Claude and sent the next turn to
+    /// the account it had just been rate-limited on, immediately after printing
+    /// "Switched to OpenAI account openai-1".
+    ///
+    /// Silent when that provider is already active, so an ordinary
+    /// claude-1 -> claude-2 switch does not announce a redundant model change.
+    pub(super) fn activate_provider_after_account_switch(&mut self, provider_key: &str) {
+        match self
+            .provider
+            .activate_provider_for_account_switch(provider_key)
+        {
+            Ok(None) => {}
+            Ok(Some(active_model)) => {
+                let model = self.finalize_model_switch(&active_model);
+                let provider_name = self.provider.display_name();
+                self.push_display_message(DisplayMessage::system(format!(
+                    "Session switched to {} on model {}.",
+                    provider_name, model
+                )));
+                self.set_status_notice(format!("Provider → {} ({})", provider_name, model));
+            }
+            // The credential switch already succeeded, so this is a notice
+            // rather than a failure of the whole command.
+            Err(error) => self.push_display_message(DisplayMessage::error(format!(
+                "Switched the {} account, but could not route this session to it: {}",
+                provider_key, error
+            ))),
+        }
+    }
+
     pub(super) fn cancel_pending_provider_failover(&mut self, notice: impl Into<String>) {
         let Some(pending) = self.pending_provider_failover.take() else {
             return;
@@ -124,7 +158,10 @@ impl App {
         }
     }
 
-    fn handle_provider_failover_prompt(&mut self, prompt: crate::provider::ProviderFailoverPrompt) {
+    pub(super) fn handle_provider_failover_prompt(
+        &mut self,
+        prompt: crate::provider::ProviderFailoverPrompt,
+    ) {
         let input_summary = Self::format_failover_input_summary(&prompt);
         let manual_message = format!(
             "⚠ {} became unavailable - jcode did not resend your prompt to {} automatically.\n\nReason: {}\n\nRetrying elsewhere would send {}.\n\nTo switch manually now, use /model and pick a model from {}, then resend. {}",
@@ -140,6 +177,29 @@ impl App {
             .provider
             .cross_provider_failover
         {
+            // A new daemon never emits a prompt in automatic mode: it crosses
+            // providers inside `complete_with_failover`. Keep this client-side
+            // path for mixed-version local sessions where an older daemon still
+            // asks the client to perform the switch.
+            crate::config::CrossProviderFailoverMode::Automatic if !self.is_remote => {
+                match self.apply_provider_switch_for_failover(&prompt) {
+                    Ok(active_model) => {
+                        self.push_display_message(DisplayMessage::system(format!(
+                            "⚡ Auto-switched provider: {} → {}.\n\nResending {} on model {}.",
+                            prompt.from_label, prompt.to_label, input_summary, active_model,
+                        )));
+                        self.set_status_notice(format!(
+                            "Provider → {} (retrying)",
+                            prompt.to_label
+                        ));
+                        self.pending_turn = true;
+                    }
+                    Err(error) => self.push_display_message(DisplayMessage::error(format!(
+                        "Failed to switch provider to {}: {}",
+                        prompt.to_label, error
+                    ))),
+                }
+            }
             crate::config::CrossProviderFailoverMode::Manual if !self.is_remote => {
                 self.push_display_message(DisplayMessage::system(manual_message));
                 self.set_status_notice(format!(
@@ -293,7 +353,7 @@ impl App {
         if self.pending_provider_failover.is_some() {
             return false;
         }
-        let routes = self.fallback_candidate_routes();
+        let mut routes = self.fallback_candidate_routes();
         if routes.is_empty() {
             return false;
         }
@@ -301,12 +361,51 @@ impl App {
         let current_provider = self.current_provider_label_for_fallback();
         let current_api_method = self.current_route_api_method().unwrap_or_default();
 
+        // Remember the route that just failed on a usage limit, then drop every
+        // route already known spent this turn.
+        //
+        // Without this the picker is memoryless: with Anthropic and OpenAI both
+        // exhausted it ranked "the other provider" best every time, so each
+        // accepted offer switched to the route that had just failed and offered
+        // the one we came from - a Claude -> OpenAI -> Claude ping-pong that ran
+        // about once a second and never terminated. A route is only skipped when
+        // *it* reported a usage limit, so a transient error still gets retried.
+        let is_usage_limit = crate::provider::error_looks_like_usage_limit(error);
+        if is_usage_limit {
+            self.exhausted_fallback_routes.insert(Self::fallback_route_key(
+                &current_provider,
+                &current_api_method,
+                &current_model,
+            ));
+        }
+        if !self.exhausted_fallback_routes.is_empty() {
+            routes.retain(|route| {
+                !self
+                    .exhausted_fallback_routes
+                    .contains(&Self::fallback_route_key(
+                        &route.provider,
+                        &route.api_method,
+                        &route.model,
+                    ))
+            });
+            if routes.is_empty() {
+                // Every route is spent. Saying so once is the honest answer;
+                // offering a switch here is what created the loop.
+                self.push_display_message(DisplayMessage::system(
+                    "⛔ Every configured route has hit its usage limit this turn, so there is nothing left to switch to. Run `/usage` for reset times, or `/model` to pick a route manually once a window resets.".to_string(),
+                ));
+                self.set_status_notice("All routes exhausted");
+                return false;
+            }
+        }
+
         // A credential failure (expired OAuth session, failed token refresh,
         // broken API key) breaks every route behind that credential, so widen
         // the exclusion set: offering a sibling model on the same broken
         // credential would fail identically.
         let options = crate::provider::FallbackPickOptions {
             credential_failure: crate::provider::error_looks_like_credential_failure(error),
+            ..Default::default()
         };
         let Some(index) = crate::provider::pick_next_fallback_route_with_options(
             &routes,
@@ -344,6 +443,29 @@ impl App {
             remote_resend,
         });
         true
+    }
+
+    /// Identity of a route for exhaustion bookkeeping: provider, credential and
+    /// model together. Case-folded because route labels arrive from both the
+    /// local provider ("Anthropic") and the remote catalog ("anthropic"), and a
+    /// case mismatch would silently defeat the skip.
+    fn fallback_route_key(provider: &str, api_method: &str, model: &str) -> String {
+        format!(
+            "{}|{}|{}",
+            provider.to_ascii_lowercase(),
+            api_method.to_ascii_lowercase(),
+            model.to_ascii_lowercase()
+        )
+    }
+
+    /// Forget which routes were exhausted, after a turn actually succeeds.
+    ///
+    /// Exhaustion is a statement about a usage window, not about the route, so
+    /// it must not outlive evidence that a request now goes through. Without
+    /// this the skip list would grow monotonically and a session that recovered
+    /// after a window reset would still refuse to offer its own best route.
+    pub(super) fn clear_exhausted_fallback_routes(&mut self) {
+        self.exhausted_fallback_routes.clear();
     }
 
     pub(super) fn clear_pending_fallback_offer(&mut self) {

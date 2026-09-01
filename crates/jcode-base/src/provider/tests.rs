@@ -1067,7 +1067,216 @@ include!("tests/auth_refresh.rs");
 include!("tests/model_resolution.rs");
 include!("tests/issue_534_profile_preservation.rs");
 include!("tests/fallback_failover.rs");
+include!("tests/account_first_failover.rs");
 include!("tests/catalog_subscription.rs");
+
+/// A MultiProvider with both the Anthropic and OpenAI slots filled, active on
+/// Anthropic: the shape of a normal Claude session that also has an OpenAI
+/// login available.
+fn test_multi_provider_with_anthropic_and_openai() -> MultiProvider {
+    save_test_openai_oauth_credentials();
+    crate::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test");
+    crate::env::set_var("OPENAI_API_KEY", "sk-test-openai-api-key");
+    MultiProvider {
+        claude: RwLock::new(None),
+        anthropic: RwLock::new(Some(test_anthropic_runtime() as Arc<dyn Provider>)),
+        openai: RwLock::new(Some(test_openai_runtime() as Arc<dyn Provider>)),
+        copilot_api: RwLock::new(None),
+        antigravity: RwLock::new(None),
+        gemini: RwLock::new(None),
+        cursor: RwLock::new(None),
+        bedrock: RwLock::new(None),
+        openrouter: RwLock::new(None),
+        openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+        active_openai_compatible_profile: RwLock::new(None),
+        active: RwLock::new(ActiveProvider::Claude),
+        use_claude_cli: false,
+        startup_notices: RwLock::new(Vec::new()),
+        initial_provider: None,
+        routes_memo: std::sync::Mutex::new(None),
+        post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }
+}
+
+/// Picking an OpenAI account from a Claude session must move the session onto
+/// OpenAI, not merely re-point the OpenAI credential.
+///
+/// The reported bug: Anthropic hit its 5-hour limit, the user switched to the
+/// OpenAI account, the UI printed "Switched to OpenAI account openai-1", and the
+/// very next turn went to Anthropic again and returned the same 429. The account
+/// store had changed; the active provider had not.
+#[test]
+fn switching_to_an_openai_account_routes_the_session_to_openai() {
+    with_clean_provider_test_env(|| {
+        let runtime = enter_test_runtime();
+        let _runtime_guard = runtime.enter();
+        let provider = test_multi_provider_with_anthropic_and_openai();
+        assert_eq!(provider.active_provider(), ActiveProvider::Claude);
+
+        let activated = provider
+            .activate_provider_for_account_switch("openai")
+            .expect("activating the OpenAI slot should succeed");
+
+        assert!(
+            activated.is_some(),
+            "a switch away from Anthropic must report the model now in force so \
+             the caller can tell the user where the next turn will run"
+        );
+        assert_eq!(
+            provider.active_provider(),
+            ActiveProvider::OpenAI,
+            "the next turn must go to OpenAI, not back to the rate-limited \
+             Anthropic account"
+        );
+        assert_eq!(
+            activated.as_deref(),
+            Some(provider.model()).as_deref(),
+            "the reported model must be the one actually selected"
+        );
+    });
+}
+
+/// An ordinary claude-1 -> claude-2 switch stays on Anthropic and reports
+/// nothing, so the UI does not announce a provider change that did not happen.
+#[test]
+fn switching_between_accounts_of_the_active_provider_reports_no_change() {
+    with_clean_provider_test_env(|| {
+        let runtime = enter_test_runtime();
+        let _runtime_guard = runtime.enter();
+        let provider = test_multi_provider_with_anthropic_and_openai();
+
+        let activated = provider
+            .activate_provider_for_account_switch("claude")
+            .expect("staying on the active provider is not an error");
+
+        assert!(
+            activated.is_none(),
+            "already on Anthropic, so there is no provider switch to announce"
+        );
+        assert_eq!(provider.active_provider(), ActiveProvider::Claude);
+    });
+}
+
+/// Switching to a provider with no credentials must fail loudly rather than
+/// silently leaving the session where it was.
+///
+/// Reporting success while staying put is what made the original bug invisible:
+/// the user believed they had moved off the exhausted account.
+#[test]
+fn switching_to_an_unconfigured_provider_is_an_error() {
+    with_clean_provider_test_env(|| {
+        let runtime = enter_test_runtime();
+        let _runtime_guard = runtime.enter();
+        let provider = test_multi_provider_with_cursor();
+
+        let error = provider
+            .activate_provider_for_account_switch("openai")
+            .expect_err("OpenAI is not configured in this session");
+
+        assert!(
+            error.to_string().contains("not configured"),
+            "error should name the real problem, got: {error}"
+        );
+        assert_eq!(
+            provider.active_provider(),
+            ActiveProvider::Cursor,
+            "a failed switch must not move the session"
+        );
+    });
+}
+
+/// A spent provider must be skipped whichever provider it is, not only Claude.
+///
+/// The exhaustion precheck used to read `match provider { Claude if ... }`, so
+/// "this provider has no credit left" was a Claude-only concept. A spent OpenAI
+/// account was never recognised as spent, so the fallback loop could not step
+/// past it to the next provider that still had credit - which is the whole
+/// point of having more than one account.
+#[test]
+fn a_spent_provider_is_skipped_whichever_provider_it_is() {
+    with_clean_provider_test_env(|| {
+        let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
+        let runtime = enter_test_runtime();
+        let _runtime_guard = runtime.enter();
+        let provider = test_multi_provider_with_anthropic_and_openai();
+
+        // Empty probe override = "no usage data for anybody", which is what
+        // makes this test hermetic. Without it, `usage_exhausted_reason` ->
+        // `account_switch_guidance` reaches the *real* probe, which issues a
+        // live usage request for the fake OpenAI token and then parks forever:
+        // `fetch_openai_usage_for_account` calls `block_on` inside
+        // `block_in_place` on this current-thread runtime, so nothing can drive
+        // the IO it is waiting for. The test never failed - it hung, holding
+        // `lock_test_env`, so every other env-using test in the crate appeared
+        // to hang too and `cargo test -p jcode-base --lib` never finished.
+        crate::provider::account_failover::with_account_usage_probe_override(Vec::new(), || {
+            for candidate in [ActiveProvider::Claude, ActiveProvider::OpenAI] {
+                let reason = crate::provider::account_failover::with_quota_exhausted_override(
+                    Some(true),
+                    || provider.provider_precheck_unavailable_reason(candidate),
+                );
+                assert!(
+                    reason.is_some(),
+                    "{:?} reports every account spent, so it must be skipped",
+                    candidate
+                );
+            }
+        });
+    });
+}
+
+/// With credit left, no provider is skipped.
+///
+/// The failure this guards against is worse than the bug it fixes: a precheck
+/// that wrongly reports exhaustion takes a working provider out of service and
+/// the turn fails with "no usable provider" while the account is fine.
+#[test]
+fn a_provider_with_credit_is_not_skipped() {
+    with_clean_provider_test_env(|| {
+        let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
+        let runtime = enter_test_runtime();
+        let _runtime_guard = runtime.enter();
+        let provider = test_multi_provider_with_anthropic_and_openai();
+
+        // Hermetic for the same reason as the test above: no live usage fetch.
+        let reason = crate::provider::account_failover::with_account_usage_probe_override(
+            Vec::new(),
+            || {
+                crate::provider::account_failover::with_quota_exhausted_override(Some(false), || {
+                    provider.provider_precheck_unavailable_reason(ActiveProvider::OpenAI)
+                })
+            },
+        );
+        assert!(
+            reason.is_none(),
+            "OpenAI has headroom and must stay in the rotation, got: {:?}",
+            reason
+        );
+    });
+}
+
+/// A provider with no account identity at all (no usage probe) is attempted
+/// rather than skipped.
+///
+/// "We cannot know until we ask" must fail open. Failing closed would silently
+/// remove every API-key provider from the chain, since none of them can report
+/// per-account quota.
+#[test]
+fn a_provider_without_account_identity_is_still_attempted() {
+    with_clean_provider_test_env(|| {
+        let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
+        let runtime = enter_test_runtime();
+        let _runtime_guard = runtime.enter();
+        let provider = test_multi_provider_with_cursor();
+
+        assert!(
+            provider
+                .provider_precheck_unavailable_reason(ActiveProvider::Cursor)
+                .is_none(),
+            "Cursor has no per-account usage probe, so it must not be pre-emptively skipped"
+        );
+    });
+}
 
 /// Rendering the route catalog must never schedule network work.
 ///
@@ -1127,4 +1336,181 @@ fn profile_catalog_cache_needs_refresh_for_missing_cache() {
             "a missing catalog cache must be reported as needing a refresh"
         );
     });
+}
+
+/// The rate-limit cooldown that stops account ping-pong across requests.
+///
+/// Reported symptom: `claude-2 → claude-1 → claude-2 → claude-1`, three switches
+/// in a row, each one spending a real request to rediscover a limit the previous
+/// request had already hit. `tried_accounts` lives for a single request, so
+/// nothing carried that knowledge forward.
+#[test]
+fn a_rate_limited_account_is_remembered_across_requests() {
+    let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
+    use crate::provider::{
+        account_is_cooling_down, clear_account_cooldown, clear_all_account_cooldowns,
+        note_account_rate_limited,
+    };
+    use jcode_provider_core::ActiveProvider;
+
+    clear_all_account_cooldowns();
+
+    assert!(
+        !account_is_cooling_down(ActiveProvider::Claude, "claude-1"),
+        "an account nobody has seen fail must be freely usable"
+    );
+
+    note_account_rate_limited(ActiveProvider::Claude, "claude-1");
+    assert!(
+        account_is_cooling_down(ActiveProvider::Claude, "claude-1"),
+        "the next request must remember this account just refused"
+    );
+    assert!(
+        !account_is_cooling_down(ActiveProvider::Claude, "claude-2"),
+        "one account's limit must not sideline the others"
+    );
+
+    // Cooldowns are per provider: an Anthropic limit says nothing about OpenAI.
+    assert!(
+        !account_is_cooling_down(ActiveProvider::OpenAI, "claude-1"),
+        "cooldowns must not leak across providers"
+    );
+
+    // A success proves the account is serving again, so it should not sit out
+    // the rest of the window.
+    clear_account_cooldown(ActiveProvider::Claude, "claude-1");
+    assert!(
+        !account_is_cooling_down(ActiveProvider::Claude, "claude-1"),
+        "a successful request must clear the cooldown immediately"
+    );
+
+    clear_all_account_cooldowns();
+}
+
+/// A cooling-down account is never offered as a rotation target.
+///
+/// Rotation exists to find an account that is *not* limited; once every
+/// alternative is known-limited there is nothing to find. ADR-0015's "never turn
+/// a recoverable limit into a hard failure" is preserved by the caller waiting
+/// on the account it already holds, not by handing it a candidate that will
+/// refuse it too.
+#[test]
+fn cooling_down_accounts_are_skipped_and_not_offered_when_all_are_limited() {
+    let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
+    use crate::provider::account_failover::same_provider_account_candidates_for_tests;
+    use crate::provider::{clear_all_account_cooldowns, note_account_rate_limited};
+    use jcode_provider_core::ActiveProvider;
+
+    clear_all_account_cooldowns();
+
+    let ordered = same_provider_account_candidates_for_tests(
+        ActiveProvider::Claude,
+        vec!["claude-1".to_string(), "claude-2".to_string()],
+    );
+    assert_eq!(
+        ordered,
+        vec!["claude-1".to_string(), "claude-2".to_string()],
+        "with no cooldowns the existing best-first order is preserved"
+    );
+
+    note_account_rate_limited(ActiveProvider::Claude, "claude-1");
+    let ordered = same_provider_account_candidates_for_tests(
+        ActiveProvider::Claude,
+        vec!["claude-1".to_string(), "claude-2".to_string()],
+    );
+    assert_eq!(
+        ordered,
+        vec!["claude-2".to_string()],
+        "the account that just refused must not be offered while a healthy one exists"
+    );
+
+    // Every account limited: offer none at all.
+    //
+    // This assertion previously required the opposite ("keep them as a last
+    // resort"), on the reasoning that a limited account beats no candidate. That
+    // is wrong for a *shared* limit and is what produced the reported flapping:
+    // with two accounts both burst-limited, every turn hopped onto the other,
+    // paid a second 429, announced a switch, and was restored. One switch plus
+    // one restore per turn, indefinitely.
+    //
+    // Returning nothing does not fail the turn: the caller's `None` branch is
+    // the dead end, which is exactly where ADR-0015's rate-limit wait lives, so
+    // the turn backs off on the account it already holds. That property is
+    // pinned end-to-end by
+    // `no_candidates_still_waits_out_a_burst_rather_than_failing` in
+    // jcode-provider-anthropic-runtime, which is the test that makes removing
+    // this last-resort rule safe.
+    note_account_rate_limited(ActiveProvider::Claude, "claude-2");
+    let ordered = same_provider_account_candidates_for_tests(
+        ActiveProvider::Claude,
+        vec!["claude-1".to_string(), "claude-2".to_string()],
+    );
+    assert!(
+        ordered.is_empty(),
+        "when everything is limited, rotation has nothing to find and must offer \
+         no candidate rather than hop onto another limited account: {:?}",
+        ordered
+    );
+
+    clear_all_account_cooldowns();
+}
+
+/// A rate limit that names a reset must be remembered until that reset, not for
+/// a flat 60s.
+///
+/// This is the defect behind the observed ping-pong: `claude-2` was blocked for
+/// ~3 hours by a spent 5-hour window, the cooldown forgot it after a minute, and
+/// rotation selected it again, and again.
+#[test]
+fn a_known_reset_outlasts_the_burst_cooldown() {
+    let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
+    use crate::provider::account_failover::same_provider_account_candidates_for_tests;
+    use crate::provider::{
+        clear_all_account_cooldowns, note_account_rate_limited, note_account_rate_limited_until,
+    };
+    use jcode_provider_core::ActiveProvider;
+
+    clear_all_account_cooldowns();
+
+    // A reset three hours out, i.e. far beyond the 60s burst window.
+    note_account_rate_limited_until(
+        ActiveProvider::Claude,
+        "claude-2",
+        Some(chrono::Utc::now() + chrono::Duration::hours(3)),
+    );
+
+    assert!(
+        crate::provider::account_is_cooling_down(ActiveProvider::Claude, "claude-2"),
+        "an account with a 3h reset must still be on cooldown"
+    );
+    assert_eq!(
+        same_provider_account_candidates_for_tests(
+            ActiveProvider::Claude,
+            vec!["claude-2".to_string(), "claude-1".to_string()],
+        ),
+        vec!["claude-1".to_string()],
+        "the quota-blocked account must be skipped in favour of the healthy one"
+    );
+
+    // A later burst-shaped note must not shorten a known long cooldown.
+    note_account_rate_limited(ActiveProvider::Claude, "claude-2");
+    assert!(
+        crate::provider::account_is_cooling_down(ActiveProvider::Claude, "claude-2"),
+        "a 60s note arriving later must not shrink the 3h deadline"
+    );
+
+    // A reset already in the past carries no information about the future, and
+    // must fall back to the short burst window rather than expiring instantly.
+    clear_all_account_cooldowns();
+    note_account_rate_limited_until(
+        ActiveProvider::Claude,
+        "claude-1",
+        Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+    );
+    assert!(
+        crate::provider::account_is_cooling_down(ActiveProvider::Claude, "claude-1"),
+        "a past reset must still produce the short burst cooldown, not zero"
+    );
+
+    clear_all_account_cooldowns();
 }

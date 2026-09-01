@@ -286,6 +286,11 @@ impl Provider for JcodeProvider {
         self.ensure_runtime_mode();
         self.inner.switch_active_provider_to(provider)
     }
+
+    fn activate_provider_for_account_switch(&self, provider: &str) -> Result<Option<String>> {
+        self.ensure_runtime_mode();
+        self.inner.activate_provider_for_account_switch(provider)
+    }
 }
 
 #[cfg(test)]

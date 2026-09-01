@@ -42,6 +42,13 @@ pub struct FallbackPickOptions {
     /// - when the failed api_method is unknown, all same-provider routes are
     ///   excluded because any of them could share the broken credential.
     pub credential_failure: bool,
+    /// The failure was a rate-limit error (429 Too Many Requests). Routes on
+    /// the same provider share the same account rate-limit bucket, so
+    /// offering a sibling model on the same provider would hit the same
+    /// limit. Skip same-provider model downgrades and prefer cross-provider
+    /// alternatives, letting the backend account-failover mechanism try the
+    /// same model on a different account first.
+    pub rate_limit: bool,
 }
 
 /// Whether `error` looks like a credential/auth failure for the active route's
@@ -141,8 +148,18 @@ pub fn pick_next_fallback_route_with_options(
                 return None;
             }
 
-            let tier = if same_model && !same_method {
+            let tier = if same_model && !same_method && !(options.rate_limit && same_provider) {
+                // Same model, different credential. Normally the least
+                // disruptive switch, but a rate limit is charged against the
+                // *account*, and on a subscription provider the OAuth and API
+                // routes are commonly the same account. Offering "same model
+                // via api key" to a user whose Anthropic window is spent sends
+                // them at the wall they just hit - and silently onto metered
+                // billing. Excluded here so it ranks below a real cross-provider
+                // hop; it stays reachable at tier 3 when nothing else exists.
                 0
+            } else if same_provider && options.rate_limit {
+                3
             } else if same_provider {
                 1
             } else {
@@ -278,6 +295,7 @@ mod tests {
         ];
         let options = FallbackPickOptions {
             credential_failure: true,
+            rate_limit: false,
         };
         let pick = pick_next_fallback_route_with_options(
             &routes,
@@ -300,6 +318,7 @@ mod tests {
         ];
         let options = FallbackPickOptions {
             credential_failure: true,
+            rate_limit: false,
         };
         let pick = pick_next_fallback_route_with_options(
             &routes,
@@ -324,10 +343,168 @@ mod tests {
         ];
         let options = FallbackPickOptions {
             credential_failure: true,
+            rate_limit: false,
         };
         let pick = pick_next_fallback_route_with_options(&routes, "gpt-5.5", "OpenAI", "", options)
             .expect("a fallback should exist");
         assert_eq!(routes[pick].provider, "Anthropic");
+    }
+
+    #[test]
+    fn rate_limit_skips_same_provider_model_downgrade() {
+        let routes = vec![
+            route("claude-sonnet-5", "Anthropic", "claude-oauth", true),
+            route("claude-fable-5", "Anthropic", "claude-oauth", true),
+            route("gpt-5", "OpenAI", "openai-oauth", true),
+        ];
+        let options = FallbackPickOptions {
+            credential_failure: false,
+            rate_limit: true,
+        };
+        let pick = pick_next_fallback_route_with_options(
+            &routes,
+            "claude-sonnet-5",
+            "Anthropic",
+            "claude-oauth",
+            options,
+        )
+        .expect("a fallback should exist");
+        assert_eq!(routes[pick].provider, "OpenAI");
+    }
+
+    /// A spent usage window must not be answered with the same model on the
+    /// same provider's *other credential*.
+    ///
+    /// Reported case: Anthropic's 5-hour limit was hit and the offer was
+    /// "switch to claude-opus-5 via api key". On a subscription
+    /// provider that is usually the same account behind a different door, so it
+    /// walks into the same wall - and quietly moves the user onto metered
+    /// billing. A provider that still has credit must win instead.
+    #[test]
+    fn rate_limit_prefers_another_provider_over_the_same_model_on_another_credential() {
+        let routes = vec![
+            route("claude-opus-5", "Anthropic", "claude-oauth", true),
+            route("claude-opus-5", "Anthropic", "claude-api", true),
+            route("gpt-5.6-sol", "OpenAI", "openai-oauth", true),
+        ];
+        let options = FallbackPickOptions {
+            credential_failure: false,
+            rate_limit: true,
+        };
+        let pick = pick_next_fallback_route_with_options(
+            &routes,
+            "claude-opus-5",
+            "Anthropic",
+            "claude-oauth",
+            options,
+        )
+        .expect("a fallback should exist");
+        assert_eq!(
+            routes[pick].provider, "OpenAI",
+            "a provider with credit beats the same account's other credential"
+        );
+    }
+
+    /// ...but that route is only *deprioritized*, never removed: when no other
+    /// provider is configured it is still better than failing the turn.
+    #[test]
+    fn rate_limit_still_offers_the_other_credential_when_it_is_the_only_option() {
+        let routes = vec![
+            route("claude-opus-5", "Anthropic", "claude-oauth", true),
+            route("claude-opus-5", "Anthropic", "claude-api", true),
+        ];
+        let options = FallbackPickOptions {
+            credential_failure: false,
+            rate_limit: true,
+        };
+        let pick = pick_next_fallback_route_with_options(
+            &routes,
+            "claude-opus-5",
+            "Anthropic",
+            "claude-oauth",
+            options,
+        )
+        .expect("the last resort is still a fallback");
+        assert_eq!(routes[pick].api_method, "claude-api");
+    }
+
+    /// A credential failure is not a rate limit: there the other credential is
+    /// exactly the right answer and must keep winning.
+    #[test]
+    fn credential_failure_keeps_preferring_the_same_model_on_another_credential() {
+        let routes = vec![
+            route("claude-opus-5", "Anthropic", "claude-api", true),
+            route("claude-opus-5", "Anthropic", "claude-oauth", true),
+            route("gpt-5.6-sol", "OpenAI", "openai-oauth", true),
+        ];
+        let options = FallbackPickOptions {
+            credential_failure: true,
+            rate_limit: false,
+        };
+        let pick = pick_next_fallback_route_with_options(
+            &routes,
+            "claude-opus-5",
+            "Anthropic",
+            "claude-api",
+            options,
+        )
+        .expect("a fallback should exist");
+        assert_eq!(routes[pick].api_method, "claude-oauth");
+    }
+
+    #[test]
+    /// Superseded behavior, kept as an explicit statement of the change.
+    ///
+    /// This used to assert that a rate limit still preferred the same model on
+    /// the same provider's other credential. That is wrong for a *usage* limit:
+    /// the limit belongs to the account, and on a subscription provider both
+    /// routes are typically the same account, so the "fallback" hits the same
+    /// wall and starts billing per token. A provider with credit now wins, and
+    /// the other credential survives only as the last resort (covered by
+    /// `rate_limit_still_offers_the_other_credential_when_it_is_the_only_option`).
+    fn rate_limit_prefers_a_provider_with_credit_over_the_same_models_other_auth() {
+        let routes = vec![
+            route("claude-sonnet-5", "Anthropic", "claude-oauth", true),
+            route("claude-sonnet-5", "Anthropic", "claude-api", true),
+            route("gpt-5", "OpenAI", "openai-oauth", true),
+        ];
+        let options = FallbackPickOptions {
+            credential_failure: false,
+            rate_limit: true,
+        };
+        let pick = pick_next_fallback_route_with_options(
+            &routes,
+            "claude-sonnet-5",
+            "Anthropic",
+            "claude-oauth",
+            options,
+        )
+        .expect("a fallback should exist");
+        assert_eq!(routes[pick].provider, "OpenAI");
+        assert_eq!(routes[pick].model, "gpt-5");
+    }
+
+    #[test]
+    fn non_rate_limit_still_offers_model_downgrade() {
+        let routes = vec![
+            route("claude-sonnet-5", "Anthropic", "claude-oauth", true),
+            route("claude-fable-5", "Anthropic", "claude-oauth", true),
+            route("gpt-5", "OpenAI", "openai-oauth", true),
+        ];
+        let options = FallbackPickOptions {
+            credential_failure: false,
+            rate_limit: false,
+        };
+        let pick = pick_next_fallback_route_with_options(
+            &routes,
+            "claude-sonnet-5",
+            "Anthropic",
+            "claude-oauth",
+            options,
+        )
+        .expect("a fallback should exist");
+        assert_eq!(routes[pick].provider, "Anthropic");
+        assert_eq!(routes[pick].model, "claude-fable-5");
     }
 
     #[test]
