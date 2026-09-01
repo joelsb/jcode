@@ -42,8 +42,8 @@ impl MultiProvider {
     /// Run the account ladder for `candidate`, whether or not the session is
     /// currently on it, and adopt the provider when a different one serves.
     ///
-    /// The rule Joel asked for is "every account of a provider before the next
-    /// provider", and the loop only honoured half of it: the ladder ran solely
+    /// The rule is "every account of a provider before the next provider", and
+    /// the loop only honoured half of it: the ladder ran solely
     /// for the provider the session started on (`if candidate == active`). Once
     /// the sequence crossed into another multi-account provider it tried exactly
     /// one account - whichever `auth.json` last recorded as active - and, if

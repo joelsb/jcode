@@ -13,7 +13,7 @@ Two changes to Anthropic account rotation:
 
 ## What forced it
 
-The `claude-1 → claude-2 → claude-1 → claude-2` switch ladder kept happening on a binary carrying every fix in Parts 1-4 of `DAIN_ACCOUNT_FIRST_FAILOVER.md`, including the rotation mutex from ADR-0020.
+The `claude-1 → claude-2 → claude-1 → claude-2` switch ladder kept happening on a binary carrying every earlier fix in this series, including the rotation mutex from ADR-0020.
 
 ADR-0020 serialised the *decision*. It did not protect the *state the decision reads*. From the 2026-08-21 log, with 6 sessions live on one daemon:
 

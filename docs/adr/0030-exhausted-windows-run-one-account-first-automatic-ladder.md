@@ -13,7 +13,7 @@ When either Anthropic's 5-hour window or 7-day window is exhausted, jcode automa
 2. retries the same model on every eligible account on the same provider;
 3. retries on the next configured provider only when no funded same-provider account remains.
 
-`cross_provider_failover = "automatic"` is the default and crosses providers inside `MultiProvider::complete_with_failover`, without returning a client confirmation prompt. `countdown` and `manual` remain explicit opt-outs.
+`cross_provider_failover = "automatic"` crosses providers inside `MultiProvider::complete_with_failover`, without returning a client confirmation prompt. `countdown` (the shipped default) and `manual` keep asking first. The account-first ladder inside a provider runs in every mode; the mode only governs *crossing* providers.
 
 ## What forced it
 
@@ -35,7 +35,7 @@ The provider does not distinguish these cases. A blocked 5-hour window, blocked 
 - A preflight verdict and runtime error produce identical routing behavior.
 - Remote and local sessions no longer need different cross-provider mechanics in automatic mode; the daemon owns the full ladder.
 - The same input can be sent to another configured provider without a countdown. Users who do not want that must set `countdown` or `manual` explicitly.
-- Existing `auto` config values now mean `automatic`, not `countdown`.
+- `auto` is accepted as an alias for `automatic`.
 
 ## Rejected alternatives
 
@@ -55,5 +55,4 @@ The provider does not distinguish these cases. A blocked 5-hour window, blocked 
 - `crates/jcode-base/src/provider/mod.rs`: remembered/preflight usage verdicts call `try_same_provider_account_failover`; automatic mode continues through the provider sequence.
 - `crates/jcode-base/src/provider/tests/fallback_failover.rs`: automatic mode does not stop for a prompt; countdown and manual do.
 - `crates/jcode-base/src/config_tests.rs`: default and parser behavior.
-- `docs/DAIN_ACCOUNT_FIRST_FAILOVER.md`, Part 6.
-- Real session screenshot on 2026-08-31: all Anthropic accounts exhausted, remote client stopped at a Ctrl+Y OpenAI offer instead of continuing.
+- - Real session screenshot on 2026-08-31: all Anthropic accounts exhausted, remote client stopped at a Ctrl+Y OpenAI offer instead of continuing.

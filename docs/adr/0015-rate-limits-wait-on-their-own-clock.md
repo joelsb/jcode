@@ -20,7 +20,7 @@ The user's own usage dashboards at that moment:
 
 | Account | 5-hour window | Weekly |
 |---|---|---|
-| joeld | 90% left | 17% left |
+| account-a | 90% left | 17% left |
 | elara | 0% left (resets 22:00) | 83% left |
 
 So one account had 90% of its 5-hour window and the other had 83% of its week. "Every Anthropic account is rate limited" was true only in the sense that *right now* both requests bounced, which is Anthropic's short-window burst limit, a third limit that sits on top of the 5-hour and weekly quotas.

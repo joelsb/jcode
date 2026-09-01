@@ -1,6 +1,6 @@
 // Account-first failover, end to end through `complete_with_failover`.
 //
-// The contract Joel asked for, in one sentence: *whatever account a session
+// The contract, in one sentence: *whatever account a session
 // starts on, every other account of that provider is tried before any other
 // provider is, and when the sequence does cross to another provider it must
 // land on an account of that provider which still has credit.*
@@ -383,8 +383,8 @@ fn a_spent_claude_account_rotates_to_the_other_claude_account() {
 /// Cursor and finally reported "No tokens/providers left" while a funded
 /// `claude-2` sat one rotation away.
 ///
-/// This is precisely the case Joel described: "if it switches to claude-1 it
-/// should switch back to claude-2".
+/// This is precisely the reported case: crossing onto a provider whose stored
+/// account is spent must continue to its funded sibling.
 #[test]
 fn crossing_from_openai_lands_on_a_claude_account_with_credit() {
     with_clean_provider_test_env(|| {
@@ -440,7 +440,7 @@ fn crossing_from_openai_lands_on_a_claude_account_with_credit() {
                         openai_label.as_str(),
                         // Not pre-marked as spent: this test wants the real
                         // request to happen and the real 429 to drive the
-                        // cross-provider step, which is what Joel observed.
+                        // cross-provider step, which is what was observed in the field.
                         &[(openai_label.as_str(), false)],
                     ),
                 ),
