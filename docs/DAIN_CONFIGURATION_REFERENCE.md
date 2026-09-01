@@ -37,6 +37,18 @@ The `claude()` shell wrapper still points **Claude Code** at port 20128. That is
 a separate tool and was deliberately left alone. Restore point:
 `~/.jcode/config.toml.bak-20260901-122712`, `~/.zshrc.bak-20260901-122712`.
 
+**Deleting the config profile is not the whole removal.** jcode keeps a separate
+usage ledger at `~/.jcode/provider_activity.json`, and
+`usage::enqueue_activity_sweeper_task` renders a `/usage` row for **every** key in
+it that has no dedicated report - including keys whose provider no longer exists.
+An `omniroute` entry (last used 2026-08-21) therefore survived the config removal
+and kept appearing as a provider row. Removed 2026-09-01; backup at
+`~/.jcode/provider_activity.json.bak-omniroute-20260901-140810`.
+
+So when retiring any provider or named profile, check that ledger too. The
+remaining keys are the real ones: `claude:oauth:claude-1`,
+`claude:oauth:claude-2`, `openai:oauth:openai-1`.
+
 ## Shell Aliases (~/.zshrc)
 
 ```bash
