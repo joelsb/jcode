@@ -4010,16 +4010,16 @@ pub(crate) fn render_tool_message(
         .saturating_sub(token_suffix_width)
         .saturating_sub(edit_suffix_width);
 
-    // `only` mode shows the technical detail in place of the intent. A row
+    // `bash` mode shows the technical detail in place of the intent. A row
     // whose detail would be empty keeps the intent so it never renders bare.
-    let replace_intent = tools_ui::tool_call_details_replace_intent()
+    let show_bash_only = tools_ui::tool_rows_show_bash_instead_of_intent()
         && !tools_ui::get_tool_summary(tc).trim().is_empty();
     let intent = tc
         .intent
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .filter(|_| !replace_intent);
+        .filter(|_| !show_bash_only);
     let intent_reserved_width = intent
         .map(|intent| UnicodeWidthStr::width(intent).saturating_add(3))
         .unwrap_or(0)

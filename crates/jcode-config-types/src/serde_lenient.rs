@@ -26,7 +26,8 @@ where
 /// `tool_call_details` shipped as `true`/`false` before it grew a third state,
 /// so an existing `config.toml` still carries a bool. Rejecting it would drop
 /// the whole `[display]` table (issue #689), so map `false`/`true` onto the
-/// enum's `off`/`on` spellings and fall back to `Default` for anything else.
+/// enum's legacy `off`/`on` aliases and fall back to `Default` for anything
+/// else.
 pub(crate) fn lenient_bool_enum<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -82,18 +83,27 @@ mod tests {
     fn legacy_boolean_tool_call_details_still_parses() {
         assert_eq!(
             parse(r#"{"tool_call_details": true, "centered": true}"#).tool_call_details,
-            ToolCallDetailMode::On
+            ToolCallDetailMode::Both
         );
         let off = parse(r#"{"tool_call_details": false, "centered": true}"#);
-        assert_eq!(off.tool_call_details, ToolCallDetailMode::Off);
+        assert_eq!(off.tool_call_details, ToolCallDetailMode::Intent);
         assert!(off.centered, "unrelated settings must survive");
         assert_eq!(
             parse(r#"{"tool_call_details": "only"}"#).tool_call_details,
-            ToolCallDetailMode::Only
+            ToolCallDetailMode::Bash,
+            "the pre-rename spelling must keep working"
+        );
+        assert_eq!(
+            parse(r#"{"tool_call_details": "bash"}"#).tool_call_details,
+            ToolCallDetailMode::Bash
+        );
+        assert_eq!(
+            parse(r#"{"tool_call_details": "both"}"#).tool_call_details,
+            ToolCallDetailMode::Both
         );
         assert_eq!(
             parse(r#"{"tool_call_details": "bogus", "centered": true}"#).tool_call_details,
-            ToolCallDetailMode::Off
+            ToolCallDetailMode::Intent
         );
     }
 

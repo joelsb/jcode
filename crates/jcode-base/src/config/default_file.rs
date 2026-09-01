@@ -199,12 +199,13 @@ prompt_entry_animation = true
 # results directly in the chat.
 # show_agentgrep_output = false
 
-# How much technical detail (command, file path, args) tool rows show next to
-# the model-provided intent (default: "off").
-#   "off"  - intent only; rows without an intent still show the detail
-#   "on"   - intent, then the dimmed detail
-#   "only" - the raw command/path instead of the intent
-# tool_call_details = "off"
+# What tool rows show next to the tool name (default: "intent").
+#   "intent" - the model's one-line description of why the call is being made
+#   "both"   - the intent, then the dimmed command/path/args
+#   "bash"   - the command/path instead of the intent, e.g. `bash $ cargo test`
+# Rows with only one of the two available show whichever exists, and error
+# summaries always render.
+# tool_call_details = "intent"
 
 # Occasionally surface a "learn this keybinding" nudge (in a distinct color)
 # when you keep doing something the slow way (e.g. /resume) instead of using

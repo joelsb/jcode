@@ -117,7 +117,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     ),
     RegisteredCommand::public(
         "/tool-call-details",
-        "Tool rows: intent only (off), intent + command (on), command only (only)",
+        "Tool rows: intent, both, or bash (the command instead of the intent)",
     ),
     RegisteredCommand::public(
         "/thinking-display",
@@ -1068,18 +1068,18 @@ impl App {
                 vec![
                     (
                         "/tool-call-details status".into(),
-                        "Show whether technical details render on intent rows",
+                        "Show what tool rows currently display",
                     ),
                     (
-                        "/tool-call-details on".into(),
-                        "Show the dimmed technical detail next to tool intents",
+                        "/tool-call-details intent".into(),
+                        "Show only the model-provided intent",
                     ),
                     (
-                        "/tool-call-details off".into(),
-                        "Show only the intent on tool rows that have one",
+                        "/tool-call-details both".into(),
+                        "Show the intent, then the dimmed command/path",
                     ),
                     (
-                        "/tool-call-details only".into(),
+                        "/tool-call-details bash".into(),
                         "Show the command/path instead of the intent",
                     ),
                 ],

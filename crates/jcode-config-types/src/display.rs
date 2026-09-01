@@ -97,10 +97,10 @@ pub struct DisplayConfig {
     /// just the one-line summary (default: false)
     #[serde(default)]
     pub show_agentgrep_output: bool,
-    /// How much technical detail (command, path, args) tool rows show next to
-    /// the model-provided intent: "off" (intent only, default), "on" (intent
-    /// then detail), or "only" (the raw command/path instead of the intent).
-    /// Legacy booleans still parse as off/on.
+    /// What tool rows show: "intent" (the model's one-line why, default),
+    /// "both" (intent then the dimmed command/path/args), or "bash" (the
+    /// command/path instead of the intent). The older off/on/only spellings
+    /// and the boolean this shipped as still parse.
     #[serde(default, deserialize_with = "crate::serde_lenient::lenient_bool_enum")]
     pub tool_call_details: ToolCallDetailMode,
     /// Native terminal scrollbar configuration for scrollable panes

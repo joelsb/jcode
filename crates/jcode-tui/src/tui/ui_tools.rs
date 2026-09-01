@@ -28,8 +28,9 @@ pub(crate) fn show_tool_call_details() -> bool {
     tool_call_detail_mode().shows_detail()
 }
 
-/// Whether the technical detail replaces the intent rather than following it.
-pub(crate) fn tool_call_details_replace_intent() -> bool {
+/// Whether the technical detail replaces the intent (`bash` mode) rather than
+/// following it (`both`).
+pub(crate) fn tool_rows_show_bash_instead_of_intent() -> bool {
     tool_call_detail_mode().hides_intent()
 }
 
@@ -40,7 +41,7 @@ pub(crate) mod tests_tool_call_details_override {
 
     thread_local! {
         static SHOW_DETAILS: Cell<ToolCallDetailMode> =
-            const { Cell::new(ToolCallDetailMode::Off) };
+            const { Cell::new(ToolCallDetailMode::Intent) };
     }
 
     pub(crate) fn get() -> ToolCallDetailMode {
@@ -49,9 +50,9 @@ pub(crate) mod tests_tool_call_details_override {
 
     pub(crate) fn set(value: bool) {
         set_mode(if value {
-            ToolCallDetailMode::On
+            ToolCallDetailMode::Both
         } else {
-            ToolCallDetailMode::Off
+            ToolCallDetailMode::Intent
         });
     }
 
@@ -870,7 +871,7 @@ pub(crate) fn get_tool_activity_detail(tool: &ToolCall) -> String {
         .map(str::trim)
         .filter(|intent| !intent.is_empty());
     match intent {
-        Some(_) if tool_call_details_replace_intent() && !summary.is_empty() => summary,
+        Some(_) if tool_rows_show_bash_instead_of_intent() && !summary.is_empty() => summary,
         Some(intent) if show_tool_call_details() && !summary.is_empty() && summary != intent => {
             format!("{} · {}", intent, summary)
         }
@@ -905,7 +906,7 @@ pub(super) fn get_tool_summary_with_budget(
             .get("command")
             .and_then(|v| v.as_str())
             .map(|cmd| {
-                let has_intent = !tool_call_details_replace_intent()
+                let has_intent = !tool_rows_show_bash_instead_of_intent()
                     && tool
                         .intent
                         .as_deref()
@@ -1587,12 +1588,12 @@ pub(super) fn render_batch_subcall_line(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    // In `only` mode the technical detail replaces the intent, but a row whose
+    // In `bash` mode the technical detail replaces the intent, but a row whose
     // detail is empty (streaming args, or a tool with nothing to show) would
     // otherwise render bare, so keep the intent as the fallback there.
-    let replace_intent =
-        tool_call_details_replace_intent() && !get_tool_summary(tool).trim().is_empty();
-    let intent = raw_intent.filter(|_| !replace_intent);
+    let show_bash_only =
+        tool_rows_show_bash_instead_of_intent() && !get_tool_summary(tool).trim().is_empty();
+    let intent = raw_intent.filter(|_| !show_bash_only);
     let intent_display = intent.map(|intent| {
         max_width
             .map(|width| truncate_end_display(intent, (width / 3).max(16)))
