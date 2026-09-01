@@ -693,19 +693,21 @@ impl MultiProvider {
                         label,
                         detail
                     ));
-                    // A remembered usage-limit verdict (including either the
-                    // 5-hour or 7-day Anthropic window) is still an account
-                    // failure first. Try every eligible account on this
-                    // provider before crossing providers, exactly as we do for
-                    // a fresh runtime 429 below.
-                    if let Some(stream) = self
-                        .try_same_provider_account_failover(
-                            candidate, messages, tools, mode, &detail, &mut notes,
-                        )
-                        .await?
-                    {
-                        return Ok(stream);
-                    }
+                }
+                // A remembered usage-limit verdict (including either the
+                // 5-hour or 7-day Anthropic window) is still an account
+                // failure first. Try every eligible account on this
+                // provider before moving on, exactly as we do for a fresh
+                // runtime 429 below.
+                if let Some(stream) = self
+                    .try_account_failover_for_candidate(
+                        candidate, active, messages, tools, mode, &detail, &mut notes,
+                    )
+                    .await?
+                {
+                    return Ok(stream);
+                }
+                if candidate == active {
                     failover_reason = Some(detail.clone());
                 }
                 notes.push(note);
@@ -721,20 +723,22 @@ impl MultiProvider {
                         label,
                         reason
                     ));
-                    // Preflight usage snapshots and runtime usage errors are
-                    // the same verdict: this account cannot accept the turn.
-                    // Run the same account-first ladder for both. Without this,
-                    // a weekly window caught before the HTTP call skipped every
-                    // alternate account and jumped directly to the provider
-                    // prompt even though another account could have credit.
-                    if let Some(stream) = self
-                        .try_same_provider_account_failover(
-                            candidate, messages, tools, mode, &reason, &mut notes,
-                        )
-                        .await?
-                    {
-                        return Ok(stream);
-                    }
+                }
+                // Preflight usage snapshots and runtime usage errors are
+                // the same verdict: this account cannot accept the turn.
+                // Run the same account-first ladder for both. Without this,
+                // a weekly window caught before the HTTP call skipped every
+                // alternate account and jumped directly to the provider
+                // prompt even though another account could have credit.
+                if let Some(stream) = self
+                    .try_account_failover_for_candidate(
+                        candidate, active, messages, tools, mode, &reason, &mut notes,
+                    )
+                    .await?
+                {
+                    return Ok(stream);
+                }
+                if candidate == active {
                     failover_reason = Some(reason.clone());
                 }
                 notes.push(note);
@@ -804,12 +808,11 @@ impl MultiProvider {
                         if decision.should_mark_provider_unavailable() {
                             record_provider_unavailable_for_account(key, &summary);
                         }
-                        if candidate == active
-                            && let Some(stream) = self
-                                .try_same_provider_account_failover(
-                                    candidate, messages, tools, mode, &summary, &mut notes,
-                                )
-                                .await?
+                        if let Some(stream) = self
+                            .try_account_failover_for_candidate(
+                                candidate, active, messages, tools, mode, &summary, &mut notes,
+                            )
+                            .await?
                         {
                             return Ok(stream);
                         }

@@ -339,8 +339,64 @@ pub(super) fn multi_account_provider_kind(
 pub(super) fn account_usage_probe(
     provider: ActiveProvider,
 ) -> Option<crate::usage::AccountUsageProbe> {
+    if let Some(probe) = probe_override_for(provider) {
+        return probe;
+    }
     let kind = multi_account_provider_kind(provider)?;
     crate::usage::account_usage_probe_sync(kind)
+}
+
+thread_local! {
+    /// Scoped stand-in for the per-account usage probe.
+    ///
+    /// The real probe reaches the network (and, cache-miss aside, must), so a
+    /// test of the *decision* built on it either performs live HTTP with fake
+    /// tokens or cannot run at all. Overriding the probe rather than the cache
+    /// keeps the seam at one function and leaves the cache's own semantics
+    /// (keying, staleness, ADR-0017) untested by accident.
+    ///
+    /// `Some(vec![])` means "probe available for nobody", which is the honest
+    /// model of a provider with no usage data. Thread-local and scoped, like
+    /// [`QUOTA_EXHAUSTED_OVERRIDE`], so parallel tests cannot see each other's
+    /// value and production never sets it.
+    static ACCOUNT_USAGE_PROBE_OVERRIDE: std::cell::RefCell<
+        Option<Vec<(&'static str, crate::usage::AccountUsageProbe)>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// `None` when no override is installed; `Some(None)` when one is installed and
+/// has nothing for this provider.
+fn probe_override_for(
+    provider: ActiveProvider,
+) -> Option<Option<crate::usage::AccountUsageProbe>> {
+    ACCOUNT_USAGE_PROBE_OVERRIDE.with(|cell| {
+        let installed = cell.borrow();
+        let probes = installed.as_ref()?;
+        let key = cooldown_provider_key(provider);
+        Some(
+            probes
+                .iter()
+                .find(|(probe_key, _)| *probe_key == key)
+                .map(|(_, probe)| probe.clone()),
+        )
+    })
+}
+
+/// Run `f` with the usage probe answering from `probes` instead of the network.
+/// Test-only seam; nothing in production calls this.
+pub fn with_account_usage_probe_override<T>(
+    probes: Vec<(ActiveProvider, crate::usage::AccountUsageProbe)>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let keyed = probes
+        .into_iter()
+        .map(|(provider, probe)| (cooldown_provider_key(provider), probe))
+        .collect::<Vec<_>>();
+    let previous =
+        ACCOUNT_USAGE_PROBE_OVERRIDE.with(|cell| cell.borrow_mut().replace(keyed));
+    let result = f();
+    ACCOUNT_USAGE_PROBE_OVERRIDE.with(|cell| *cell.borrow_mut() = previous);
+    result
 }
 
 pub(super) fn same_provider_account_failover_enabled() -> bool {

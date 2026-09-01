@@ -1067,6 +1067,7 @@ include!("tests/auth_refresh.rs");
 include!("tests/model_resolution.rs");
 include!("tests/issue_534_profile_preservation.rs");
 include!("tests/fallback_failover.rs");
+include!("tests/account_first_failover.rs");
 include!("tests/catalog_subscription.rs");
 
 /// A MultiProvider with both the Anthropic and OpenAI slots filled, active on
@@ -1180,6 +1181,99 @@ fn switching_to_an_unconfigured_provider_is_an_error() {
             provider.active_provider(),
             ActiveProvider::Cursor,
             "a failed switch must not move the session"
+        );
+    });
+}
+
+/// A spent provider must be skipped whichever provider it is, not only Claude.
+///
+/// The exhaustion precheck used to read `match provider { Claude if ... }`, so
+/// "this provider has no credit left" was a Claude-only concept. A spent OpenAI
+/// account was never recognised as spent, so the fallback loop could not step
+/// past it to the next provider that still had credit - which is the whole
+/// point of having more than one account.
+#[test]
+fn a_spent_provider_is_skipped_whichever_provider_it_is() {
+    with_clean_provider_test_env(|| {
+        let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
+        let runtime = enter_test_runtime();
+        let _runtime_guard = runtime.enter();
+        let provider = test_multi_provider_with_anthropic_and_openai();
+
+        // Empty probe override = "no usage data for anybody", which is what
+        // makes this test hermetic. Without it, `usage_exhausted_reason` ->
+        // `account_switch_guidance` reaches the *real* probe, which issues a
+        // live usage request for the fake OpenAI token and then parks forever:
+        // `fetch_openai_usage_for_account` calls `block_on` inside
+        // `block_in_place` on this current-thread runtime, so nothing can drive
+        // the IO it is waiting for. The test never failed - it hung, holding
+        // `lock_test_env`, so every other env-using test in the crate appeared
+        // to hang too and `cargo test -p jcode-base --lib` never finished.
+        crate::provider::account_failover::with_account_usage_probe_override(Vec::new(), || {
+            for candidate in [ActiveProvider::Claude, ActiveProvider::OpenAI] {
+                let reason = crate::provider::account_failover::with_quota_exhausted_override(
+                    Some(true),
+                    || provider.provider_precheck_unavailable_reason(candidate),
+                );
+                assert!(
+                    reason.is_some(),
+                    "{:?} reports every account spent, so it must be skipped",
+                    candidate
+                );
+            }
+        });
+    });
+}
+
+/// With credit left, no provider is skipped.
+///
+/// The failure this guards against is worse than the bug it fixes: a precheck
+/// that wrongly reports exhaustion takes a working provider out of service and
+/// the turn fails with "no usable provider" while the account is fine.
+#[test]
+fn a_provider_with_credit_is_not_skipped() {
+    with_clean_provider_test_env(|| {
+        let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
+        let runtime = enter_test_runtime();
+        let _runtime_guard = runtime.enter();
+        let provider = test_multi_provider_with_anthropic_and_openai();
+
+        // Hermetic for the same reason as the test above: no live usage fetch.
+        let reason = crate::provider::account_failover::with_account_usage_probe_override(
+            Vec::new(),
+            || {
+                crate::provider::account_failover::with_quota_exhausted_override(Some(false), || {
+                    provider.provider_precheck_unavailable_reason(ActiveProvider::OpenAI)
+                })
+            },
+        );
+        assert!(
+            reason.is_none(),
+            "OpenAI has headroom and must stay in the rotation, got: {:?}",
+            reason
+        );
+    });
+}
+
+/// A provider with no account identity at all (no usage probe) is attempted
+/// rather than skipped.
+///
+/// "We cannot know until we ask" must fail open. Failing closed would silently
+/// remove every API-key provider from the chain, since none of them can report
+/// per-account quota.
+#[test]
+fn a_provider_without_account_identity_is_still_attempted() {
+    with_clean_provider_test_env(|| {
+        let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
+        let runtime = enter_test_runtime();
+        let _runtime_guard = runtime.enter();
+        let provider = test_multi_provider_with_cursor();
+
+        assert!(
+            provider
+                .provider_precheck_unavailable_reason(ActiveProvider::Cursor)
+                .is_none(),
+            "Cursor has no per-account usage probe, so it must not be pre-emptively skipped"
         );
     });
 }
