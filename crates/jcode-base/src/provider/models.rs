@@ -954,6 +954,21 @@ pub fn clear_all_model_unavailability_for_account() {
     OPENAI_MODEL_CATALOG_SERVICE.clear_runtime_model_unavailable_scope(&scope);
 }
 
+/// Test-only: drop every runtime provider-unavailability marker, for every
+/// provider and every account.
+///
+/// [`clear_all_provider_unavailability_for_account`] only clears the
+/// `openai::<scope>` keys, so an Anthropic marker recorded under
+/// `claude::claude-1` survives it. That is fine in production, where the marker
+/// is per-account and TTL'd, but across tests in one process it leaks: a test
+/// that 429s `claude-1` makes the next test skip `claude-1` entirely and record
+/// a different, still-passing, wrong ladder.
+pub fn clear_all_provider_unavailability_for_tests() {
+    if let Ok(mut unavailable) = ACCOUNT_RUNTIME_UNAVAILABLE_PROVIDERS.write() {
+        unavailable.clear();
+    }
+}
+
 /// Clear all runtime provider unavailability markers.
 pub fn clear_all_provider_unavailability_for_account() {
     let scope = current_openai_account_scope();

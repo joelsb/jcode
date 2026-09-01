@@ -39,6 +39,66 @@ impl MultiProvider {
         Ok(Some(self.model()))
     }
 
+    /// Run the account ladder for `candidate`, whether or not the session is
+    /// currently on it, and adopt the provider when a different one serves.
+    ///
+    /// The rule Joel asked for is "every account of a provider before the next
+    /// provider", and the loop only honoured half of it: the ladder ran solely
+    /// for the provider the session started on (`if candidate == active`). Once
+    /// the sequence crossed into another multi-account provider it tried exactly
+    /// one account - whichever `auth.json` last recorded as active - and, if
+    /// that one was spent, walked past a funded sibling to the next provider,
+    /// eventually reporting "No tokens/providers left".
+    ///
+    /// Observed shape of the bug, from the test that reproduces it: the very
+    /// error that gave up also said "Another Anthropic account has headroom:
+    /// `claude-2`. Use `/account switch claude-2`" - jcode knew the answer and
+    /// asked the user to type it.
+    ///
+    /// Adopting the provider on success is not cosmetic. The stream is about to
+    /// be served by `candidate`, so leaving `active` pointing at the provider
+    /// that just refused would make the next turn start the whole ladder again
+    /// from the spent account.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn try_account_failover_for_candidate(
+        &self,
+        candidate: ActiveProvider,
+        active: ActiveProvider,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        mode: CompletionMode<'_>,
+        reason: &str,
+        notes: &mut Vec<String>,
+    ) -> Result<Option<EventStream>> {
+        let Some(stream) = self
+            .try_same_provider_account_failover(candidate, messages, tools, mode, reason, notes)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        if candidate != active {
+            self.set_active_provider(candidate);
+            let from_label = Self::provider_label(active);
+            let to_label = Self::provider_label(candidate);
+            crate::logging::info(&format!(
+                "{}: switched from {} to {} on an alternate account",
+                mode.switch_log_prefix(),
+                from_label,
+                to_label
+            ));
+            self.startup_notices
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(format!(
+                    "⚡ Auto-fallback: {} unavailable, switched to {}",
+                    from_label, to_label
+                ));
+        }
+
+        Ok(Some(stream))
+    }
+
     pub(super) async fn try_same_provider_account_failover(
         &self,
         provider: ActiveProvider,
