@@ -196,9 +196,18 @@ fn test_same_provider_account_candidates_include_other_openai_accounts() {
         })
         .unwrap();
 
-        crate::auth::codex::set_active_account("openai-1").unwrap();
+        // Read the labels back: the account store assigns canonical names, so
+        // hard-coded ones would not exist.
+        let labels: Vec<String> = crate::auth::codex::list_accounts()
+            .expect("read back the seeded OpenAI accounts")
+            .into_iter()
+            .map(|account| account.label)
+            .collect();
+        assert_eq!(labels.len(), 2, "two accounts were seeded");
+
+        crate::auth::codex::set_active_account(&labels[0]).unwrap();
         let candidates = MultiProvider::same_provider_account_candidates(ActiveProvider::OpenAI);
-        assert_eq!(candidates, vec!["openai-2".to_string()]);
+        assert_eq!(candidates, vec![labels[1].clone()]);
     });
 }
 

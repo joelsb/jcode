@@ -16,7 +16,8 @@
 /// cannot express "this account is spent, that one is funded" - which is the
 /// only thing these tests are about. Every `complete()` records the account it
 /// was called with, so a test can assert the exact ladder that was climbed
-/// (`["claude-1", "claude-2"]`) instead of merely that the call eventually
+/// (spent account first, then the funded sibling) instead of merely that the
+/// call eventually
 /// succeeded.
 struct AccountAwareStub {
     name: &'static str,
@@ -177,7 +178,7 @@ fn write_account_first_failover_config() {
 /// `RATE_LIMITED_ACCOUNTS`, the per-account provider-unavailability map and the
 /// model-unavailability map all outlive a single test, and each of these tests
 /// deliberately *creates* entries in them. Without this reset the second test to
-/// run sees the first test's 429 for `claude-1`, skips the account entirely and
+/// run sees the first test's 429 for the spent account, skips it entirely and
 /// records a different (still passing, still wrong) ladder - a clean, plausible,
 /// wrong answer that hid the real ordering.
 fn reset_failover_memory() {
@@ -187,28 +188,36 @@ fn reset_failover_memory() {
     crate::usage::clear_anthropic_account_usage_for_tests();
 }
 
-/// Seed `labels` as Anthropic OAuth accounts and make `active` the active one.
+/// Seed `count` Anthropic OAuth accounts, make the first one active, and return
+/// the labels the account store actually assigned, first-active-first.
 ///
-/// Writes `auth.json` directly instead of going through `upsert_account`, which
-/// renames a new account to `next_account_label(prefix, len)` and so cannot be
-/// used to pin the exact labels these assertions name.
-fn seed_anthropic_accounts(labels: &[&str], active: &str) {
+/// The labels are read back rather than chosen: `load_auth_file` relabels
+/// accounts to canonical names (`claude-otter`, `claude-fox`, ...), so a test
+/// that hard-codes labels asserts against names that never exist.
+fn seed_anthropic_accounts(count: usize) -> Vec<String> {
     let mut auth = crate::auth::claude::load_auth_file().unwrap_or_default();
-    auth.anthropic_accounts = labels
-        .iter()
-        .map(|label| crate::auth::claude::AnthropicAccount {
-            label: (*label).to_string(),
-            access: format!("test-access-{label}"),
-            refresh: format!("test-refresh-{label}"),
+    auth.anthropic_accounts = (0..count)
+        .map(|index| crate::auth::claude::AnthropicAccount {
+            label: format!("seed-{index}"),
+            access: format!("test-access-{index}"),
+            refresh: format!("test-refresh-{index}"),
             expires: chrono::Utc::now().timestamp_millis() + 86_400_000,
-            email: Some(format!("{label}@example.test")),
+            email: Some(format!("seed-{index}@example.test")),
             subscription_type: Some("max".to_string()),
             scopes: Vec::new(),
         })
         .collect();
-    auth.active_anthropic_account = Some(active.to_string());
+    auth.active_anthropic_account = None;
     crate::auth::claude::save_auth_file(&auth).expect("write test anthropic accounts");
-    crate::auth::claude::set_active_account_override(Some(active.to_string()));
+
+    let labels: Vec<String> = crate::auth::claude::list_accounts()
+        .expect("read back seeded accounts")
+        .into_iter()
+        .map(|account| account.label)
+        .collect();
+    assert_eq!(labels.len(), count, "every seeded account must be readable");
+    crate::auth::claude::set_active_account(&labels[0]).expect("select the first account");
+    labels
 }
 
 fn account_first_test_provider(
@@ -317,12 +326,13 @@ fn a_spent_claude_account_rotates_to_the_other_claude_account() {
         let _cooldown_guard = crate::provider::account_failover::lock_account_cooldown_tests();
         reset_failover_memory();
         write_account_first_failover_config();
-        seed_anthropic_accounts(&["claude-1", "claude-2"], "claude-1");
+        let accounts = seed_anthropic_accounts(2);
+        let (spent, funded) = (accounts[0].as_str(), accounts[1].as_str());
 
         let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let anthropic = Arc::new(AccountAwareStub::new(
             ActiveProvider::Claude,
-            &["claude-1"],
+            &[spent],
             attempts.clone(),
         ));
         let provider =
@@ -335,8 +345,8 @@ fn a_spent_claude_account_rotates_to_the_other_claude_account() {
                 ActiveProvider::Claude,
                 probe(
                     crate::usage::MultiAccountProviderKind::Anthropic,
-                    "claude-1",
-                    &[("claude-1", true), ("claude-2", false)],
+                    spent,
+                    &[(spent, true), (funded, false)],
                 ),
             )],
             || {
@@ -351,18 +361,18 @@ fn a_spent_claude_account_rotates_to_the_other_claude_account() {
 
         assert!(
             result.is_ok(),
-            "claude-2 has credit, so the turn must be served: {:?}",
+            "the sibling account has credit, so the turn must be served: {:?}",
             result.err().map(|err| err.to_string())
         );
         assert_eq!(
             recorded_attempts(&attempts),
-            vec!["claude:claude-1".to_string(), "claude:claude-2".to_string()],
+            vec![format!("claude:{spent}"), format!("claude:{funded}")],
             "the spent account is tried once, then the sibling account - no third \
              request and no return trip"
         );
         assert_eq!(
             crate::auth::claude::active_account_label().as_deref(),
-            Some("claude-2"),
+            Some(funded),
             "the session must stay on the account that actually served the turn"
         );
         assert_eq!(
@@ -372,7 +382,7 @@ fn a_spent_claude_account_rotates_to_the_other_claude_account() {
         );
         let notices = notices(&provider);
         assert!(
-            notices.contains("claude-1") && notices.contains("claude-2"),
+            notices.contains(spent) && notices.contains(funded),
             "the user must be told which account is now serving, got: {notices}"
         );
 
@@ -388,7 +398,7 @@ fn a_spent_claude_account_rotates_to_the_other_claude_account() {
 /// Anthropic therefore tried exactly one account - whichever `auth.json` last
 /// recorded as active - and, finding it spent, walked on to Copilot, Gemini,
 /// Cursor and finally reported "No tokens/providers left" while a funded
-/// `claude-2` sat one rotation away.
+/// a funded sibling sat one rotation away.
 ///
 /// This is precisely the reported case: crossing onto a provider whose stored
 /// account is spent must continue to its funded sibling.
@@ -406,10 +416,15 @@ fn crossing_from_openai_lands_on_a_claude_account_with_credit() {
         reset_failover_memory();
         write_account_first_failover_config();
         save_test_openai_oauth_credentials();
-        let openai_label = crate::auth::codex::primary_account_label();
-        // Deliberately the spent account: the stored choice must not decide the
-        // outcome.
-        seed_anthropic_accounts(&["claude-1", "claude-2"], "claude-1");
+        let openai_label = crate::auth::codex::list_accounts()
+            .expect("read back the seeded OpenAI account")
+            .first()
+            .map(|account| account.label.clone())
+            .expect("one OpenAI account was seeded");
+        // The stored active Anthropic account is deliberately the spent one:
+        // the stored choice must not decide the outcome.
+        let accounts = seed_anthropic_accounts(2);
+        let (spent, funded) = (accounts[0].clone(), accounts[1].clone());
 
         let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let openai = Arc::new(AccountAwareStub::new(
@@ -419,7 +434,7 @@ fn crossing_from_openai_lands_on_a_claude_account_with_credit() {
         ));
         let anthropic = Arc::new(AccountAwareStub::new(
             ActiveProvider::Claude,
-            &["claude-1"],
+            &[spent.as_str()],
             attempts.clone(),
         ));
         let provider = account_first_test_provider(
@@ -436,8 +451,8 @@ fn crossing_from_openai_lands_on_a_claude_account_with_credit() {
                     ActiveProvider::Claude,
                     probe(
                         crate::usage::MultiAccountProviderKind::Anthropic,
-                        "claude-1",
-                        &[("claude-1", true), ("claude-2", false)],
+                        spent.as_str(),
+                        &[(spent.as_str(), true), (funded.as_str(), false)],
                     ),
                 ),
                 (
@@ -464,7 +479,7 @@ fn crossing_from_openai_lands_on_a_claude_account_with_credit() {
 
         assert!(
             result.is_ok(),
-            "claude-2 has credit, so crossing providers must succeed rather than \
+            "the funded Anthropic account must serve the turn rather than the run \
              report no usable provider: {:?}",
             result.err().map(|err| err.to_string())
         );
@@ -474,11 +489,11 @@ fn crossing_from_openai_lands_on_a_claude_account_with_credit() {
             recorded,
             vec![
                 format!("openai:{openai_label}"),
-                "claude:claude-1".to_string(),
-                "claude:claude-2".to_string(),
+                format!("claude:{spent}"),
+                format!("claude:{funded}"),
             ],
             "OpenAI is tried once, then Anthropic's stored account, then its \
-             funded sibling. Stopping after claude-1 is the bug."
+             funded sibling. Stopping after the spent account is the bug."
         );
         assert_eq!(
             provider.active_provider(),
@@ -486,10 +501,10 @@ fn crossing_from_openai_lands_on_a_claude_account_with_credit() {
             "the session must follow the turn onto the provider that served it"
         );
         assert_eq!(
-            crate::auth::claude::active_account_label().as_deref(),
-            Some("claude-2"),
+            crate::auth::claude::active_account_label(),
+            Some(funded.clone()),
             "and onto the account that served it, so the next turn does not \
-             rediscover claude-1's limit"
+             rediscover the spent account's limit"
         );
 
         reset_failover_memory();
