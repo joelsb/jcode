@@ -18,24 +18,34 @@ cross_provider_failover = "automatic"      # after every funded same-provider ac
 same_provider_account_failover = true       # try other accounts on same provider
 prefer_account_failover = true              # DAIN patch: account before model downgrade
 
-[providers.omniroute]
-type = "open-ai-compatible"
-base_url = "http://localhost:20128/v1"
-auth = "bearer"
-api_key_env = "JCODE_PROVIDER_OMNIROUTE_API_KEY"
-default_model = "auto/best-coding"
-provider_routing = true
-model_catalog = true
+[providers]                                 # empty: no named profiles configured
 ```
+
+### OmniRoute: removed 2026-09-01
+
+The `[providers.omniroute]` profile and the `jc-or` / `jc-or-5` aliases are gone.
+It looked like a safety net and was not one:
+
+- Nothing listens on `localhost:20128`; the service is not running.
+- A named `open-ai-compatible` profile can **never** be selected by failover.
+  `ActiveProvider` in `crates/jcode-provider-core/src/selection.rs` is a fixed
+  enum with no variant for named profiles, so the profile is invisible to the
+  failover sequence even when the service is up. That is why an exhausted-quota
+  error listed 7 providers and never OmniRoute.
+
+The `claude()` shell wrapper still points **Claude Code** at port 20128. That is
+a separate tool and was deliberately left alone. Restore point:
+`~/.jcode/config.toml.bak-20260901-122712`, `~/.zshrc.bak-20260901-122712`.
 
 ## Shell Aliases (~/.zshrc)
 
 ```bash
-alias jc='git pull ; jcode -m "claude-opus-4-6[1m]"'
-alias jc-5='git pull ; jcode -m "claude-sonnet-5"'
-alias jc-or='git pull ; jcode --provider-profile omniroute -m "claude-opus-4-6[1m]"'
-alias jc-5-or='git pull ; jcode --provider-profile omniroute -m "claude-sonnet-5"'
+alias jc='git pull || true ; jcode -m "claude-opus-5"'
+alias jc-5='git pull || true ; jcode --socket /tmp/jcode-sonnet5.sock -m "claude-sonnet-5"'
 ```
+
+No `[1m]` suffix on purpose: from opus/sonnet 4.7 up the 1M window is native and
+jcode strips the suffix before the request anyway.
 
 ## Accounts
 
@@ -51,7 +61,7 @@ Failover order: sorted by usage (least-used first). `same_provider_account_failo
 | Section | What |
 |---------|------|
 | `[provider]` | Default model/provider, reasoning effort, failover |
-| `[providers.<name>]` | Named profiles (OmniRoute, etc.) |
+| `[providers.<name>]` | Named openai-compatible profiles (none configured; not failover-eligible) |
 | `[display]` | Theme, diff mode, layout |
 | `[features]` | Memory, swarm, mermaid, macOS menu bar indicator (`menubar`) |
 | `[keybindings]` | All keyboard shortcuts |
