@@ -192,6 +192,54 @@ Not in any commit as of 2026-09-01, so absent from every `git log` based summary
 - New test `remote_events_reload_04.rs` (+93).
 - Untracked: `.local/prd/session-task-label-brief.md`, `crates/jcode-build-support/examples/publish_current.rs`.
 
+## Porting this to the Pi harness
+
+Pi is a TypeScript monorepo at `~/MYNE/Projects/tools/pi`, ten packages under `packages/`. Everything below was checked against that checkout on 2026-09-01, not inferred from feature names.
+
+### The blocker
+
+Pi's credential store is keyed by provider id, one credential per provider, and has no concept of an account. Our largest feature has nowhere to live until that type changes.
+
+| File | What it says |
+|---|---|
+| `ai/src/auth/types.ts:51` | "App-owned credential storage, **keyed by `Provider.id`, one credential per provider**." |
+| `ai/src/auth/types.ts:40` | `CredentialInfo` is `{providerId, type}`. No account identity. |
+| `ai/src/auth/credential-store.ts` | `Map<string, Credential>` where the string is the provider id. Zero occurrences of "account". |
+| `ai/src/utils/provider-retry.ts:105` | On a 429 it sleeps and reissues **the same request with the same credential**. There is nothing else to switch to. |
+
+`Credential` and `CredentialStore` are exported from `@earendil-works/pi-ai`, a published package, so changing their shape is not an internal refactor. That decision belongs to Pi upstream, or it means forking pi-ai.
+
+### Port order
+
+Five items form one chain behind the credential change. Four depend on nothing and can be done in any order.
+
+**Chain, in dependency order:**
+
+1. **Multi-account credentials.** Keyed credential set per provider, account id on `CredentialInfo`, `auth.json` migration. Blocks the four below.
+2. **Rotate the account on a 429.** `utils/provider-retry.ts` needs a credential-swap callback inside its retry loop.
+3. **Exhaustion verdict and usage windows.** No equivalent exists anywhere in Pi. Five-hour and seven-day tracking, the any-window rule, cross-request memory.
+4. **Route ranking.** No twin of our `fallback_pick.rs`. Includes the rule that a rate limit is never answered with the same model on the same provider's other credential.
+5. **Rotation broadcast.** `core/event-bus.ts` can carry it; the UI to name the active account is new.
+
+**Independent:** fast mode, the `.claudeignore` guard, mermaid as real images, task labels.
+
+### Feature by feature
+
+| Our feature | Pi today | Work |
+|---|---|---|
+| Skill `disable-model-invocation` | **Already implemented.** `visibleSkills` filters it in `agent/src/harness/system-prompt.ts:4`, with tests. | none |
+| Prompt queue | Partly there: `steer` vs `followUp` queues and `queue_update` events in `core/agent-session.ts`. | small |
+| Credential file hardening | `auth.json` written mode `0600` under `proper-lockfile`. | none |
+| Account-first failover | Nothing. One credential per provider, retry reuses it. | the project |
+| Fast mode | No `speed` or `service_tier` in `api/anthropic-messages.ts`. | one file |
+| Mermaid as images | ASCII box-drawing via `grok-mermaid`. Zero hits for kitty, sixel or iterm. | full stack |
+| `.claudeignore` | Nothing. Zero hits repo-wide. | module + wiring |
+| Task labels | No OSC terminal-title write anywhere. | medium |
+| MCP handle eviction | **Pi has no MCP at all.** Not a port, a feature. | out of scope |
+| Memory health, redaction | Memory exists under `agent/harness/session/`; no redaction module. | medium |
+
+Cheapest real win: port fast mode first. One file, self-contained, and it proves the pipeline before anyone commits to the credential refactor.
+
 ## Blast radius for a rebase
 
 | Crate | Files modified |

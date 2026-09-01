@@ -467,6 +467,151 @@
     <p class="caption">Risk is highest exactly where our two largest files live.</p>
   </figure>
 
+  <h2>Porting this to the Pi harness</h2>
+  <p>Pi is a TypeScript monorepo at <code>~/MYNE/Projects/tools/pi</code>, ten packages under <code>packages/</code>. Everything below was checked against that checkout on 2026-09-01, not assumed from the feature names.</p>
+
+  <div class="aside">One blocker sits under everything else. Pi's credential store is documented as keyed by provider id, <strong>one credential per provider</strong>, and the word "account" does not appear in it at all. Our flagship feature has nowhere to live until that type changes.</div>
+
+  <h3>The blocker, in Pi's own words</h3>
+  <table>
+    <thead><tr><th>File</th><th>What it says</th></tr></thead>
+    <tbody>
+      <tr><td><code>ai/src/auth/types.ts:51</code></td><td>"App-owned credential storage, <strong>keyed by Provider.id, one credential per provider</strong>."</td></tr>
+      <tr><td><code>ai/src/auth/types.ts:40</code></td><td><code>CredentialInfo</code> is <code>{providerId, type}</code>. No account identity anywhere in it.</td></tr>
+      <tr><td><code>ai/src/auth/credential-store.ts</code></td><td><code>Map&lt;string, Credential&gt;</code>. The string is the provider id. Zero occurrences of "account".</td></tr>
+      <tr><td><code>ai/src/utils/provider-retry.ts:105</code></td><td>On a 429 it sleeps and reissues <strong>the same request with the same credential</strong>. There is nothing else to switch to.</td></tr>
+    </tbody>
+  </table>
+  <p><code>Credential</code> and <code>CredentialStore</code> are exported from <code>@earendil-works/pi-ai</code>, a published package. Changing their shape is not an internal refactor.</p>
+
+  <figure>
+    <svg viewBox="0 0 1000 620" role="img" aria-labelledby="piorder-title piorder-desc" xmlns="http://www.w3.org/2000/svg">
+      <title id="piorder-title">Port order for the Pi harness</title>
+      <desc id="piorder-desc">Dependency graph showing that multi-account credentials must land before rotation, exhaustion tracking, route ranking and the rotation broadcast, while fast mode, the ignore guard and mermaid images depend on nothing and can be ported in any order.</desc>
+      <rect width="100%" height="100%" fill="#2d3142"/>
+
+      <!-- rank eyebrows -->
+      <text x="56" y="96" fill="#8e98ac" font-size="7" font-family="'Geist Mono', monospace" letter-spacing="0.14em">RANK 0</text>
+      <text x="56" y="216" fill="#8e98ac" font-size="7" font-family="'Geist Mono', monospace" letter-spacing="0.14em">RANK 1</text>
+      <text x="56" y="336" fill="#8e98ac" font-size="7" font-family="'Geist Mono', monospace" letter-spacing="0.14em">RANK 2</text>
+      <text x="56" y="456" fill="#8e98ac" font-size="7" font-family="'Geist Mono', monospace" letter-spacing="0.14em">INDEPENDENT</text>
+
+      <!-- edges drawn before boxes -->
+      <!-- multi-account (centre 420,116 bottom y=144) fans to three at rank1 -->
+      <path d="M 380,144 V 168 Q 380,176 372,176 H 208 Q 200,176 200,184 V 208"
+            fill="none" stroke="#bfc0c0" stroke-width="1.2"/>
+      <polygon points="196,208 204,208 200,216" fill="#bfc0c0"/>
+      <line x1="420" y1="144" x2="420" y2="208" stroke="#bfc0c0" stroke-width="1.2"/>
+      <polygon points="416,208 424,208 420,216" fill="#bfc0c0"/>
+      <path d="M 460,144 V 168 Q 460,176 468,176 H 632 Q 640,176 640,184 V 208"
+            fill="none" stroke="#bfc0c0" stroke-width="1.2"/>
+      <polygon points="636,208 644,208 640,216" fill="#bfc0c0"/>
+      <!-- rank1 rotation -> rank2 broadcast -->
+      <line x1="200" y1="264" x2="200" y2="328" stroke="#bfc0c0" stroke-width="1.2"/>
+      <polygon points="196,328 204,328 200,336" fill="#bfc0c0"/>
+      <!-- rank1 exhaustion -> rank2 ranking -->
+      <line x1="420" y1="264" x2="420" y2="328" stroke="#bfc0c0" stroke-width="1.2"/>
+      <polygon points="416,328 424,328 420,336" fill="#bfc0c0"/>
+      <!-- rank1 usage store -> ranking (horizontal-ish elbow) -->
+      <path d="M 640,264 V 296 Q 640,304 632,304 H 508 Q 500,304 500,312 V 328"
+            fill="none" stroke="#bfc0c0" stroke-width="1.2"/>
+      <polygon points="496,328 504,328 500,336" fill="#bfc0c0"/>
+
+      <!-- rank 0 focal node -->
+      <rect x="300" y="88" width="240" height="56" rx="6" fill="#2d3142"/>
+      <rect x="300" y="88" width="240" height="56" rx="6" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="492" y="94" width="40" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.40)" stroke-width="0.8"/>
+      <text x="512" y="103" fill="rgba(240,138,89,0.85)" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">4 IN</text>
+      <text x="404" y="122" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Multi-account credentials</text>
+      <text x="404" y="136" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">pi-ai · published type change</text>
+
+      <!-- rank 1 -->
+      <rect x="120" y="216" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="120" y="216" width="160" height="56" rx="6" fill="rgba(245,245,245,0.05)" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="240" y="222" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.30)" stroke-width="0.8"/>
+      <text x="256" y="231" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">1 IN</text>
+      <text x="188" y="250" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Rotate on 429</text>
+      <text x="188" y="264" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">provider-retry.ts</text>
+
+      <rect x="340" y="216" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="340" y="216" width="160" height="56" rx="6" fill="rgba(245,245,245,0.05)" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="460" y="222" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.30)" stroke-width="0.8"/>
+      <text x="476" y="231" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">1 IN</text>
+      <text x="408" y="250" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Exhaustion verdict</text>
+      <text x="408" y="264" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">no equivalent exists</text>
+
+      <rect x="560" y="216" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="560" y="216" width="160" height="56" rx="6" fill="rgba(245,245,245,0.05)" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="680" y="222" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.30)" stroke-width="0.8"/>
+      <text x="696" y="231" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">1 IN</text>
+      <text x="628" y="250" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Usage windows</text>
+      <text x="628" y="264" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">5h and 7d tracking</text>
+
+      <!-- rank 2 -->
+      <rect x="120" y="336" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="120" y="336" width="160" height="56" rx="6" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <text x="200" y="370" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Rotation broadcast</text>
+      <text x="200" y="384" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">core/event-bus.ts exists</text>
+
+      <rect x="420" y="336" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="420" y="336" width="160" height="56" rx="6" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <text x="500" y="370" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Route ranking</text>
+      <text x="500" y="384" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">no fallback_pick twin</text>
+
+      <!-- independent row -->
+      <rect x="120" y="456" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="120" y="456" width="160" height="56" rx="6" fill="rgba(45,49,66,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="200" y="490" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Fast mode</text>
+      <text x="200" y="504" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">one file · start here</text>
+
+      <rect x="320" y="456" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="320" y="456" width="160" height="56" rx="6" fill="rgba(45,49,66,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="400" y="490" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Ignore guard</text>
+      <text x="400" y="504" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">new module + wiring</text>
+
+      <rect x="520" y="456" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="520" y="456" width="160" height="56" rx="6" fill="rgba(45,49,66,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="600" y="490" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Mermaid images</text>
+      <text x="600" y="504" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">ASCII only today</text>
+
+      <rect x="720" y="456" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="720" y="456" width="160" height="56" rx="6" fill="rgba(45,49,66,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="800" y="490" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Task labels</text>
+      <text x="800" y="504" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">no OSC title today</text>
+
+      <!-- legend -->
+      <line x1="56" y1="556" x2="944" y2="556" stroke="rgba(245,245,245,0.12)" stroke-width="0.8"/>
+      <text x="56" y="576" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+      <rect x="200" y="568" width="14" height="10" rx="2" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
+      <text x="222" y="576" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">BLOCKS FOUR OTHERS</text>
+      <rect x="420" y="568" width="14" height="10" rx="2" fill="rgba(245,245,245,0.05)" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="442" y="576" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">BLOCKED WORK</text>
+      <rect x="600" y="568" width="14" height="10" rx="2" fill="rgba(45,49,66,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="622" y="576" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">PORTABLE ALONE</text>
+      <text x="944" y="576" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">BADGE = HOW MANY THINGS WAIT ON IT</text>
+    </svg>
+    <p class="caption">Five items form one chain behind a published type change. Four depend on nothing.</p>
+  </figure>
+
+  <h3>Feature by feature</h3>
+  <table>
+    <thead><tr><th>Our feature</th><th>Pi today</th><th>Work</th></tr></thead>
+    <tbody>
+      <tr><td>Skill <code>disable-model-invocation</code></td><td><strong>Already implemented.</strong> <code>visibleSkills</code> filters it in <code>agent/src/harness/system-prompt.ts:4</code>, with tests in <code>skills.test.ts</code>.</td><td class="num">none</td></tr>
+      <tr><td>Prompt queue</td><td>Partly there: <code>steer</code> vs <code>followUp</code> queues and <code>queue_update</code> events in <code>core/agent-session.ts</code>.</td><td class="num">small</td></tr>
+      <tr><td>Credential file hardening</td><td><code>auth.json</code> written mode <code>0600</code> under <code>proper-lockfile</code>.</td><td class="num">none</td></tr>
+      <tr><td>Account-first failover</td><td>Nothing. One credential per provider, retry reuses it.</td><td class="num">the project</td></tr>
+      <tr><td>Fast mode</td><td>No <code>speed</code> or <code>service_tier</code> in <code>api/anthropic-messages.ts</code>.</td><td class="num">one file</td></tr>
+      <tr><td>Mermaid as images</td><td>ASCII box-drawing via <code>grok-mermaid</code>. Zero hits for kitty, sixel or iterm.</td><td class="num">full stack</td></tr>
+      <tr><td><code>.claudeignore</code></td><td>Nothing. Zero hits repo-wide.</td><td class="num">module + wiring</td></tr>
+      <tr><td>Task labels</td><td>No OSC terminal-title write anywhere.</td><td class="num">medium</td></tr>
+      <tr><td>MCP handle eviction</td><td><strong>Pi has no MCP at all.</strong> Not a port, a feature.</td><td class="num">out of scope</td></tr>
+      <tr><td>Memory health, redaction</td><td>Memory exists under <code>agent/harness/session/</code>; no redaction module.</td><td class="num">medium</td></tr>
+    </tbody>
+  </table>
+
+  <div class="aside">Cheapest real win: port fast mode first. One file, self-contained, and it proves the pipeline before anyone commits to the credential refactor.</div>
+
   <h2>Position</h2>
   <table>
     <thead><tr><th>Fact</th><th>Value</th></tr></thead>
