@@ -188,9 +188,15 @@ fn reset_failover_memory() {
 }
 
 /// Seed `labels` as Anthropic OAuth accounts and make `active` the active one.
+///
+/// Writes `auth.json` directly instead of going through `upsert_account`, which
+/// renames a new account to `next_account_label(prefix, len)` and so cannot be
+/// used to pin the exact labels these assertions name.
 fn seed_anthropic_accounts(labels: &[&str], active: &str) {
-    for label in labels {
-        crate::auth::claude::upsert_account(crate::auth::claude::AnthropicAccount {
+    let mut auth = crate::auth::claude::load_auth_file().unwrap_or_default();
+    auth.anthropic_accounts = labels
+        .iter()
+        .map(|label| crate::auth::claude::AnthropicAccount {
             label: (*label).to_string(),
             access: format!("test-access-{label}"),
             refresh: format!("test-refresh-{label}"),
@@ -199,9 +205,10 @@ fn seed_anthropic_accounts(labels: &[&str], active: &str) {
             subscription_type: Some("max".to_string()),
             scopes: Vec::new(),
         })
-        .expect("seed anthropic account");
-    }
-    crate::auth::claude::set_active_account(active).expect("select active anthropic account");
+        .collect();
+    auth.active_anthropic_account = Some(active.to_string());
+    crate::auth::claude::save_auth_file(&auth).expect("write test anthropic accounts");
+    crate::auth::claude::set_active_account_override(Some(active.to_string()));
 }
 
 fn account_first_test_provider(

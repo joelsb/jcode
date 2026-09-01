@@ -21,12 +21,32 @@ impl MultiProvider {
         &self,
         provider: ActiveProvider,
     ) -> Option<String> {
-        match provider {
-            ActiveProvider::Claude if self.is_claude_usage_exhausted() => Some(
-                crate::provider::account_failover::usage_exhausted_reason(provider),
-            ),
-            _ => None,
+        // Anthropic keeps its own aggregate check (five-hour + seven-day ratios
+        // from the session usage snapshot), which predates the per-account
+        // probe and covers the single-account case.
+        if provider == ActiveProvider::Claude && self.is_claude_usage_exhausted() {
+            return Some(crate::provider::account_failover::usage_exhausted_reason(
+                provider,
+            ));
         }
+
+        // Every other provider is checked through the same per-account usage
+        // probe, so "this provider has no account with credit left" is decided
+        // by one rule rather than a per-provider branch. A provider that gains
+        // a probe later starts being skipped here with no change to this
+        // function; one without a probe reports `false` and is still attempted,
+        // which is the correct answer for "we cannot know until we ask".
+        //
+        // Without this, exhaustion was a Claude-only concept: a spent OpenAI
+        // account was never recognised as spent, so the loop could not move
+        // past it to the next provider that still had credit.
+        if crate::provider::account_failover::all_accounts_quota_exhausted(provider) {
+            return Some(crate::provider::account_failover::usage_exhausted_reason(
+                provider,
+            ));
+        }
+
+        None
     }
 
     pub(super) fn build_failover_prompt(
@@ -66,7 +86,11 @@ impl MultiProvider {
     }
 
     pub(super) fn additional_no_provider_guidance(&self) -> Vec<String> {
-        [ActiveProvider::Claude, ActiveProvider::OpenAI]
+        // Ask every provider in the fallback order, not a hard-coded pair, so a
+        // provider that gains multi-account support is reported without editing
+        // this list. `account_switch_guidance` yields `None` for providers with
+        // no account identity, so the filter does the selection.
+        Self::fallback_sequence(self.active_provider())
             .into_iter()
             .filter_map(crate::provider::account_failover::account_switch_guidance)
             .collect()

@@ -651,7 +651,10 @@ pub(super) fn usage_exhausted_reason(provider: ActiveProvider) -> String {
     reason
 }
 
-fn error_looks_like_usage_limit(summary: &str) -> bool {
+/// Whether an error message looks like a usage/quota/rate limit, as opposed to
+/// a transport or protocol fault. Public because the provider runtimes size
+/// their own rate-limit wait with it.
+pub fn error_looks_like_usage_limit(summary: &str) -> bool {
     let lower = summary.to_ascii_lowercase();
     [
         "quota",
