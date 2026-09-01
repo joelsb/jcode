@@ -30,19 +30,28 @@ The working tree has uncommitted changes from another session
 `fallback_pick.rs`, `provider/failover.rs`, `provider/tests.rs`). **Not mine.
 Leave them alone.**
 
-## The one unfinished thing
+## The one unfinished thing - DONE (2026-09-01 10:57)
 
-`cargo test -p jcode-tui --lib` (full suite) was never seen to completion. Two
-attempts were killed by a server reload, not by a failure. Everything narrower
-passed: the new test, all 20 `fallback` tests, and a full `jcode-base --lib`
-run showing only the 3 pre-existing failures listed below.
+`cargo test -p jcode-tui --lib` now completes: **2242 passed, 17 failed, 18
+ignored, ~49s**.
 
-Run this first:
+It never completed before because the suite **deadlocked**, not because a
+reload killed it. `smoothness_benchmark_simulated_streaming_turn_stays_within_budget`
+took the render lock and then the env lock, while every
+`with_temp_jcode_home` + `create_test_app` test takes them the other way round.
+`sample` on the wedged binary showed the pair parked in
+`_pthread_mutex_firstfit_lock_wait`. Fixed in `af00c62f6`; a scan of the whole
+crate found it was the only inversion.
 
-```bash
-cd ~/MYNE/Projects/tools/jcode && source "$HOME/.cargo/env"
-cargo test --profile selfdev -p jcode-tui --lib 2>&1 | tail -6
-```
+The 17 remaining failures **reproduce identically on a clean detached worktree
+at the same commit**, so none of them come from this failover work. They are
+environment-driven: the tests read Joel's real `~/.jcode/config.toml`
+(`default_model = "claude-opus-5[1m]"` leaks into header/remote-state
+assertions) and the real terminal env (`HERDR_ENV` + `HERDR_PANE_ID` are set in
+every pane here, so `detected_resume_terminal` returns `herdr` and the handterm
+test fails). Unsetting the HERDR vars fixes that one test in isolation. Fixing
+the class properly means making those tests hermetic; not attempted, not part
+of this work.
 
 Known pre-existing failures in `jcode-base --lib`, present on a clean stashed
 tree, **not caused by this work**:
