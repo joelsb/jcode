@@ -3010,32 +3010,29 @@ fn handle_tool_call_details_command(app: &mut App, trimmed: &str) -> bool {
     if rest.is_empty() || matches!(rest, "show" | "status") {
         let current = crate::config::config().display.tool_call_details;
         app.push_display_message(DisplayMessage::system(format!(
-            "Tool call details are currently {}.\n\nWhen on, tool rows show the dimmed technical detail (command, path, args) next to the model-provided intent. When off, rows with an intent show only the intent; rows without an intent still show the technical detail.\n\nUse /tool-call-details on or /tool-call-details off to change it.",
-            if current { "on" } else { "off" }
+            "Tool call details are currently {}.\n\noff - tool rows show only the model-provided intent\non - intent, then the dimmed technical detail (command, path, args)\nonly - the technical detail instead of the intent\n\nRows with no technical detail always fall back to the intent, and error summaries always render.\n\nUse /tool-call-details off, on, or only to change it.",
+            current.label()
         )));
         return true;
     }
 
-    let Some(enabled) = parse_on_off_value(rest) else {
+    let Some(mode) = jcode_config_types::ToolCallDetailMode::parse(rest) else {
         app.push_display_message(DisplayMessage::error(
-            "Usage: /tool-call-details (show), /tool-call-details on, or /tool-call-details off"
+            "Usage: /tool-call-details (show), /tool-call-details off, /tool-call-details on, or /tool-call-details only"
                 .to_string(),
         ));
         return true;
     };
 
-    app.set_status_notice(format!(
-        "Tool call details: {}",
-        if enabled { "on" } else { "off" }
-    ));
-    match crate::config::Config::set_tool_call_details(enabled) {
+    app.set_status_notice(format!("Tool call details: {}", mode.label()));
+    match crate::config::Config::set_tool_call_details(mode) {
         Ok(()) => app.push_display_message(DisplayMessage::system(format!(
             "Saved tool call details: {}. Applied to this session immediately.",
-            if enabled { "on" } else { "off" }
+            mode.label()
         ))),
         Err(error) => app.push_display_message(DisplayMessage::error(format!(
             "Applied tool call details {} for this session, but failed to save it as the default: {}",
-            if enabled { "on" } else { "off" },
+            mode.label(),
             error
         ))),
     }

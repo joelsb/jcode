@@ -1,5 +1,5 @@
 use crate::DisplayMessage;
-use jcode_config_types::{DiagramDisplayMode, DiffDisplayMode};
+use jcode_config_types::{DiagramDisplayMode, DiffDisplayMode, ToolCallDetailMode};
 use ratatui::layout::Alignment;
 use ratatui::text::{Line, Span};
 use std::collections::{HashMap, VecDeque};
@@ -16,7 +16,7 @@ struct MessageCacheKey {
     mermaid_epoch: u64,
     mermaid_aspect_bucket: Option<u16>,
     show_agentgrep_output: bool,
-    tool_call_details: bool,
+    tool_call_details: ToolCallDetailMode,
 }
 
 #[derive(Default)]
@@ -66,7 +66,7 @@ pub struct MessageCacheContext {
     pub mermaid_epoch: u64,
     pub mermaid_aspect_bucket: Option<u16>,
     pub show_agentgrep_output: bool,
-    pub tool_call_details: bool,
+    pub tool_call_details: ToolCallDetailMode,
 }
 
 pub fn left_pad_lines_for_centered_mode(lines: &mut [Line<'static>], width: u16) {

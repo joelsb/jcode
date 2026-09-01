@@ -21,6 +21,33 @@ where
     Ok(T::deserialize(value).unwrap_or_default())
 }
 
+/// Deserialize a string-valued enum that also accepts a legacy boolean.
+///
+/// `tool_call_details` shipped as `true`/`false` before it grew a third state,
+/// so an existing `config.toml` still carries a bool. Rejecting it would drop
+/// the whole `[display]` table (issue #689), so map `false`/`true` onto the
+/// enum's `off`/`on` spellings and fall back to `Default` for anything else.
+pub(crate) fn lenient_bool_enum<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrString {
+        Bool(bool),
+        Str(String),
+    }
+
+    let raw = match BoolOrString::deserialize(deserializer)? {
+        BoolOrString::Bool(true) => "on".to_string(),
+        BoolOrString::Bool(false) => "off".to_string(),
+        BoolOrString::Str(s) => s,
+    };
+    let value = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(raw.as_str());
+    Ok(T::deserialize(value).unwrap_or_default())
+}
+
 /// `Option` variant of [`lenient_enum`]: an unrecognized value becomes `None`
 /// ("not configured") rather than a config-wide parse failure.
 pub(crate) fn lenient_optional_enum<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -41,11 +68,33 @@ where
 mod tests {
     use crate::{
         DiagramDisplayMode, DiffDisplayMode, DisplayConfig, LatexRenderingMode,
-        MarkdownSpacingMode, OverscrollStatusMode, ReasoningDisplayMode,
+        MarkdownSpacingMode, OverscrollStatusMode, ReasoningDisplayMode, ToolCallDetailMode,
     };
 
     fn parse(json: &str) -> DisplayConfig {
         serde_json::from_str(json).expect("display config must still parse")
+    }
+
+    /// `tool_call_details` grew from a bool to a tri-state. An existing
+    /// `config.toml` still holds `true`/`false`, and rejecting it would drop
+    /// the entire `[display]` table.
+    #[test]
+    fn legacy_boolean_tool_call_details_still_parses() {
+        assert_eq!(
+            parse(r#"{"tool_call_details": true, "centered": true}"#).tool_call_details,
+            ToolCallDetailMode::On
+        );
+        let off = parse(r#"{"tool_call_details": false, "centered": true}"#);
+        assert_eq!(off.tool_call_details, ToolCallDetailMode::Off);
+        assert!(off.centered, "unrelated settings must survive");
+        assert_eq!(
+            parse(r#"{"tool_call_details": "only"}"#).tool_call_details,
+            ToolCallDetailMode::Only
+        );
+        assert_eq!(
+            parse(r#"{"tool_call_details": "bogus", "centered": true}"#).tool_call_details,
+            ToolCallDetailMode::Off
+        );
     }
 
     #[test]

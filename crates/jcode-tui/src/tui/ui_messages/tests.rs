@@ -1996,6 +1996,82 @@ fn render_tool_message_hides_technical_preview_by_default() {
     assert_eq!(lines.len(), 1, "no extra detail line expected: {rendered}");
 }
 
+/// `only` mode: the row shows the actual command instead of the intent, so a
+/// reader can see what ran rather than a paraphrase of why.
+#[test]
+fn render_tool_message_shows_only_the_command_in_only_mode() {
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set_mode(
+        jcode_config_types::ToolCallDetailMode::Only,
+    );
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "ok".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_intent_only".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({
+                "command": "cargo test -p jcode render_background_task --lib",
+                "intent": "Verify compact progress card"
+            }),
+            intent: Some("Verify compact progress card".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    let rendered = extract_line_text(&lines[0]);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set_mode(
+        jcode_config_types::ToolCallDetailMode::Off,
+    );
+
+    assert!(
+        rendered.contains("$ cargo test -p jcode render_background_task"),
+        "the full command should render in only mode: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Verify compact progress card"),
+        "intent should be replaced in only mode: {rendered}"
+    );
+    assert_eq!(lines.len(), 1, "no extra detail line expected: {rendered}");
+}
+
+/// A tool row whose technical detail is empty (arguments still streaming) must
+/// keep the intent in `only` mode rather than rendering a bare tool name.
+#[test]
+fn render_tool_message_falls_back_to_intent_when_only_mode_has_no_detail() {
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set_mode(
+        jcode_config_types::ToolCallDetailMode::Only,
+    );
+    let msg = DisplayMessage {
+        role: "tool".to_string(),
+        content: "ok".to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_intent_only_empty".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({}),
+            intent: Some("Verify compact progress card".to_string()),
+            thought_signature: None,
+        }),
+    };
+
+    let lines = render_tool_message(&msg, 120, crate::config::DiffDisplayMode::Off);
+    let rendered = extract_line_text(&lines[0]);
+    crate::tui::ui::tools_ui::tests_tool_call_details_override::set_mode(
+        jcode_config_types::ToolCallDetailMode::Off,
+    );
+
+    assert!(
+        rendered.contains("Verify compact progress card"),
+        "intent must survive when there is no detail to show: {rendered}"
+    );
+}
+
 /// Even with details off, a failed tool row keeps its error summary so
 /// failures stay diagnosable.
 #[test]

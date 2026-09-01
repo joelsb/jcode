@@ -1,6 +1,7 @@
 use crate::message::ToolCall;
 
 use super::{dim_color, rgb, tool_color, truncate_line_preserving_suffix_to_width};
+use jcode_config_types::ToolCallDetailMode;
 use ratatui::prelude::*;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -9,32 +10,52 @@ pub(crate) use jcode_tui_tool_display::{
     canonical_tool_name, is_edit_tool_name, resolve_display_tool_name, tool_output_looks_failed,
 };
 
-/// Whether the dimmed technical detail (command, path, args) should render
-/// alongside a model-provided intent on tool rows. Rows without an intent
-/// always fall back to the technical detail regardless of this setting.
+/// How much dimmed technical detail (command, path, args) renders on tool
+/// rows: alongside the model-provided intent, instead of it, or not at all.
+/// Rows without an intent always fall back to the technical detail.
 #[cfg(not(test))]
-pub(crate) fn show_tool_call_details() -> bool {
+pub(crate) fn tool_call_detail_mode() -> ToolCallDetailMode {
     crate::config::config().display.tool_call_details
 }
 
 #[cfg(test)]
-pub(crate) fn show_tool_call_details() -> bool {
+pub(crate) fn tool_call_detail_mode() -> ToolCallDetailMode {
     tests_tool_call_details_override::get()
+}
+
+/// Whether the technical detail renders at all.
+pub(crate) fn show_tool_call_details() -> bool {
+    tool_call_detail_mode().shows_detail()
+}
+
+/// Whether the technical detail replaces the intent rather than following it.
+pub(crate) fn tool_call_details_replace_intent() -> bool {
+    tool_call_detail_mode().hides_intent()
 }
 
 #[cfg(test)]
 pub(crate) mod tests_tool_call_details_override {
+    use super::ToolCallDetailMode;
     use std::cell::Cell;
 
     thread_local! {
-        static SHOW_DETAILS: Cell<bool> = const { Cell::new(false) };
+        static SHOW_DETAILS: Cell<ToolCallDetailMode> =
+            const { Cell::new(ToolCallDetailMode::Off) };
     }
 
-    pub(crate) fn get() -> bool {
+    pub(crate) fn get() -> ToolCallDetailMode {
         SHOW_DETAILS.with(Cell::get)
     }
 
     pub(crate) fn set(value: bool) {
+        set_mode(if value {
+            ToolCallDetailMode::On
+        } else {
+            ToolCallDetailMode::Off
+        });
+    }
+
+    pub(crate) fn set_mode(value: ToolCallDetailMode) {
         SHOW_DETAILS.with(|cell| cell.set(value));
     }
 }
@@ -849,6 +870,7 @@ pub(crate) fn get_tool_activity_detail(tool: &ToolCall) -> String {
         .map(str::trim)
         .filter(|intent| !intent.is_empty());
     match intent {
+        Some(_) if tool_call_details_replace_intent() && !summary.is_empty() => summary,
         Some(intent) if show_tool_call_details() && !summary.is_empty() && summary != intent => {
             format!("{} · {}", intent, summary)
         }
@@ -883,11 +905,12 @@ pub(super) fn get_tool_summary_with_budget(
             .get("command")
             .and_then(|v| v.as_str())
             .map(|cmd| {
-                let has_intent = tool
-                    .intent
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|intent| !intent.is_empty());
+                let has_intent = !tool_call_details_replace_intent()
+                    && tool
+                        .intent
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|intent| !intent.is_empty());
                 let cmd_budget = max_width
                     .map(|w| w.saturating_sub(2))
                     .unwrap_or(bash_max_chars)
@@ -1559,11 +1582,17 @@ pub(super) fn render_batch_subcall_line(
         };
         (crate::util::format_approx_token_count(tokens), color)
     });
-    let intent = tool
+    let raw_intent = tool
         .intent
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    // In `only` mode the technical detail replaces the intent, but a row whose
+    // detail is empty (streaming args, or a tool with nothing to show) would
+    // otherwise render bare, so keep the intent as the fallback there.
+    let replace_intent =
+        tool_call_details_replace_intent() && !get_tool_summary(tool).trim().is_empty();
+    let intent = raw_intent.filter(|_| !replace_intent);
     let intent_display = intent.map(|intent| {
         max_width
             .map(|width| truncate_end_display(intent, (width / 3).max(16)))

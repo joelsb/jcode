@@ -117,7 +117,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     ),
     RegisteredCommand::public(
         "/tool-call-details",
-        "Show/toggle dimmed technical details on tool rows with an intent",
+        "Tool rows: intent only (off), intent + command (on), command only (only)",
     ),
     RegisteredCommand::public(
         "/thinking-display",
@@ -1077,6 +1077,10 @@ impl App {
                     (
                         "/tool-call-details off".into(),
                         "Show only the intent on tool rows that have one",
+                    ),
+                    (
+                        "/tool-call-details only".into(),
+                        "Show the command/path instead of the intent",
                     ),
                 ],
             );

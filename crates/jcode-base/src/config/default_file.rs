@@ -199,11 +199,12 @@ prompt_entry_animation = true
 # results directly in the chat.
 # show_agentgrep_output = false
 
-# Show the dimmed technical detail (command, file path, args) next to the
-# model-provided intent on tool rows (default: false). When false, tool rows
-# with an intent show just the intent; rows without an intent still show the
-# technical detail.
-# tool_call_details = false
+# How much technical detail (command, file path, args) tool rows show next to
+# the model-provided intent (default: "off").
+#   "off"  - intent only; rows without an intent still show the detail
+#   "on"   - intent, then the dimmed detail
+#   "only" - the raw command/path instead of the intent
+# tool_call_details = "off"
 
 # Occasionally surface a "learn this keybinding" nudge (in a distinct color)
 # when you keep doing something the slow way (e.g. /resume) instead of using

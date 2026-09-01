@@ -196,7 +196,7 @@ impl Config {
                 self.display.copy_badge_alt_label.trim()
             },
             self.display.show_agentgrep_output,
-            self.display.tool_call_details,
+            self.display.tool_call_details.label(),
             if self.display.theme.trim().is_empty() {
                 "auto"
             } else {

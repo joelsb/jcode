@@ -156,6 +156,48 @@ impl OverscrollStatusMode {
 /// How to display mermaid diagrams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+pub enum ToolCallDetailMode {
+    /// Show only the model-provided intent when a row has one (default).
+    #[default]
+    Off,
+    /// Show the intent followed by the dimmed technical detail.
+    On,
+    /// Show only the technical detail (the actual command, path, args), never
+    /// the intent. Rows with no technical detail fall back to the intent.
+    Only,
+}
+
+impl ToolCallDetailMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Only => "only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "0" | "no" | "intent" => Some(Self::Off),
+            "on" | "true" | "1" | "yes" | "both" => Some(Self::On),
+            "only" | "command" | "detail" | "details" | "raw" => Some(Self::Only),
+            _ => None,
+        }
+    }
+
+    /// Whether the technical detail should render at all.
+    pub fn shows_detail(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Whether the intent should be suppressed in favor of the detail.
+    pub fn hides_intent(&self) -> bool {
+        matches!(self, Self::Only)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DiagramDisplayMode {
     /// Don't show diagrams in dedicated widgets (only inline in messages).
     ///

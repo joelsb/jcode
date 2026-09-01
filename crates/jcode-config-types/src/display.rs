@@ -2,7 +2,8 @@
 
 use crate::{
     DiagramDisplayMode, DiffDisplayMode, LatexRenderingMode, MarkdownSpacingMode,
-    NativeScrollbarConfig, OverscrollStatusMode, ReasoningDisplayMode, default_true,
+    NativeScrollbarConfig, OverscrollStatusMode, ReasoningDisplayMode, ToolCallDetailMode,
+    default_true,
 };
 use serde::{Deserialize, Serialize};
 
@@ -96,12 +97,12 @@ pub struct DisplayConfig {
     /// just the one-line summary (default: false)
     #[serde(default)]
     pub show_agentgrep_output: bool,
-    /// Show the dimmed technical detail (command, path, args) after the
-    /// model-provided intent on tool rows (default: false). When off, rows
-    /// that have an intent show only the intent; rows without an intent
-    /// always fall back to the technical detail.
-    #[serde(default)]
-    pub tool_call_details: bool,
+    /// How much technical detail (command, path, args) tool rows show next to
+    /// the model-provided intent: "off" (intent only, default), "on" (intent
+    /// then detail), or "only" (the raw command/path instead of the intent).
+    /// Legacy booleans still parse as off/on.
+    #[serde(default, deserialize_with = "crate::serde_lenient::lenient_bool_enum")]
+    pub tool_call_details: ToolCallDetailMode,
     /// Native terminal scrollbar configuration for scrollable panes
     pub native_scrollbars: NativeScrollbarConfig,
     /// Surface occasional "learn this keybinding" nudges when the user keeps
@@ -169,7 +170,7 @@ impl Default for DisplayConfig {
             compact_notifications: false,
             copy_badge_alt_label: String::new(),
             show_agentgrep_output: false,
-            tool_call_details: false,
+            tool_call_details: ToolCallDetailMode::default(),
             native_scrollbars: NativeScrollbarConfig::default(),
             keybinding_hints: true,
             theme: String::new(),

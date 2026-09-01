@@ -269,13 +269,15 @@ impl Config {
     }
 
     /// Update the persisted tool-call-details preference.
-    pub fn set_tool_call_details(show: bool) -> anyhow::Result<()> {
+    pub fn set_tool_call_details(
+        mode: jcode_config_types::ToolCallDetailMode,
+    ) -> anyhow::Result<()> {
         let mut cfg = Self::load();
-        cfg.display.tool_call_details = show;
+        cfg.display.tool_call_details = mode;
         cfg.save()?;
         crate::logging::info(&format!(
             "Saved display.tool_call_details to config: {}",
-            show
+            mode.label()
         ));
         Ok(())
     }
