@@ -362,8 +362,14 @@ impl App {
     /// Reset the credential-failure streak. Called when a turn completes
     /// successfully or the user changes auth (login, provider/model switch),
     /// so a fixed credential gets a fresh retry budget.
+    ///
+    /// Also forgets which routes were usage-exhausted, for the same reason and
+    /// on the same evidence: a completed turn (or new credentials) proves the
+    /// earlier verdict no longer describes now, and a stale skip list would
+    /// refuse to offer a route whose window has since reset.
     pub(super) fn reset_credential_failure_breaker(&mut self) {
         self.consecutive_credential_failures = 0;
+        self.clear_exhausted_fallback_routes();
     }
 
     /// Hard-stop every automatic resend path because the session has hit
@@ -521,6 +527,7 @@ impl App {
             pending_provider_failover: None,
             pending_fallback_offer: None,
             pending_fallback_resend: None,
+            exhausted_fallback_routes: std::collections::HashSet::new(),
             pending_merge_offer: None,
             session_save_pending: false,
             streaming_tool_calls: Vec::new(),
@@ -965,6 +972,7 @@ impl App {
             pending_provider_failover: None,
             pending_fallback_offer: None,
             pending_fallback_resend: None,
+            exhausted_fallback_routes: std::collections::HashSet::new(),
             pending_merge_offer: None,
             session_save_pending: false,
             streaming_tool_calls: Vec::new(),

@@ -688,6 +688,99 @@ fn test_remote_fallback_offer_accept_stages_switch_and_resends() {
     assert_eq!(pending.content, "hi");
 }
 
+/// Two exhausted providers must not be offered to each other forever.
+///
+/// Reported case: Anthropic weekly spent and OpenAI 5-hour spent. The picker is
+/// memoryless, so it ranked "the other provider" best every time: accepting the
+/// offer switched to the route that had just failed, which then offered the
+/// route we came from. The transcript shows that alternating about once a second
+/// with no terminating condition.
+///
+/// The second usage error must therefore produce no offer at all, and must say
+/// so once.
+#[test]
+fn test_two_exhausted_providers_stop_offering_each_other() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.is_remote = true;
+    app.remote_provider_name = Some("Anthropic".to_string());
+    app.remote_provider_model = Some("claude-opus-5".to_string());
+    app.session.route_api_method = Some("claude-oauth".to_string());
+    app.remote_model_options = vec![
+        claude_oauth_route("claude-opus-5"),
+        openai_oauth_route("gpt-5.6-pro"),
+    ];
+    app.is_processing = true;
+    app.status = ProcessingStatus::Streaming;
+
+    let exhausted = "No tokens/providers left: no usable provider right now. \
+                     Details: Anthropic: OAuth usage exhausted (runtime-error, 1m ago) | \
+                     OpenAI: OAuth usage exhausted (runtime-error, 17s ago)";
+
+    // First failure on Anthropic: OpenAI is still worth offering.
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Error {
+            id: 30,
+            message: exhausted.to_string(),
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+    let offer = app
+        .pending_fallback_offer
+        .as_ref()
+        .expect("the first usage failure may still offer the untried provider");
+    assert_eq!(offer.selection.provider_label, "OpenAI");
+
+    // Accept it, and let OpenAI fail the same way.
+    assert!(app.apply_pending_fallback_offer());
+    app.remote_provider_name = Some("OpenAI".to_string());
+    app.remote_provider_model = Some("gpt-5.6-pro".to_string());
+    app.session.route_api_method = Some("openai-oauth".to_string());
+    app.is_processing = true;
+    app.status = ProcessingStatus::Streaming;
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Error {
+            id: 31,
+            message: exhausted.to_string(),
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+
+    assert!(
+        app.pending_fallback_offer.is_none(),
+        "both routes are spent, so offering a switch back to Anthropic is the ping-pong"
+    );
+    assert!(
+        app.display_messages()
+            .iter()
+            .any(|message| message.content.contains("Every configured route has hit its usage limit")),
+        "the user must be told once that nothing is left, instead of getting another offer"
+    );
+
+    // A window reset (or new credentials) makes routes offerable again.
+    app.reset_credential_failure_breaker();
+    app.is_processing = true;
+    app.status = ProcessingStatus::Streaming;
+    app.handle_server_event(
+        crate::protocol::ServerEvent::Error {
+            id: 32,
+            message: exhausted.to_string(),
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+    assert!(
+        app.pending_fallback_offer.is_some(),
+        "exhaustion must not outlive the evidence for it"
+    );
+}
+
 /// A failed route switch must drop the staged resend instead of firing it on
 /// the old (broken) route.
 #[test]

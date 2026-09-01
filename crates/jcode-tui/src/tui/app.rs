@@ -976,6 +976,13 @@ pub struct App {
     // Remote sessions: the failed turn payload staged by an accepted fallback
     // offer, dispatched once the server confirms the route switch.
     pending_fallback_resend: Option<FallbackResendPayload>,
+    // Routes (provider + api_method + model) that already failed with a usage
+    // limit since the last successful turn. A fallback offer must never point
+    // back at one of these: with two spent providers the ranking otherwise
+    // returns the route we just came from, and accepting each offer produced an
+    // endless Claude -> OpenAI -> Claude ping-pong. Cleared on the next
+    // successful turn, so a reset window makes every route offerable again.
+    exhausted_fallback_routes: std::collections::HashSet<String>,
     // Interactive "spawn a jcode agent to merge the diverged update" offer shown
     // after an update fails because the local checkout and upstream diverged.
     // Accepted with the same key as the fallback offer.

@@ -353,13 +353,51 @@ impl App {
         if self.pending_provider_failover.is_some() {
             return false;
         }
-        let routes = self.fallback_candidate_routes();
+        let mut routes = self.fallback_candidate_routes();
         if routes.is_empty() {
             return false;
         }
         let current_model = self.current_model_for_fallback();
         let current_provider = self.current_provider_label_for_fallback();
         let current_api_method = self.current_route_api_method().unwrap_or_default();
+
+        // Remember the route that just failed on a usage limit, then drop every
+        // route already known spent this turn.
+        //
+        // Without this the picker is memoryless: with Anthropic and OpenAI both
+        // exhausted it ranked "the other provider" best every time, so each
+        // accepted offer switched to the route that had just failed and offered
+        // the one we came from - a Claude -> OpenAI -> Claude ping-pong that ran
+        // about once a second and never terminated. A route is only skipped when
+        // *it* reported a usage limit, so a transient error still gets retried.
+        let is_usage_limit = crate::provider::error_looks_like_usage_limit(error);
+        if is_usage_limit {
+            self.exhausted_fallback_routes.insert(Self::fallback_route_key(
+                &current_provider,
+                &current_api_method,
+                &current_model,
+            ));
+        }
+        if !self.exhausted_fallback_routes.is_empty() {
+            routes.retain(|route| {
+                !self
+                    .exhausted_fallback_routes
+                    .contains(&Self::fallback_route_key(
+                        &route.provider,
+                        &route.api_method,
+                        &route.model,
+                    ))
+            });
+            if routes.is_empty() {
+                // Every route is spent. Saying so once is the honest answer;
+                // offering a switch here is what created the loop.
+                self.push_display_message(DisplayMessage::system(
+                    "⛔ Every configured route has hit its usage limit this turn, so there is nothing left to switch to. Run `/usage` for reset times, or `/model` to pick a route manually once a window resets.".to_string(),
+                ));
+                self.set_status_notice("All routes exhausted");
+                return false;
+            }
+        }
 
         // A credential failure (expired OAuth session, failed token refresh,
         // broken API key) breaks every route behind that credential, so widen
@@ -406,6 +444,29 @@ impl App {
             remote_resend,
         });
         true
+    }
+
+    /// Identity of a route for exhaustion bookkeeping: provider, credential and
+    /// model together. Case-folded because route labels arrive from both the
+    /// local provider ("Anthropic") and the remote catalog ("anthropic"), and a
+    /// case mismatch would silently defeat the skip.
+    fn fallback_route_key(provider: &str, api_method: &str, model: &str) -> String {
+        format!(
+            "{}|{}|{}",
+            provider.to_ascii_lowercase(),
+            api_method.to_ascii_lowercase(),
+            model.to_ascii_lowercase()
+        )
+    }
+
+    /// Forget which routes were exhausted, after a turn actually succeeds.
+    ///
+    /// Exhaustion is a statement about a usage window, not about the route, so
+    /// it must not outlive evidence that a request now goes through. Without
+    /// this the skip list would grow monotonically and a session that recovered
+    /// after a window reset would still refuse to offer its own best route.
+    pub(super) fn clear_exhausted_fallback_routes(&mut self) {
+        self.exhausted_fallback_routes.clear();
     }
 
     pub(super) fn clear_pending_fallback_offer(&mut self) {
