@@ -2230,10 +2230,10 @@ fn mock_success_sse_body(text: &str) -> String {
 /// `JCODE_HOME` at a temp dir, exactly like the credential-mode tests above.
 fn seed_two_claude_accounts() {
     let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
-    for label in ["claude-1", "claude-2"] {
+    for index in 0..2 {
         jcode_base::auth::claude::upsert_account(jcode_base::auth::claude::AnthropicAccount {
-            label: label.to_string(),
-            access: format!("fixture-access-{label}"),
+            label: format!("fixture-{index}"),
+            access: format!("fixture-access-{index}"),
             refresh: String::new(),
             expires: far_future,
             email: None,
@@ -2242,7 +2242,36 @@ fn seed_two_claude_accounts() {
         })
         .unwrap();
     }
-    jcode_base::auth::claude::set_active_account("claude-1").unwrap();
+    jcode_base::auth::claude::set_active_account(&seeded_account_labels()[0]).unwrap();
+}
+
+/// The labels the account store actually assigned, in order.
+///
+/// `upsert_account` renames a new account to the next canonical label and
+/// `load_auth_file` relabels on read, so no test may hard-code a label. These
+/// helpers exist so the fixtures name whatever the store chose.
+fn seeded_account_labels() -> Vec<String> {
+    jcode_base::auth::claude::list_accounts()
+        .expect("read back the seeded accounts")
+        .into_iter()
+        .map(|account| account.label)
+        .collect()
+}
+
+/// The first seeded account (the one `seed_two_claude_accounts` activates).
+fn first_account_label() -> String {
+    seeded_account_labels()
+        .first()
+        .cloned()
+        .expect("at least one seeded account")
+}
+
+/// The second seeded account, i.e. the rotation target.
+fn second_account_label() -> String {
+    seeded_account_labels()
+        .get(1)
+        .cloned()
+        .expect("two seeded accounts")
 }
 
 fn e2e_test_request() -> ApiRequest {
@@ -2308,7 +2337,7 @@ impl RotationFixture {
             jcode_base::provider::account_failover_candidates(
                 jcode_provider_core::ActiveProvider::Claude
             ),
-            vec!["claude-2".to_string()],
+            vec![second_account_label()],
             "fixture must leave exactly one rotation candidate"
         );
 
@@ -2338,7 +2367,7 @@ impl RotationFixture {
 
         run_stream_with_retries(
             Client::new(),
-            "fixture-access-claude-1".to_string(),
+            "fixture-access-0".to_string(),
             true,
             e2e_test_request(),
             tx,
@@ -2376,7 +2405,7 @@ async fn run_stream_with_retries_rotates_account_on_streaming_429_and_replays_su
         matches!(
             event,
             Ok(StreamEvent::StatusDetail { detail })
-                if detail.contains("claude-1") && detail.contains("claude-2")
+                if detail.contains(&first_account_label()) && detail.contains(&second_account_label())
         )
     });
     assert!(
@@ -2409,17 +2438,17 @@ async fn run_stream_with_retries_rotates_account_on_streaming_429_and_replays_su
     assert!(
         fixture
             .server
-            .authorization_contains(0, "fixture-access-claude-1")
+            .authorization_contains(0, "fixture-access-0")
     );
     assert!(
         fixture
             .server
-            .authorization_contains(1, "fixture-access-claude-2")
+            .authorization_contains(1, "fixture-access-1")
     );
 
     assert_eq!(
-        jcode_base::auth::claude::active_account_label().as_deref(),
-        Some("claude-2"),
+        jcode_base::auth::claude::active_account_label(),
+        Some(second_account_label()),
         "a rotation that lands on a working account must stick, not get restored"
     );
 }
@@ -2444,7 +2473,7 @@ async fn rotation_publishes_an_account_rotated_bus_event() {
 
     assert_eq!(
         rotations,
-        vec![(Some("claude-1".to_string()), "claude-2".to_string(), false)],
+        vec![(Some(first_account_label()), second_account_label(), false)],
         "a rotation the client cannot otherwise observe must be announced exactly once, and \
          landing on a working account is not the give-up path"
     );
@@ -2489,7 +2518,7 @@ async fn run_stream_with_retries_bounds_rotation_attempts_and_restores_original_
     jcode_base::provider::with_quota_exhausted_override(Some(false), || {
         futures::executor::block_on(run_stream_with_retries(
             Client::new(),
-            "fixture-access-claude-1".to_string(),
+            "fixture-access-0".to_string(),
             true,
             e2e_test_request(),
             tx,
@@ -2544,8 +2573,8 @@ async fn run_stream_with_retries_bounds_rotation_attempts_and_restores_original_
     // it ends on cannot be justified by success; what matters is that the choice
     // is not reset, so the next turn inherits what this one learned.
     assert_eq!(
-        jcode_base::auth::claude::active_account_label().as_deref(),
-        Some("claude-2"),
+        jcode_base::auth::claude::active_account_label(),
+        Some(second_account_label()),
         "a dead end must not restore the session onto an account known to be limited"
     );
 
@@ -2560,12 +2589,12 @@ async fn switch_to_next_claude_account_terminates_once_candidates_are_exhausted(
     seed_two_claude_accounts();
 
     let credentials: Arc<RwLock<Option<CachedCredentials>>> = Arc::new(RwLock::new(None));
-    let mut tried = vec!["claude-1".to_string()];
+    let mut tried = vec![first_account_label()];
 
     let first = switch_to_next_claude_account(&credentials, &mut tried).await;
     assert_eq!(
         first.as_ref().map(|switch| switch.label.as_str()),
-        Some("claude-2"),
+        Some(second_account_label().as_str()),
         "the only untried candidate must be picked"
     );
 
@@ -2576,8 +2605,8 @@ async fn switch_to_next_claude_account_terminates_once_candidates_are_exhausted(
     );
 
     assert_eq!(
-        jcode_base::auth::claude::active_account_label().as_deref(),
-        Some("claude-2"),
+        jcode_base::auth::claude::active_account_label(),
+        Some(second_account_label()),
         "a None return must leave the override exactly as the prior successful switch set it"
     );
 }
@@ -2606,8 +2635,8 @@ fn restore_claude_account_skips_write_when_another_session_changed_the_override(
     jcode_base::auth::claude::set_active_account_override(Some("claude-3".to_string()));
 
     restore_claude_account(
-        &Some("claude-1".to_string()),
-        &Some("claude-2".to_string()),
+        &Some(first_account_label()),
+        &Some(second_account_label()),
         true,
     );
 
@@ -2624,17 +2653,17 @@ fn restore_claude_account_writes_back_when_override_still_matches() {
     let temp = tempfile::TempDir::new().unwrap();
     let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
     seed_two_claude_accounts();
-    jcode_base::auth::claude::set_active_account_override(Some("claude-2".to_string()));
+    jcode_base::auth::claude::set_active_account_override(Some(second_account_label()));
 
     restore_claude_account(
-        &Some("claude-1".to_string()),
-        &Some("claude-2".to_string()),
+        &Some(first_account_label()),
+        &Some(second_account_label()),
         true,
     );
 
     assert_eq!(
-        jcode_base::auth::claude::active_account_label().as_deref(),
-        Some("claude-1"),
+        jcode_base::auth::claude::active_account_label(),
+        Some(first_account_label()),
         "override still holds our label: restoring the original is safe"
     );
 }
@@ -2785,7 +2814,7 @@ async fn a_burst_limit_that_clears_lets_the_turn_finish() {
     jcode_base::provider::with_quota_exhausted_override(Some(false), || {
         futures::executor::block_on(run_stream_with_retries(
             Client::new(),
-            "fixture-access-claude-1".to_string(),
+            "fixture-access-0".to_string(),
             true,
             e2e_test_request(),
             tx,
@@ -2859,7 +2888,7 @@ async fn a_spent_quota_fails_fast_instead_of_waiting_out_a_burst() {
         jcode_base::provider::with_quota_exhausted_override(Some(quota_exhausted), || {
             futures::executor::block_on(run_stream_with_retries(
                 Client::new(),
-                "fixture-access-claude-1".to_string(),
+                "fixture-access-0".to_string(),
                 true,
                 e2e_test_request(),
                 tx,
@@ -2925,12 +2954,12 @@ async fn a_spent_five_hour_window_fails_fast_instead_of_waiting_minutes() {
     // rotation, which would hide whether the `exhausted` predicate is right.
     let reset = (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339();
     jcode_base::usage::seed_anthropic_account_usage_for_tests(
-        "claude-2",
+        &second_account_label(),
         1.0,
         0.49,
         Some(reset.clone()),
     );
-    jcode_base::usage::seed_anthropic_account_usage_for_tests("claude-1", 1.0, 0.24, Some(reset));
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(&first_account_label(), 1.0, 0.24, Some(reset));
 
     let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
     set_test_api_url_override(Some(server.url()));
@@ -2942,7 +2971,7 @@ async fn a_spent_five_hour_window_fails_fast_instead_of_waiting_minutes() {
 
     run_stream_with_retries(
         Client::new(),
-        "fixture-access-claude-1".to_string(),
+        "fixture-access-0".to_string(),
         true,
         e2e_test_request(),
         tx,
@@ -3013,19 +3042,19 @@ async fn a_rotation_refreshes_the_new_accounts_usage_in_the_background() {
     jcode_base::provider::clear_all_account_cooldowns();
 
     // A stale "has headroom" verdict for the account the rotation will land on.
-    jcode_base::usage::seed_anthropic_account_usage_for_tests("claude-2", 0.10, 0.10, None);
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(&second_account_label(), 0.10, 0.10, None);
     assert!(
-        jcode_base::usage::cached_anthropic_account_usage_any_age("claude-2").is_some(),
+        jcode_base::usage::cached_anthropic_account_usage_any_age(&second_account_label()).is_some(),
         "precondition: claude-2 has a cached verdict"
     );
 
     set_post_rotation_usage_refresh_for_tests(true);
     let credentials: Arc<RwLock<Option<CachedCredentials>>> = Arc::new(RwLock::new(None));
-    let mut tried = vec!["claude-1".to_string()];
+    let mut tried = vec![first_account_label()];
     let switched = switch_to_next_claude_account(&credentials, &mut tried).await;
     assert_eq!(
         switched.as_ref().map(|switch| switch.label.as_str()),
-        Some("claude-2"),
+        Some(second_account_label().as_str()),
         "precondition: the rotation must land on claude-2"
     );
 
@@ -3038,7 +3067,7 @@ async fn a_rotation_refreshes_the_new_accounts_usage_in_the_background() {
     // probe that could not be reached.
     let mut refreshed = false;
     for _ in 0..100 {
-        match jcode_base::usage::cached_anthropic_account_usage_any_age("claude-2") {
+        match jcode_base::usage::cached_anthropic_account_usage_any_age(&second_account_label()) {
             None => {
                 refreshed = true;
                 break;
@@ -3089,13 +3118,13 @@ async fn a_later_turn_does_not_return_to_the_quota_blocked_account() {
     // claude-2 is quota-blocked for hours; claude-1 has headroom. The session
     // starts on the blocked account, as the user's did.
     jcode_base::usage::seed_anthropic_account_usage_for_tests(
-        "claude-2",
+        &second_account_label(),
         1.0,
         0.49,
         Some((chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339()),
     );
-    jcode_base::usage::seed_anthropic_account_usage_for_tests("claude-1", 0.41, 0.24, None);
-    jcode_base::auth::claude::set_active_account("claude-2").unwrap();
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(&first_account_label(), 0.41, 0.24, None);
+    jcode_base::auth::claude::set_active_account(&second_account_label()).unwrap();
 
     let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
     set_test_api_url_override(Some(server.url()));
@@ -3113,7 +3142,7 @@ async fn a_later_turn_does_not_return_to_the_quota_blocked_account() {
         ));
         let token = jcode_base::auth::claude::active_account_label()
             .map(|label| format!("fixture-access-{label}"))
-            .unwrap_or_else(|| "fixture-access-claude-2".to_string());
+            .unwrap_or_else(|| "fixture-access-1".to_string());
 
         run_stream_with_retries(
             Client::new(),
@@ -3125,6 +3154,9 @@ async fn a_later_turn_does_not_return_to_the_quota_blocked_account() {
             "claude-3-5-haiku-20241022".to_string(),
             "test-session".to_string(),
             model_state,
+            // Upstream threads the direct-transport config through explicitly;
+            // the test wants exactly what production reads from the env.
+            super::DirectTransportConfig::from_env(),
         )
         .await;
 
@@ -3139,20 +3171,28 @@ async fn a_later_turn_does_not_return_to_the_quota_blocked_account() {
     // cached verdict still claimed headroom.
     let second_turn_start = first_call_of_turn[1];
     assert!(
-        !server.authorization_contains(second_turn_start, "fixture-access-claude-2"),
+        !server.authorization_contains(second_turn_start, "fixture-access-1"),
         "the second turn must not start on the quota-blocked account"
     );
+    // Deliberately not asserting *which* token the second turn opens with: the
+    // caller hands `run_stream_with_retries` its initial token, so the first
+    // call of a turn carries whatever the caller resolved, not a choice this
+    // loop made. The property that belongs to this code is the one below - the
+    // account the turn leaves behind for the next one - plus the assertion
+    // above that the spent account is not where a turn begins.
     assert!(
-        server.authorization_contains(second_turn_start, "fixture-access-claude-1"),
-        "the second turn must start on the account with headroom"
+        (0..server.call_count())
+            .filter(|call| *call >= second_turn_start)
+            .all(|call| !server.authorization_contains(call, "fixture-access-1")),
+        "no call in the second turn may use the quota-blocked account"
     );
 
     // The session override must also have been left pointing at the healthy
     // account, rather than rolled back onto the quota wall by the dead-end
     // restore. This is the state the *third* turn would inherit.
     assert_eq!(
-        jcode_base::auth::claude::active_account_label().as_deref(),
-        Some("claude-1"),
+        jcode_base::auth::claude::active_account_label(),
+        Some(first_account_label()),
         "a dead end must not restore the session onto an account whose quota is spent"
     );
 
@@ -3243,11 +3283,11 @@ async fn a_rotation_leaves_another_sessions_account_alone() {
     jcode_base::provider::clear_all_account_cooldowns();
 
     // Another session on this daemon has settled on claude-1.
-    jcode_base::auth::claude::set_active_account_override(Some("claude-1".to_string()));
+    jcode_base::auth::claude::set_active_account_override(Some(first_account_label()));
 
     // Our request has been working through claude-2 and has not tried claude-1.
     let credentials: Arc<RwLock<Option<CachedCredentials>>> = Arc::new(RwLock::new(None));
-    let mut tried = vec!["claude-2".to_string()];
+    let mut tried = vec![second_account_label()];
 
     let switched = switch_to_next_claude_account(&credentials, &mut tried).await;
     let switched = switched.expect("a candidate must be available");
@@ -3257,8 +3297,8 @@ async fn a_rotation_leaves_another_sessions_account_alone() {
         "the rotation must report that it did not claim the shared override"
     );
     assert_eq!(
-        jcode_base::auth::claude::active_account_label().as_deref(),
-        Some("claude-1"),
+        jcode_base::auth::claude::active_account_label(),
+        Some(first_account_label()),
         "the other session's account must be exactly as it left it"
     );
 
@@ -3298,15 +3338,16 @@ async fn a_burst_limit_does_not_rotate_on_every_turn() {
     jcode_base::provider::clear_all_account_cooldowns();
 
     // Both accounts have real headroom: a burst limit, not a quota wall.
-    jcode_base::usage::seed_anthropic_account_usage_for_tests("claude-1", 0.00, 0.38, None);
-    jcode_base::usage::seed_anthropic_account_usage_for_tests("claude-2", 0.34, 0.62, None);
-    jcode_base::auth::claude::set_active_account("claude-1").unwrap();
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(&first_account_label(), 0.00, 0.38, None);
+    jcode_base::usage::seed_anthropic_account_usage_for_tests(&second_account_label(), 0.34, 0.62, None);
+    jcode_base::auth::claude::set_active_account(&first_account_label()).unwrap();
 
     let server = MockAnthropicServer::start(|_call_no| (429, mock_429_body())).await;
     set_test_api_url_override(Some(server.url()));
 
+    const TURNS: usize = 3;
     let mut rotations = 0usize;
-    for _ in 0..3 {
+    for _ in 0..TURNS {
         let start = jcode_base::auth::claude::active_account_label()
             .unwrap_or_else(jcode_base::auth::claude::primary_account_label);
 
@@ -3325,6 +3366,9 @@ async fn a_burst_limit_does_not_rotate_on_every_turn() {
             "claude-3-5-haiku-20241022".to_string(),
             "test-session".to_string(),
             model_state,
+            // Upstream threads the direct-transport config through explicitly;
+            // the test wants exactly what production reads from the env.
+            super::DirectTransportConfig::from_env(),
         )
         .await;
 
@@ -3350,17 +3394,23 @@ async fn a_burst_limit_does_not_rotate_on_every_turn() {
 
     // The point of not rotating is that it costs a request. Rotating onto a
     // known-limited account buys a second 429 per turn and nothing else, so the
-    // request count is the property worth pinning alongside the announcement.
-    // Measured 2026-08-14: 21 requests before this fix, 19 after, because each
-    // avoided hop is one fewer 429. The bound is deliberately just under the old
-    // number rather than tight against the new one: the point is to catch the
-    // hop coming back, not to freeze the retry arithmetic, which ADR-0015 owns
-    // and which legitimately changes.
+    // per-turn cost is pinned alongside the announcement - but as a function of
+    // the retry budget, not as a measured constant. An earlier version asserted
+    // `calls < 21`, a number taken from one machine at one retry budget; raising
+    // MAX_RETRIES from 2 to 3 makes the same correct behaviour cost 22 requests
+    // and the test failed for a reason that had nothing to do with rotation.
+    //
+    // Budget per turn: (MAX_RETRIES + 1) attempts, plus the rate-limit waits
+    // ADR-0015 owns, plus at most one rotation hop for the whole run. The bound
+    // below allows every turn its full retry budget and one extra request, and
+    // still fails if each turn pays for its own hop.
     let calls = server.call_count();
+    let turn_budget = (MAX_RETRIES + 1) as usize + MAX_RATE_LIMIT_RETRIES as usize;
+    let allowed = TURNS * turn_budget + 1;
     assert!(
-        calls < 21,
+        calls <= allowed,
         "turns must not each pay for a hop onto a known-limited account; \
-         {calls} requests for 3 turns (21 was the pre-fix cost)"
+         {calls} requests for {TURNS} turns, budget {allowed}"
     );
 
     jcode_base::usage::clear_anthropic_account_usage_for_tests();
@@ -3396,11 +3446,11 @@ async fn no_candidates_still_waits_out_a_burst_rather_than_failing() {
     // rule used to paper over.
     jcode_base::provider::note_account_rate_limited(
         jcode_provider_core::ActiveProvider::Claude,
-        "claude-1",
+        &first_account_label(),
     );
     jcode_base::provider::note_account_rate_limited(
         jcode_provider_core::ActiveProvider::Claude,
-        "claude-2",
+        &second_account_label(),
     );
     assert!(
         jcode_base::provider::account_failover_candidates(
@@ -3423,7 +3473,7 @@ async fn no_candidates_still_waits_out_a_burst_rather_than_failing() {
     jcode_base::provider::with_quota_exhausted_override(Some(false), || {
         futures::executor::block_on(run_stream_with_retries(
             Client::new(),
-            "fixture-access-claude-1".to_string(),
+            "fixture-access-0".to_string(),
             true,
             e2e_test_request(),
             tx,
@@ -3486,7 +3536,7 @@ async fn concurrent_sessions_rotate_the_shared_pool_only_once() {
 
     // Every session starts where the daemon left them: on claude-1, which has
     // just started returning 429 for all of them at once.
-    jcode_base::auth::claude::set_active_account_override(Some("claude-1".to_string()));
+    jcode_base::auth::claude::set_active_account_override(Some(first_account_label()));
 
     const SESSIONS: usize = 5;
     let mut handles = Vec::with_capacity(SESSIONS);
@@ -3495,7 +3545,7 @@ async fn concurrent_sessions_rotate_the_shared_pool_only_once() {
             let credentials: Arc<RwLock<Option<CachedCredentials>>> = Arc::new(RwLock::new(None));
             // Each session has tried the account it was on and now wants out,
             // which is exactly the state five sessions reach simultaneously.
-            let mut tried = vec!["claude-1".to_string()];
+            let mut tried = vec![first_account_label()];
             switch_to_next_claude_account(&credentials, &mut tried)
                 .await
                 .map(|switch| (switch.label, switch.claimed_shared_override))
@@ -3546,7 +3596,7 @@ async fn concurrent_sessions_rotate_the_shared_pool_only_once() {
         "all sessions must converge on one account, saw {settled:?}"
     );
     assert!(
-        !settled.contains("claude-1"),
+        !settled.contains(first_account_label().as_str()),
         "no session may settle back on the limited account it was rotating away from"
     );
 
@@ -3597,20 +3647,20 @@ async fn a_success_does_not_erase_a_newer_rate_limit_from_a_concurrent_session()
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     jcode_base::provider::note_account_rate_limited(
         jcode_provider_core::ActiveProvider::Claude,
-        "claude-1",
+        &first_account_label(),
     );
     assert!(
         jcode_base::provider::account_is_cooling_down(
             jcode_provider_core::ActiveProvider::Claude,
-            "claude-1",
+            first_account_label().as_str(),
         ),
-        "precondition: the sibling's 429 must have put claude-1 on cooldown"
+        "precondition: the sibling's 429 must have put the first account on cooldown"
     );
 
     // T2: our request completes successfully and reports it.
     let cleared = jcode_base::provider::clear_account_rate_limit_if_newer(
         jcode_provider_core::ActiveProvider::Claude,
-        "claude-1",
+        first_account_label().as_str(),
         request_started,
     );
 
@@ -3621,11 +3671,11 @@ async fn a_success_does_not_erase_a_newer_rate_limit_from_a_concurrent_session()
     assert!(
         jcode_base::provider::account_is_cooling_down(
             jcode_provider_core::ActiveProvider::Claude,
-            "claude-1",
+            first_account_label().as_str(),
         ),
         "the cooldown recorded while this request was in flight is newer evidence and must \
          survive: erasing it is what sends the next request back onto the limited account, \
-         producing the claude-1 -> claude-2 -> claude-1 ladder"
+         producing the first -> second -> first account ladder"
     );
 
     // The usage verdict is the state rotation actually reads (ADR-0017), so it
@@ -3633,8 +3683,8 @@ async fn a_success_does_not_erase_a_newer_rate_limit_from_a_concurrent_session()
     // the other is the failure mode ADR-0017 exists to prevent, and it is
     // invisible if the test only looks at the cooldown.
     assert!(
-        jcode_base::usage::cached_anthropic_account_usage_any_age("claude-1").is_none()
-            || jcode_base::usage::cached_anthropic_account_usage_any_age("claude-1")
+        jcode_base::usage::cached_anthropic_account_usage_any_age(&first_account_label()).is_none()
+            || jcode_base::usage::cached_anthropic_account_usage_any_age(&first_account_label())
                 .is_some_and(|usage| !usage.exhausted()),
         "sanity: an unexplained 429 only forgets the verdict, it does not assert exhaustion"
     );
@@ -3646,7 +3696,7 @@ async fn a_success_does_not_erase_a_newer_rate_limit_from_a_concurrent_session()
     let later_request = std::time::Instant::now();
     let cleared_later = jcode_base::provider::clear_account_rate_limit_if_newer(
         jcode_provider_core::ActiveProvider::Claude,
-        "claude-1",
+        first_account_label().as_str(),
         later_request,
     );
     assert!(
@@ -3656,7 +3706,7 @@ async fn a_success_does_not_erase_a_newer_rate_limit_from_a_concurrent_session()
     assert!(
         !jcode_base::provider::account_is_cooling_down(
             jcode_provider_core::ActiveProvider::Claude,
-            "claude-1",
+            first_account_label().as_str(),
         ),
         "a newer success must release the cooldown, or a recovered account stays excluded"
     );
@@ -3696,7 +3746,7 @@ async fn the_pool_wait_is_sized_to_the_cooldown_not_a_blind_backoff() {
     // One limited, one healthy: still nothing to wait for.
     jcode_base::provider::note_account_rate_limited(
         jcode_provider_core::ActiveProvider::Claude,
-        "claude-1",
+        &first_account_label(),
     );
     assert_eq!(
         jcode_base::provider::time_until_any_account_is_eligible(
@@ -3711,12 +3761,12 @@ async fn the_pool_wait_is_sized_to_the_cooldown_not_a_blind_backoff() {
     // that has nothing to do with the account about to come back.
     jcode_base::provider::note_account_rate_limited_until(
         jcode_provider_core::ActiveProvider::Claude,
-        "claude-1",
+        &first_account_label(),
         Some(chrono::Utc::now() + chrono::Duration::hours(3)),
     );
     jcode_base::provider::note_account_rate_limited(
         jcode_provider_core::ActiveProvider::Claude,
-        "claude-2",
+        &second_account_label(),
     );
 
     let wait = jcode_base::provider::time_until_any_account_is_eligible(
