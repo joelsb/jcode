@@ -52,20 +52,17 @@ impl Agent {
     /// emitting `turn_end`. Anything tracking agent state from hooks saw the
     /// turn begin and never end: a status integration would sit on "working"
     /// forever. Observers are fire-and-forget, so this cannot fail the turn.
-    async fn run_turn_with_hooks(
-        &mut self,
-        print_output: bool,
-        source: &str,
-    ) -> Result<String> {
+    async fn run_turn_with_hooks(&mut self, print_output: bool, source: &str) -> Result<String> {
         let turn_started_at = Instant::now();
         let start_message_index = self.message_count();
         self.fire_turn_start_hook(source);
         let result = self.run_turn(print_output).await;
         // fire_turn_end_hook takes the unit result the streaming path produces;
         // map the captured text away without discarding the error.
-        let hook_result = result.as_ref().map(|_| ()).map_err(|error| {
-            anyhow::anyhow!(error.to_string())
-        });
+        let hook_result = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
         self.refresh_task_label();
         self.fire_turn_end_hook(&hook_result, turn_started_at, start_message_index);
         result

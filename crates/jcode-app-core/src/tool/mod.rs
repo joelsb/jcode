@@ -1072,8 +1072,7 @@ impl Registry {
                         // server removed stop being callable.
                         registry.unregister_prefix(&prefix).await;
 
-                        let tools =
-                            crate::mcp::create_mcp_tools(Arc::clone(&mcp_manager)).await;
+                        let tools = crate::mcp::create_mcp_tools(Arc::clone(&mcp_manager)).await;
                         let mut registered = 0usize;
                         for (name, tool) in tools {
                             if name.starts_with(&prefix) {
@@ -1093,17 +1092,14 @@ impl Registry {
                         if let Some(ref tx) = event_tx {
                             let mut counts: std::collections::BTreeMap<String, usize> =
                                 std::collections::BTreeMap::new();
-                            for (server, _) in
-                                mcp_manager.read().await.all_tools().await
-                            {
+                            for (server, _) in mcp_manager.read().await.all_tools().await {
                                 *counts.entry(server).or_default() += 1;
                             }
                             let servers: Vec<String> = counts
                                 .into_iter()
                                 .map(|(name, count)| format!("{}:{}", name, count))
                                 .collect();
-                            let _ =
-                                tx.send(crate::protocol::ServerEvent::McpStatus { servers });
+                            let _ = tx.send(crate::protocol::ServerEvent::McpStatus { servers });
                         }
                     }
                 });

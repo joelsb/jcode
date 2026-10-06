@@ -151,9 +151,7 @@ pub(super) async fn remove_session_entry<T>(
 /// id is resident, never what the agent is. That keeps the unit test free of a
 /// full `Agent` (which needs a live provider and registry) and mirrors
 /// [`remove_session_entry`].
-async fn reconcile_owned_active_pids<T>(
-    sessions: &Arc<RwLock<HashMap<String, T>>>,
-) -> usize {
+async fn reconcile_owned_active_pids<T>(sessions: &Arc<RwLock<HashMap<String, T>>>) -> usize {
     let own_pid = std::process::id();
     let mut evicted = 0usize;
 
@@ -185,7 +183,11 @@ async fn reconcile_owned_active_pids<T>(
             "active_pids: evicted stale marker for {} (pid {}, {})",
             session_id,
             pid,
-            if ours { "ours, no live agent" } else { "dead process" },
+            if ours {
+                "ours, no live agent"
+            } else {
+                "dead process"
+            },
         ));
     }
 

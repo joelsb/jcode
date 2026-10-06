@@ -100,8 +100,8 @@ pub mod telegram;
 pub mod telemetry {
     pub use jcode_telemetry_core::*;
 }
-pub mod terminal_launch;
 pub mod task_label;
+pub mod terminal_launch;
 pub mod todo;
 pub mod transport;
 pub mod usage;

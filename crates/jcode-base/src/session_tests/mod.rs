@@ -127,10 +127,22 @@ mod credential_redaction {
         );
 
         let stored = serde_json::to_string(&session.messages).expect("serialize");
-        assert!(!stored.contains(FAKE_ACCESS), "access token reached the transcript");
-        assert!(!stored.contains(FAKE_REFRESH), "refresh token reached the transcript");
-        assert!(stored.contains("ANTHROPIC_OAUTH_ACCESS"), "no marker: {stored}");
-        assert!(stored.contains("ANTHROPIC_OAUTH_REFRESH"), "no marker: {stored}");
+        assert!(
+            !stored.contains(FAKE_ACCESS),
+            "access token reached the transcript"
+        );
+        assert!(
+            !stored.contains(FAKE_REFRESH),
+            "refresh token reached the transcript"
+        );
+        assert!(
+            stored.contains("ANTHROPIC_OAUTH_ACCESS"),
+            "no marker: {stored}"
+        );
+        assert!(
+            stored.contains("ANTHROPIC_OAUTH_REFRESH"),
+            "no marker: {stored}"
+        );
     }
 
     /// A model echoing a token back is the same durable leak by another route.
@@ -148,8 +160,14 @@ mod credential_redaction {
         );
 
         let stored = serde_json::to_string(&session.messages).expect("serialize");
-        assert!(!stored.contains(FAKE_ACCESS), "token reached the transcript");
-        assert!(stored.contains("keep it safe"), "surrounding text was destroyed");
+        assert!(
+            !stored.contains(FAKE_ACCESS),
+            "token reached the transcript"
+        );
+        assert!(
+            stored.contains("keep it safe"),
+            "surrounding text was destroyed"
+        );
     }
 
     /// Ordinary output must be byte-identical, or every transcript is suspect.

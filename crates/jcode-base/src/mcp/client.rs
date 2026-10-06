@@ -297,7 +297,10 @@ impl McpClient {
                             .ok()
                             .filter(|value| value.get("id").map(Value::is_null).unwrap_or(true))
                             .and_then(|value| {
-                                value.get("method").and_then(Value::as_str).map(String::from)
+                                value
+                                    .get("method")
+                                    .and_then(Value::as_str)
+                                    .map(String::from)
                             });
                         if let Some(method) = method {
                             crate::logging::debug(&format!(

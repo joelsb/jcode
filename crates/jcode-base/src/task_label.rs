@@ -24,19 +24,151 @@ const MIN_KEYWORDS: usize = 2;
 /// Words that carry no task identity. Deliberately small: over-filtering
 /// produces confident wrong labels, which the brief rates worse than none.
 const STOPWORDS: &[&str] = &[
-    "a", "about", "actually", "after", "all", "also", "an", "and", "any", "are", "as", "at",
-    "back", "basically", "be", "been", "before", "being", "both", "but", "by", "can", "could",
-    "did", "do", "does", "doing", "done", "each", "else", "etc", "even", "every", "first", "for",
-    "from", "get", "go", "had", "has", "have", "he", "her", "here", "hers", "him", "his", "how",
-    "i", "if", "in", "into", "is", "it", "its", "just", "let", "lets", "like", "may", "me",
-    "might", "more", "most", "much", "must", "my", "need", "needs", "new", "no", "not", "now",
-    "of", "off", "ok", "okay", "on", "once", "one", "only", "or", "other", "our", "out", "over",
-    "own", "per", "please", "really", "same", "see", "shall", "she", "should", "so", "some",
-    "still", "such", "sure", "than", "that", "the", "their", "them", "then", "there",
-    "these", "they", "thing", "things", "this", "those", "through", "to", "too", "try", "under",
-    "up", "us", "use", "using", "very", "via", "want", "was", "way", "we", "well", "were", "what",
-    "when", "where", "which", "while", "who", "why", "will", "with", "would", "yes", "yet", "you",
-    "your", "yours",
+    "a",
+    "about",
+    "actually",
+    "after",
+    "all",
+    "also",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
+    "back",
+    "basically",
+    "be",
+    "been",
+    "before",
+    "being",
+    "both",
+    "but",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "doing",
+    "done",
+    "each",
+    "else",
+    "etc",
+    "even",
+    "every",
+    "first",
+    "for",
+    "from",
+    "get",
+    "go",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "here",
+    "hers",
+    "him",
+    "his",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "just",
+    "let",
+    "lets",
+    "like",
+    "may",
+    "me",
+    "might",
+    "more",
+    "most",
+    "much",
+    "must",
+    "my",
+    "need",
+    "needs",
+    "new",
+    "no",
+    "not",
+    "now",
+    "of",
+    "off",
+    "ok",
+    "okay",
+    "on",
+    "once",
+    "one",
+    "only",
+    "or",
+    "other",
+    "our",
+    "out",
+    "over",
+    "own",
+    "per",
+    "please",
+    "really",
+    "same",
+    "see",
+    "shall",
+    "she",
+    "should",
+    "so",
+    "some",
+    "still",
+    "such",
+    "sure",
+    "than",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "thing",
+    "things",
+    "this",
+    "those",
+    "through",
+    "to",
+    "too",
+    "try",
+    "under",
+    "up",
+    "us",
+    "use",
+    "using",
+    "very",
+    "via",
+    "want",
+    "was",
+    "way",
+    "we",
+    "well",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "why",
+    "will",
+    "with",
+    "would",
+    "yes",
+    "yet",
+    "you",
+    "your",
+    "yours",
 ];
 
 /// A stable hash of the text a label was derived from, so an unchanged source
@@ -92,8 +224,9 @@ fn is_ticket_key(token: &str) -> bool {
 }
 
 fn trim_token(token: &str) -> &str {
-    token
-        .trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && c != '/' && c != '.')
+    token.trim_matches(|c: char| {
+        !c.is_alphanumeric() && c != '-' && c != '_' && c != '/' && c != '.'
+    })
 }
 
 fn is_pathish(token: &str) -> bool {
@@ -336,7 +469,10 @@ pub fn refresh_derived(session_id: &str, user_texts: &[&str]) -> bool {
     let Some(label) = derive_label(user_texts).and_then(|label| clamp_label(&label)) else {
         return false;
     };
-    if existing.as_ref().is_some_and(|stored| stored.label == label) {
+    if existing
+        .as_ref()
+        .is_some_and(|stored| stored.label == label)
+    {
         return false;
     }
     write(
@@ -620,7 +756,12 @@ mod tests {
 
     #[test]
     fn ignores_continuations_and_keeps_the_last_substantive_message() {
-        let texts = ["Rewrite the segment sync job", "continue", "ok", "yes go on"];
+        let texts = [
+            "Rewrite the segment sync job",
+            "continue",
+            "ok",
+            "yes go on",
+        ];
         assert_eq!(
             derive_label(&texts),
             Some("Rewrite Segment Sync Job".to_string())

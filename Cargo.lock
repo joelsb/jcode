@@ -4241,6 +4241,7 @@ dependencies = [
  "jcode-message-types",
  "memchr",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4343,6 +4344,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "ignore",
  "jcode-agent-runtime",
  "jcode-message-types",
  "jcode-tool-types",

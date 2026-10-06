@@ -331,14 +331,12 @@ fn execute_linked_agentgrep(
             // header still reports the true total, so the caller sees that more
             // matches exist and can raise the cap deliberately.
             let max_regions = params.max_regions.or(Some(DEFAULT_GREP_MAX_REGIONS));
-            Ok(
-                ToolOutput::new(format!(
-                    "{}{}",
-                    render_grep_output(&result, &args, max_regions),
-                    suppressed_note(suppressed, ctx.working_dir.as_deref())
-                ))
-                .with_title("agentgrep grep"),
-            )
+            Ok(ToolOutput::new(format!(
+                "{}{}",
+                render_grep_output(&result, &args, max_regions),
+                suppressed_note(suppressed, ctx.working_dir.as_deref())
+            ))
+            .with_title("agentgrep grep"))
         }
         "find" => {
             let args = build_find_args(params, ctx)?;

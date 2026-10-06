@@ -59,7 +59,8 @@ element of the chain, not of the work you cared about.
 
 /// macOS-specific addendum: Apple ships bash 3.2 (2007) as `/bin/bash` for
 /// licensing reasons, so bash 4+ builtins fail with confusing syntax errors.
-pub const SHELL_PROMPT_MACOS: &str = "\n\nOn macOS `/bin/bash` is **bash 3.2**, not bash 4/5. These are syntax errors here:
+pub const SHELL_PROMPT_MACOS: &str =
+    "\n\nOn macOS `/bin/bash` is **bash 3.2**, not bash 4/5. These are syntax errors here:
 `mapfile`/`readarray`, associative arrays (`declare -A`), `${var,,}`/`${var^^}` case
 conversion, `&>>`, and `;;&` in `case`. Use `while read` loops, `tr` for case folding, and
 `>>file 2>&1`. BSD userland also differs from GNU: `sed -i` needs an argument (`sed -i ''`),
